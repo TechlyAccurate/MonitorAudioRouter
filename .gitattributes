@@ -1,0 +1,16 @@
+* text=auto
+
+*.cs text eol=crlf
+*.csproj text eol=crlf
+*.manifest text eol=crlf
+*.ps1 text eol=crlf
+
+*.html text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+*.ico binary
+*.png binary
+*.xpi binary
+*.zip binary

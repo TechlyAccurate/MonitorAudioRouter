@@ -1,0 +1,23 @@
+# Build outputs
+bin/
+obj/
+app/
+build/
+dist/
+packages/
+
+# Generated installer payload
+installer-src/Resources/payload.zip
+
+# Local native-host manifests contain machine-specific paths
+native-hosts/
+
+# Local maintainer notes
+PUBLISHING.md
+
+# Runtime state
+config.json
+state.json
+router.log
+browser-bridge.token
+*.pdb

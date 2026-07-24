@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Monitor Audio Router Browser Setup</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      line-height: 1.45;
+    }
+    body {
+      margin: 0;
+      background: Canvas;
+      color: CanvasText;
+    }
+    main {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 32px 24px 48px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+      font-weight: 650;
+    }
+    h2 {
+      margin: 28px 0 8px;
+      font-size: 18px;
+    }
+    p,
+    li {
+      font-size: 14px;
+    }
+    code {
+      font-family: Consolas, "Cascadia Mono", monospace;
+      font-size: 13px;
+    }
+    .note {
+      border-left: 4px solid #2f6fed;
+      padding: 8px 12px;
+      background: color-mix(in srgb, CanvasText 6%, Canvas);
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Monitor Audio Router Browser Setup</h1>
+    <p>Monitor Audio Router is installed. Browser support depends on the published browser extension IDs configured for this installer.</p>
+
+    <h2>Normal Browser Windows</h2>
+    <p>The installer registers the native messaging host for Chrome, Chromium, Edge, and Firefox. When published extension IDs are supplied, it also installs the browser extensions through the supported browser policy paths.</p>
+    <p>This build is configured for Chrome extension ID <code>jnjminkakfohjeffdpeamngcnfneckog</code> and Firefox extension ID <code>monitor-audio-router@example.local</code>. Browser policy installation can only fetch store extensions after the relevant store review makes them available.</p>
+
+    <h2>Private and Incognito Windows</h2>
+    <p>Private/incognito support is optional and off by default. Chrome and Edge require per-profile user approval for Incognito/InPrivate access. Firefox private browsing policy is enabled only when the installer is run with <code>/enableprivatebrowsing</code>.</p>
+
+    <h2>Route Configuration</h2>
+    <p>Use the tray menu's <strong>Open config</strong> command to assign audio devices to monitors. Leave a monitor set to <strong>Default</strong> to use the current Windows default playback device.</p>
+
+    <div class="note">
+      <p>The browser extension sends audible browser window hints only to the local native messaging host. It does not send data to a remote server.</p>
+    </div>
+  </main>
+</body>
+</html>

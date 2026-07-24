@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Monitor Audio Router Bridge",
+  "description": "Reports audible browser windows to the local Monitor Audio Router tray app.",
+  "version": "0.1.3",
+  "incognito": "spanning",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1OlppVmMseKoE23+q6Gu5pzg+Z652tEgMXbEzqdqRfXWgt9tE5gLoFCjMKuINDkNpRXoUh+GGm8wAc/4kGZUmPB6FGqNedji3fSNUDo/zWahGrFee0Lao3RssWNjVi9rG/Ic6S6K7WuOatQ3ahkOgMJ3DsBP5mzpVOoP2xpsgy4JuvBfSCZGCl46e4WykZ4hpjsyfDfsbHdleqWV39/SwyG0XvHxOzdvnaf+4lt+S9UyI4qzjOu4S7ZyUgDh0tnKCMastVm+1O2t9TFS+5lYdxUxTAgBs4ItKvPNo0jTxmt2+IcB40R8nq07+S91GYfO9Ed7Yr+97atuvlTmeRma1QIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "tabs"
+  ],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "64": "icons/icon-64.png",
+    "96": "icons/icon-96.png",
+    "128": "icons/icon-128.png"
+  },
+  "optional_permissions": [
+    "processes"
+  ],
+  "action": {
+    "default_title": "Monitor Audio Router",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "64": "icons/icon-64.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
