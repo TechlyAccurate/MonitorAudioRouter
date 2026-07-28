@@ -550,6 +550,15 @@ static bool StartBrowserUrl(string[] browserExeNames, string url)
 
 static string? FindBrowserExecutable(string fileName)
 {
+    if (fileName.Equals("firefox.exe", StringComparison.OrdinalIgnoreCase))
+    {
+        var normalFirefoxPath = FindBrowserExecutableCandidate(fileName);
+        if (normalFirefoxPath is not null)
+        {
+            return normalFirefoxPath;
+        }
+    }
+
     foreach (var hive in new[] { Registry.CurrentUser, Registry.LocalMachine })
     {
         try
@@ -567,6 +576,11 @@ static string? FindBrowserExecutable(string fileName)
         }
     }
 
+    return FindBrowserExecutableCandidate(fileName);
+}
+
+static string? FindBrowserExecutableCandidate(string fileName)
+{
     foreach (var candidate in BrowserExecutableCandidates(fileName))
     {
         if (File.Exists(candidate))
