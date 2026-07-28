@@ -7,7 +7,7 @@ It is useful when a PC has several displays with different speakers. A video mov
 ## Downloads
 
 - [Latest Windows release](https://github.com/TechlyAccurate/MonitorAudioRouter/releases/latest)
-- Chrome companion extension: Web Store review in progress
+- [Chrome companion extension](https://chromewebstore.google.com/detail/jnjminkakfohjeffdpeamngcnfneckog)
 - [Firefox companion extension](https://addons.mozilla.org/en-US/firefox/addon/monitor-audio-router-bridge/)
 
 The browser extensions are optional, but recommended when routing browser audio.
@@ -27,7 +27,9 @@ The tray menu provides route configuration, enable/disable, `Scan now`, autostar
 
 Run `MonitorAudioRouterSetup.exe` as administrator.
 
-The installer adds the tray app, browser communication helper, Start Menu shortcut, and current-user autostart. It also opens a local browser setup page for the optional companion extensions.
+The installer adds the tray app, browser communication helper, Start Menu shortcut, and current-user autostart. It also attempts to deploy the published browser extensions through supported browser policy registry entries.
+
+If browser extension policy deployment is skipped or fails for a browser, the installer opens that browser's extension store page so the user can install the companion extension manually.
 
 To install without browser extensions:
 

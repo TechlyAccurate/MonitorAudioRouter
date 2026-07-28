@@ -208,6 +208,7 @@ internal sealed class RouterTrayContext : ApplicationContext
     private readonly BrowserHintServer _hintServer;
     private readonly WindowEventWatcher _windowEventWatcher;
     private readonly DisplayEventWatcher _displayEventWatcher;
+    private readonly PowerEventWatcher _powerEventWatcher;
     private readonly AudioEventWatcher _audioEventWatcher;
     private RoutingEngine _engine;
     private RouterSettings _settings;
@@ -236,11 +237,17 @@ internal sealed class RouterTrayContext : ApplicationContext
         _hintServer = new BrowserHintServer(reason => _scanScheduler.RequestBurst(reason));
         _windowEventWatcher = new WindowEventWatcher(reason => _scanScheduler.RequestBurst(reason));
         _displayEventWatcher = new DisplayEventWatcher(reason => _scanScheduler.RequestBurst(reason));
+        _powerEventWatcher = new PowerEventWatcher(reason =>
+        {
+            _engine.HoldManagedRoutes(TimeSpan.FromSeconds(20), reason);
+            _scanScheduler.RequestBurst(reason);
+        });
         _audioEventWatcher = new AudioEventWatcher(reason => _scanScheduler.RequestBurst(reason));
 
         _hintServer.Start();
         _windowEventWatcher.Start();
         _displayEventWatcher.Start();
+        _powerEventWatcher.Start();
         _audioEventWatcher.Start();
         _scanScheduler.Start();
     }
@@ -428,6 +435,7 @@ internal sealed class RouterTrayContext : ApplicationContext
         _scanScheduler.Dispose();
         _windowEventWatcher.Dispose();
         _displayEventWatcher.Dispose();
+        _powerEventWatcher.Dispose();
         _audioEventWatcher.Dispose();
         _hintServer.Dispose();
         RestoreManagedRoutesForExit();
@@ -1460,6 +1468,34 @@ internal sealed class DisplayEventWatcher : IDisposable
     }
 }
 
+internal sealed class PowerEventWatcher : IDisposable
+{
+    private readonly Action<string> _requestBurst;
+
+    public PowerEventWatcher(Action<string> requestBurst)
+    {
+        _requestBurst = requestBurst;
+    }
+
+    public void Start()
+    {
+        SystemEvents.PowerModeChanged += OnPowerModeChanged;
+    }
+
+    private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode == PowerModes.Resume)
+        {
+            _requestBurst("power resume");
+        }
+    }
+
+    public void Dispose()
+    {
+        SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+    }
+}
+
 internal static class BrowserHintStore
 {
     private const int MaxHintWindows = 32;
@@ -1539,7 +1575,7 @@ internal static class BrowserHintStore
 
     public static Dictionary<string, BrowserHintSet> GetSnapshot()
     {
-        var cutoff = DateTimeOffset.UtcNow.AddSeconds(-8);
+        var cutoff = DateTimeOffset.UtcNow.AddSeconds(-12);
         lock (LockObject)
         {
             foreach (var stale in HintsByProcess.Where(kvp => kvp.Value.UpdatedUtc < cutoff).Select(kvp => kvp.Key).ToList())
@@ -1642,7 +1678,7 @@ internal static class BrowserHintStore
             .Select(w =>
             {
                 var monitor = WindowInspector.PickMonitor(w.Bounds, monitors);
-                return $"{ShortBounds(w.Bounds)}>{monitor.BoundsKey};pids={CompactPidList(w.ProcessIds)};tabs={w.Titles.Count};active={w.WindowTitles.Count}";
+                return $"id={w.WindowId};{ShortBounds(w.Bounds)}>{monitor.BoundsKey};pids={CompactPidList(w.ProcessIds)};tabs={w.Titles.Count};active={w.WindowTitles.Count};titles={CompactTitleSignature(w)}";
             });
         var signature = $"{processName}|preferred={preferredWindowId?.ToString() ?? "none"}|{string.Join("|", signatureParts)}";
         lock (LockObject)
@@ -1775,6 +1811,24 @@ internal static class BrowserHintStore
         return processIds.Count <= 3
             ? string.Join(",", visible)
             : string.Join(",", visible) + $"+{processIds.Count - 3}";
+    }
+
+    private static string CompactTitleSignature(BrowserHintWindow window)
+    {
+        var joined = string.Join(
+            "\u001F",
+            window.Titles
+                .Concat(window.WindowTitles)
+                .Select(NormalizeTitle)
+                .Where(title => title.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(title => title, StringComparer.OrdinalIgnoreCase));
+        if (joined.Length == 0)
+        {
+            return "none";
+        }
+
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(joined)))[..10].ToLowerInvariant();
     }
 
 }
@@ -2019,12 +2073,27 @@ internal sealed class RoutingEngine : IDisposable
     private readonly RouterState _state;
     private readonly Dictionary<int, string> _lastAmbiguousTarget = new();
     private readonly Dictionary<string, IntPtr> _browserWindowHandles = new(StringComparer.OrdinalIgnoreCase);
+    private DateTimeOffset _holdManagedRoutesUntilUtc = DateTimeOffset.MinValue;
     private string? _lastDebugSignature;
 
     public RoutingEngine(RouterSettings settings)
     {
         _settings = settings;
         _state = StateStore.Load();
+    }
+
+    public void HoldManagedRoutes(TimeSpan duration, string reason)
+    {
+        var until = DateTimeOffset.UtcNow.Add(duration);
+        if (until > _holdManagedRoutesUntilUtc)
+        {
+            _holdManagedRoutesUntilUtc = until;
+        }
+
+        Log.WriteThrottled(
+            $"managed-route-hold-{reason}",
+            $"Holding managed route ownership for {duration.TotalSeconds:0}s after {reason}.",
+            TimeSpan.FromMinutes(1));
     }
 
     public ScanResult Scan()
@@ -2184,9 +2253,15 @@ internal sealed class RoutingEngine : IDisposable
         var changed = 0;
         var failed = 0;
 
+        var temporarilyHoldingManagedRoutes = DateTimeOffset.UtcNow < _holdManagedRoutesUntilUtc;
         foreach (var route in _state.Managed.Values.ToList())
         {
             if (targets.ContainsKey(route.ProcessId))
+            {
+                continue;
+            }
+
+            if (temporarilyHoldingManagedRoutes && ManagedRouteProcessStillMatches(route))
             {
                 continue;
             }
@@ -2213,17 +2288,26 @@ internal sealed class RoutingEngine : IDisposable
                 if (_policy.ClearPersistedEndpoint(route.ProcessId))
                 {
                     changed++;
+                    _state.Managed.Remove(route.ProcessId.ToString());
                 }
                 else
                 {
                     failed++;
                 }
+
+                continue;
             }
 
             _state.Managed.Remove(route.ProcessId.ToString());
         }
 
         return (changed, failed);
+    }
+
+    private static bool ManagedRouteProcessStillMatches(ManagedRoute route)
+    {
+        var process = GetProcessInfo(route.ProcessId);
+        return process is not null && MatchesProcessIdentity(route, process.Value);
     }
 
     private PidTargetBuildResult BuildPidTargets(

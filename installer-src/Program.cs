@@ -7,12 +7,14 @@ using Microsoft.Win32;
 
 const string AppName = "Monitor Audio Router";
 const string AppId = "MonitorAudioRouter";
-const string AppVersion = "0.1.4";
+const string AppVersion = "0.1.5";
 const string HostName = "com.monitoraudiorouter.router";
 const string DefaultChromeExtensionId = "jnjminkakfohjeffdpeamngcnfneckog";
 const string DefaultEdgeExtensionId = "";
 const string DefaultFirefoxExtensionId = "monitor-audio-router@example.local";
 const string DefaultFirefoxInstallUrl = "https://addons.mozilla.org/firefox/downloads/latest/monitor-audio-router-bridge/latest.xpi";
+const string ChromeWebStoreListingUrl = "https://chromewebstore.google.com/detail/jnjminkakfohjeffdpeamngcnfneckog";
+const string FirefoxAddOnsListingUrl = "https://addons.mozilla.org/en-US/firefox/addon/monitor-audio-router-bridge/";
 const string ChromeWebStoreUpdateUrl = "https://clients2.google.com/service/update2/crx";
 const string EdgeAddOnsUpdateUrl = "https://edge.microsoft.com/extensionwebstorebase/v1/crx";
 const string RunValueName = "Monitor Audio Router";
@@ -33,7 +35,7 @@ try
         InstallFiles(tempDir, installDir);
         WriteNativeMessagingManifests(installDir, options);
         RegisterNativeMessagingHosts(installDir);
-        RegisterBrowserExtensionPolicies(options);
+        var browserExtensionDeployment = RegisterBrowserExtensionPolicies(options);
         RegisterStartup(installDir);
         InstallStartMenuShortcut(installDir);
         WriteInstallInfo(installDir, options);
@@ -44,7 +46,8 @@ try
             StartProcess(Path.Combine(installDir, "MonitorAudioRouter.exe"));
         }
 
-        if (options.OpenBrowserSetup)
+        var openedExtensionPages = OpenBrowserExtensionPagesIfNeeded(options, browserExtensionDeployment);
+        if (options.OpenBrowserSetup && !openedExtensionPages)
         {
             StartProcess(Path.Combine(installDir, "BrowserSetup.html"));
         }
@@ -201,48 +204,82 @@ static void AddChromiumOrigin(List<string> origins, string extensionId)
     }
 }
 
-static void RegisterBrowserExtensionPolicies(InstallerOptions options)
+static BrowserExtensionDeploymentResult RegisterBrowserExtensionPolicies(InstallerOptions options)
 {
+    var result = new BrowserExtensionDeploymentResult();
     if (!options.InstallBrowserExtensions)
     {
-        return;
+        result.SkippedByUser = true;
+        Console.WriteLine("Browser extension policy install skipped by installer option.");
+        return result;
     }
 
     var installedAny = false;
     if (HasPublishedValue(options.ChromeExtensionId))
     {
-        AddExtensionForcelistEntry(
-            Registry.LocalMachine,
-            @"Software\Policies\Google\Chrome\ExtensionInstallForcelist",
-            options.ChromeExtensionId,
-            ChromeWebStoreUpdateUrl);
-        AddExtensionForcelistEntry(
-            Registry.LocalMachine,
-            @"Software\Policies\Chromium\ExtensionInstallForcelist",
-            options.ChromeExtensionId,
-            ChromeWebStoreUpdateUrl);
-        installedAny = true;
+        installedAny |= TryRegisterPolicy(
+            "Chrome extension policy",
+            () => AddExtensionForcelistEntry(
+                Registry.LocalMachine,
+                @"Software\Policies\Google\Chrome\ExtensionInstallForcelist",
+                options.ChromeExtensionId,
+                ChromeWebStoreUpdateUrl),
+            () => result.ChromePolicyInstalled = true,
+            () => result.ChromePolicyFailed = true);
+        installedAny |= TryRegisterPolicy(
+            "Chromium extension policy",
+            () => AddExtensionForcelistEntry(
+                Registry.LocalMachine,
+                @"Software\Policies\Chromium\ExtensionInstallForcelist",
+                options.ChromeExtensionId,
+                ChromeWebStoreUpdateUrl),
+            () => result.ChromiumPolicyInstalled = true,
+            () => result.ChromiumPolicyFailed = true);
     }
 
     if (HasPublishedValue(options.EdgeExtensionId))
     {
-        AddExtensionForcelistEntry(
-            Registry.LocalMachine,
-            @"Software\Policies\Microsoft\Edge\ExtensionInstallForcelist",
-            options.EdgeExtensionId,
-            EdgeAddOnsUpdateUrl);
-        installedAny = true;
+        installedAny |= TryRegisterPolicy(
+            "Edge extension policy",
+            () => AddExtensionForcelistEntry(
+                Registry.LocalMachine,
+                @"Software\Policies\Microsoft\Edge\ExtensionInstallForcelist",
+                options.EdgeExtensionId,
+                EdgeAddOnsUpdateUrl),
+            () => result.EdgePolicyInstalled = true,
+            () => result.EdgePolicyFailed = true);
     }
 
     if (HasPublishedValue(options.FirefoxExtensionId) && HasPublishedValue(options.FirefoxInstallUrl))
     {
-        SetFirefoxExtensionPolicy(options.FirefoxExtensionId, options.FirefoxInstallUrl, options.EnablePrivateBrowsing);
-        installedAny = true;
+        installedAny |= TryRegisterPolicy(
+            "Firefox extension policy",
+            () => SetFirefoxExtensionPolicy(options.FirefoxExtensionId, options.FirefoxInstallUrl, options.EnablePrivateBrowsing),
+            () => result.FirefoxPolicyInstalled = true,
+            () => result.FirefoxPolicyFailed = true);
     }
 
     if (!installedAny)
     {
         Console.WriteLine("Browser extension policy install skipped because published extension IDs/URLs are not configured in this build.");
+    }
+
+    return result;
+}
+
+static bool TryRegisterPolicy(string name, Action action, Action onSuccess, Action onFailure)
+{
+    try
+    {
+        action();
+        onSuccess();
+        return true;
+    }
+    catch (Exception ex)
+    {
+        onFailure();
+        Console.Error.WriteLine($"{name} failed: {ex.Message}");
+        return false;
     }
 }
 
@@ -425,6 +462,115 @@ static void StartProcess(string path)
     Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
 }
 
+static bool OpenBrowserExtensionPagesIfNeeded(InstallerOptions options, BrowserExtensionDeploymentResult deployment)
+{
+    var opened = false;
+    if (HasPublishedValue(options.ChromeExtensionId) &&
+        (deployment.SkippedByUser || deployment.ChromePolicyFailed || deployment.ChromiumPolicyFailed))
+    {
+        opened |= StartBrowserUrl(new[] { "chrome.exe", "chromium.exe" }, ChromeWebStoreListingUrl);
+    }
+
+    if (HasPublishedValue(options.FirefoxExtensionId) &&
+        (deployment.SkippedByUser || deployment.FirefoxPolicyFailed))
+    {
+        opened |= StartBrowserUrl(new[] { "firefox.exe" }, FirefoxAddOnsListingUrl);
+    }
+
+    return opened;
+}
+
+static bool StartBrowserUrl(string[] browserExeNames, string url)
+{
+    foreach (var browserExeName in browserExeNames)
+    {
+        var browserPath = FindBrowserExecutable(browserExeName);
+        if (browserPath is null)
+        {
+            continue;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(browserPath, url) { UseShellExecute = false });
+            return true;
+        }
+        catch
+        {
+            // Fall through to the next browser or shell fallback.
+        }
+    }
+
+    try
+    {
+        Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        return true;
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+static string? FindBrowserExecutable(string fileName)
+{
+    foreach (var hive in new[] { Registry.CurrentUser, Registry.LocalMachine })
+    {
+        try
+        {
+            using var key = hive.OpenSubKey($@"Software\Microsoft\Windows\CurrentVersion\App Paths\{fileName}");
+            var path = key?.GetValue(null)?.ToString();
+            if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+            {
+                return path;
+            }
+        }
+        catch
+        {
+            // App Paths lookup is best effort.
+        }
+    }
+
+    foreach (var candidate in BrowserExecutableCandidates(fileName))
+    {
+        if (File.Exists(candidate))
+        {
+            return candidate;
+        }
+    }
+
+    return null;
+}
+
+static IEnumerable<string> BrowserExecutableCandidates(string fileName)
+{
+    var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+    var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+    var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    return fileName.ToLowerInvariant() switch
+    {
+        "chrome.exe" => new[]
+        {
+            Path.Combine(programFiles, "Google", "Chrome", "Application", fileName),
+            Path.Combine(programFilesX86, "Google", "Chrome", "Application", fileName),
+            Path.Combine(localAppData, "Google", "Chrome", "Application", fileName)
+        },
+        "chromium.exe" => new[]
+        {
+            Path.Combine(programFiles, "Chromium", "Application", fileName),
+            Path.Combine(programFilesX86, "Chromium", "Application", fileName),
+            Path.Combine(localAppData, "Chromium", "Application", fileName)
+        },
+        "firefox.exe" => new[]
+        {
+            Path.Combine(programFiles, "Mozilla Firefox", fileName),
+            Path.Combine(programFilesX86, "Mozilla Firefox", fileName),
+            Path.Combine(localAppData, "Mozilla Firefox", fileName)
+        },
+        _ => Array.Empty<string>()
+    };
+}
+
 static string Quote(string value) => "\"" + value.Replace("\"", "\\\"") + "\"";
 
 static void TryDeleteDirectory(string path)
@@ -489,3 +635,16 @@ sealed record InstallerOptions(
     string EdgeExtensionId,
     string FirefoxExtensionId,
     string FirefoxInstallUrl);
+
+sealed class BrowserExtensionDeploymentResult
+{
+    public bool SkippedByUser { get; set; }
+    public bool ChromePolicyInstalled { get; set; }
+    public bool ChromePolicyFailed { get; set; }
+    public bool ChromiumPolicyInstalled { get; set; }
+    public bool ChromiumPolicyFailed { get; set; }
+    public bool EdgePolicyInstalled { get; set; }
+    public bool EdgePolicyFailed { get; set; }
+    public bool FirefoxPolicyInstalled { get; set; }
+    public bool FirefoxPolicyFailed { get; set; }
+}

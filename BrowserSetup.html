@@ -51,7 +51,8 @@
 
     <h2>Normal Browser Windows</h2>
     <p>The installer registers the native messaging host for Chrome, Chromium, Edge, and Firefox. When published extension IDs are supplied, it also installs the browser extensions through the supported browser policy paths.</p>
-    <p>This build is configured for Chrome extension ID <code>jnjminkakfohjeffdpeamngcnfneckog</code> and Firefox extension ID <code>monitor-audio-router@example.local</code>. Browser policy installation can only fetch store extensions after the relevant store review makes them available.</p>
+    <p>This build is configured for the published Chrome extension ID <code>jnjminkakfohjeffdpeamngcnfneckog</code> and Firefox extension ID <code>monitor-audio-router@example.local</code>.</p>
+    <p>If policy deployment is skipped or blocked, the installer opens the published extension pages for manual installation.</p>
 
     <h2>Private and Incognito Windows</h2>
     <p>Private/incognito support is optional and off by default. Chrome and Edge require per-profile user approval for Incognito/InPrivate access. Firefox private browsing policy is enabled only when the installer is run with <code>/enableprivatebrowsing</code>.</p>

@@ -95,17 +95,25 @@ async function sendSnapshot() {
   }
 }
 
+function sendSnapshotBurst() {
+  sendSnapshot();
+  setTimeout(sendSnapshot, 150);
+  setTimeout(sendSnapshot, 750);
+}
+
 function start() {
   connect();
   sendSnapshot();
   setInterval(sendSnapshot, SEND_INTERVAL_MS);
 
-  browser.tabs.onUpdated.addListener(sendSnapshot);
-  browser.tabs.onActivated.addListener(sendSnapshot);
-  browser.tabs.onRemoved.addListener(sendSnapshot);
-  browser.windows.onRemoved.addListener(sendSnapshot);
+  browser.tabs.onUpdated.addListener(sendSnapshotBurst);
+  browser.tabs.onActivated.addListener(sendSnapshotBurst);
+  browser.tabs.onAttached.addListener(sendSnapshotBurst);
+  browser.tabs.onDetached.addListener(sendSnapshotBurst);
+  browser.tabs.onRemoved.addListener(sendSnapshotBurst);
+  browser.windows.onRemoved.addListener(sendSnapshotBurst);
 
-  browser.browserAction.onClicked.addListener(sendSnapshot);
+  browser.browserAction.onClicked.addListener(sendSnapshotBurst);
 }
 
 start();
