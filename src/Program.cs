@@ -1111,7 +1111,10 @@ internal static class AppUpdater
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
 
-            Process.Start(new ProcessStartInfo(setupPath, "/nobrowsersetup /nooptions")
+            var installerArgs = SettingsStore.Load().AutostartEnabled
+                ? "/nobrowsersetup /nooptions /noupdatetolatest /autostart"
+                : "/nobrowsersetup /nooptions /noupdatetolatest /noautostart";
+            Process.Start(new ProcessStartInfo(setupPath, installerArgs)
             {
                 UseShellExecute = true,
                 Verb = "runas",
