@@ -12,7 +12,7 @@ using Microsoft.Win32;
 
 const string AppName = "Monitor Audio Router";
 const string AppId = "MonitorAudioRouter";
-const string AppVersion = "0.1.7";
+const string AppVersion = "0.1.8";
 const string HostName = "com.monitoraudiorouter.router";
 const string DefaultChromeExtensionId = "jnjminkakfohjeffdpeamngcnfneckog";
 const string DefaultEdgeExtensionId = "";

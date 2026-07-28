@@ -296,6 +296,159 @@ internal sealed class SingleInstanceLock : IDisposable
     }
 }
 
+internal sealed class AboutForm : Form
+{
+    private const string GitHubUrl = "https://github.com/TechlyAccurate/MonitorAudioRouter";
+    private const string LatestReleaseUrl = "https://github.com/TechlyAccurate/MonitorAudioRouter/releases/latest";
+    private const string ChromeExtensionUrl = "https://chromewebstore.google.com/detail/jnjminkakfohjeffdpeamngcnfneckog";
+    private const string FirefoxExtensionUrl = "https://addons.mozilla.org/en-US/firefox/addon/monitor-audio-router-bridge/";
+    private readonly Button _updateButton;
+
+    public AboutForm()
+    {
+        Text = "About Monitor Audio Router";
+        StartPosition = FormStartPosition.CenterScreen;
+        MinimizeBox = false;
+        MaximizeBox = false;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        ClientSize = new Size(500, 295);
+
+        try
+        {
+            var iconPath = Path.Combine(Paths.AppRoot, "MonitorAudioRouter.ico");
+            if (File.Exists(iconPath))
+            {
+                Icon = new Icon(iconPath);
+            }
+        }
+        catch
+        {
+            // The dialog is still usable without a window icon.
+        }
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 5,
+            Padding = new Padding(16)
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        root.Controls.Add(new Label
+        {
+            AutoSize = true,
+            Font = new Font(Font, FontStyle.Bold),
+            Text = "Monitor Audio Router"
+        }, 0, 0);
+
+        root.Controls.Add(new Label
+        {
+            AutoSize = true,
+            Margin = new Padding(0, 8, 0, 0),
+            Text = $"Current version: {AppUpdater.GetInstalledVersionText()}"
+        }, 0, 1);
+
+        var links = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.TopDown,
+            WrapContents = false,
+            Margin = new Padding(0, 14, 0, 0)
+        };
+        links.Controls.Add(BuildLink("GitHub repository", GitHubUrl));
+        links.Controls.Add(BuildLink("Latest release", LatestReleaseUrl));
+        links.Controls.Add(BuildLink("Chrome companion extension", ChromeExtensionUrl));
+        links.Controls.Add(BuildLink("Firefox companion extension", FirefoxExtensionUrl));
+        root.Controls.Add(links, 0, 2);
+
+        var actions = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            Dock = DockStyle.Right,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false
+        };
+
+        var closeButton = new Button
+        {
+            AutoSize = true,
+            DialogResult = DialogResult.OK,
+            Text = "Close"
+        };
+
+        _updateButton = new Button
+        {
+            AutoSize = true,
+            Text = "Check for update"
+        };
+        _updateButton.Click += async (_, _) => await CheckForUpdateAsync();
+
+        actions.Controls.Add(closeButton);
+        actions.Controls.Add(_updateButton);
+        root.Controls.Add(actions, 0, 4);
+
+        AcceptButton = closeButton;
+        CancelButton = closeButton;
+        Controls.Add(root);
+    }
+
+    private async Task CheckForUpdateAsync()
+    {
+        _updateButton.Enabled = false;
+        try
+        {
+            await AppUpdater.CheckAndInstallLatestAsync(this);
+        }
+        finally
+        {
+            if (!IsDisposed)
+            {
+                _updateButton.Enabled = true;
+            }
+        }
+    }
+
+    private static LinkLabel BuildLink(string text, string url)
+    {
+        var link = new LinkLabel
+        {
+            AutoSize = true,
+            Margin = new Padding(0, 0, 0, 6),
+            Text = text,
+            Tag = url
+        };
+        link.LinkClicked += (_, args) =>
+        {
+            if (args.Link?.LinkData is string linkUrl)
+            {
+                OpenUrl(linkUrl);
+            }
+        };
+        link.Links.Clear();
+        link.Links.Add(0, text.Length, url);
+        return link;
+    }
+
+    private static void OpenUrl(string url)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"Could not open URL {url}: {ex}");
+            MessageBox.Show(ex.Message, "Could not open link", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+}
+
 internal sealed class RouterTrayContext : ApplicationContext
 {
     private readonly NotifyIcon _notifyIcon;
@@ -377,6 +530,9 @@ internal sealed class RouterTrayContext : ApplicationContext
         var showInfoItem = new ToolStripMenuItem("Show setup info");
         showInfoItem.Click += (_, _) => MessageBox.Show(Cli.BuildSetupInfo(), "Monitor Audio Router", MessageBoxButtons.OK, MessageBoxIcon.Information);
 
+        var aboutItem = new ToolStripMenuItem("About");
+        aboutItem.Click += (_, _) => ShowAbout();
+
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, _) => ExitThread();
 
@@ -386,6 +542,7 @@ internal sealed class RouterTrayContext : ApplicationContext
         menu.Items.Add(reloadItem);
         menu.Items.Add(configureRoutesItem);
         menu.Items.Add(showInfoItem);
+        menu.Items.Add(aboutItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exitItem);
         return menu;
@@ -475,6 +632,20 @@ internal sealed class RouterTrayContext : ApplicationContext
         {
             Log.Write($"Route configuration failed: {ex}");
             MessageBox.Show(ex.Message, "Could not configure routes", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private static void ShowAbout()
+    {
+        try
+        {
+            using var form = new AboutForm();
+            form.ShowDialog();
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"About dialog failed: {ex}");
+            MessageBox.Show(ex.Message, "Could not open About", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -673,50 +844,15 @@ internal sealed class RouteConfigForm : Form
         footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-        var linkPanel = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            AutoSize = true,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = true
-        };
-
         var viewJsonLink = new LinkLabel
         {
             Text = "View config JSON",
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             TextAlign = ContentAlignment.MiddleLeft,
-            Margin = new Padding(0, 6, 16, 0)
-        };
-        viewJsonLink.LinkClicked += (_, _) => OpenConfigJson();
-
-        var updateLink = new LinkLabel
-        {
-            Text = "Check for app update",
-            AutoSize = true,
-            Anchor = AnchorStyles.Left,
-            TextAlign = ContentAlignment.MiddleLeft,
             Margin = new Padding(0, 6, 0, 0)
         };
-        updateLink.LinkClicked += async (_, _) =>
-        {
-            updateLink.Enabled = false;
-            try
-            {
-                await AppUpdater.CheckAndInstallLatestAsync(this);
-            }
-            finally
-            {
-                if (!IsDisposed)
-                {
-                    updateLink.Enabled = true;
-                }
-            }
-        };
-
-        linkPanel.Controls.Add(viewJsonLink);
-        linkPanel.Controls.Add(updateLink);
+        viewJsonLink.LinkClicked += (_, _) => OpenConfigJson();
 
         var buttons = new FlowLayoutPanel
         {
@@ -751,7 +887,7 @@ internal sealed class RouteConfigForm : Form
         buttons.Controls.Add(saveButton);
         buttons.Controls.Add(cancelButton);
         buttons.Controls.Add(autoDetectButton);
-        footer.Controls.Add(linkPanel, 0, 0);
+        footer.Controls.Add(viewJsonLink, 0, 0);
         footer.Controls.Add(buttons, 1, 0);
         root.Controls.Add(footer, 0, 2);
 
@@ -1049,6 +1185,12 @@ internal static class AppUpdater
     private const string LatestReleaseApiUrl = "https://api.github.com/repos/TechlyAccurate/MonitorAudioRouter/releases/latest";
     private const string SetupAssetName = "MonitorAudioRouterSetup.exe";
     private const string ChecksumsAssetName = "SHA256SUMS.txt";
+
+    public static string GetInstalledVersionText()
+    {
+        var version = GetCurrentVersion();
+        return version is null ? "unknown" : FormatVersion(version);
+    }
 
     public static async Task CheckAndInstallLatestAsync(IWin32Window owner)
     {
