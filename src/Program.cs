@@ -4,6 +4,7 @@ using System.IO.Pipes;
 using System.Media;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -141,6 +142,13 @@ internal static class Program
             return 0;
         }
 
+        using var singleInstance = SingleInstanceLock.TryAcquire();
+        if (!singleInstance.Acquired)
+        {
+            Log.Write("Another Monitor Audio Router tray instance is already running; duplicate instance exiting.");
+            return 0;
+        }
+
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         using var context = new RouterTrayContext();
@@ -197,6 +205,93 @@ internal static class Paths
         {
             Log.Write($"Could not migrate {fileName} to user data folder: {ex.Message}");
         }
+    }
+}
+
+internal sealed class SingleInstanceLock : IDisposable
+{
+    private const string MutexPrefix = @"Local\MonitorAudioRouterTray";
+    private readonly Mutex? _mutex;
+    private bool _ownsMutex;
+
+    private SingleInstanceLock(Mutex? mutex, bool ownsMutex)
+    {
+        _mutex = mutex;
+        _ownsMutex = ownsMutex;
+    }
+
+    public bool Acquired => _ownsMutex;
+
+    public static SingleInstanceLock TryAcquire()
+    {
+        var mutexName = BuildMutexName();
+        Mutex? mutex = null;
+        try
+        {
+            mutex = new Mutex(false, mutexName);
+            try
+            {
+                if (mutex.WaitOne(TimeSpan.Zero))
+                {
+                    return new SingleInstanceLock(mutex, ownsMutex: true);
+                }
+            }
+            catch (AbandonedMutexException)
+            {
+                return new SingleInstanceLock(mutex, ownsMutex: true);
+            }
+
+            mutex.Dispose();
+            return new SingleInstanceLock(null, ownsMutex: false);
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or SystemException)
+        {
+            mutex?.Dispose();
+            Log.Write($"Could not acquire tray single-instance lock; exiting duplicate defensively: {ex.Message}");
+            return new SingleInstanceLock(null, ownsMutex: false);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_mutex is null)
+        {
+            return;
+        }
+
+        if (_ownsMutex)
+        {
+            try
+            {
+                _mutex.ReleaseMutex();
+            }
+            catch
+            {
+                // Process shutdown should not be blocked by mutex cleanup.
+            }
+
+            _ownsMutex = false;
+        }
+
+        _mutex.Dispose();
+    }
+
+    private static string BuildMutexName()
+    {
+        try
+        {
+            var sid = WindowsIdentity.GetCurrent().User?.Value;
+            if (!string.IsNullOrWhiteSpace(sid))
+            {
+                return $"{MutexPrefix}-{sid}";
+            }
+        }
+        catch
+        {
+            // Fall back to the session-wide lock name.
+        }
+
+        return MutexPrefix;
     }
 }
 
