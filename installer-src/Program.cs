@@ -1,13 +1,14 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
+using System.Security.Principal;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Win32;
 
 const string AppName = "Monitor Audio Router";
 const string AppId = "MonitorAudioRouter";
-const string AppVersion = "0.1.5";
+const string AppVersion = "0.1.6";
 const string HostName = "com.monitoraudiorouter.router";
 const string DefaultChromeExtensionId = "jnjminkakfohjeffdpeamngcnfneckog";
 const string DefaultEdgeExtensionId = "";
@@ -43,7 +44,7 @@ try
 
         if (options.Launch)
         {
-            StartProcess(Path.Combine(installDir, "MonitorAudioRouter.exe"));
+            StartAppForUser(Path.Combine(installDir, "MonitorAudioRouter.exe"));
         }
 
         var openedExtensionPages = OpenBrowserExtensionPagesIfNeeded(options, browserExtensionDeployment);
@@ -460,6 +461,41 @@ static void StartProcess(string path)
     }
 
     Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+}
+
+static void StartAppForUser(string path)
+{
+    if (!File.Exists(path))
+    {
+        return;
+    }
+
+    if (IsElevated())
+    {
+        try
+        {
+            var explorer = new ProcessStartInfo("explorer.exe")
+            {
+                UseShellExecute = false
+            };
+            explorer.ArgumentList.Add(path);
+            Process.Start(explorer);
+            return;
+        }
+        catch
+        {
+            // Fall back to the direct launch below.
+        }
+    }
+
+    StartProcess(path);
+}
+
+static bool IsElevated()
+{
+    using var identity = WindowsIdentity.GetCurrent();
+    var principal = new WindowsPrincipal(identity);
+    return principal.IsInRole(WindowsBuiltInRole.Administrator);
 }
 
 static bool OpenBrowserExtensionPagesIfNeeded(InstallerOptions options, BrowserExtensionDeploymentResult deployment)
