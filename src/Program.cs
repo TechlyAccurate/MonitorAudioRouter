@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO.Pipes;
 using System.Media;
+using System.Net.Http.Headers;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Principal;
@@ -672,14 +673,50 @@ internal sealed class RouteConfigForm : Form
         footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
+        var linkPanel = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = true
+        };
+
         var viewJsonLink = new LinkLabel
         {
             Text = "View config JSON",
             AutoSize = true,
             Anchor = AnchorStyles.Left,
-            TextAlign = ContentAlignment.MiddleLeft
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(0, 6, 16, 0)
         };
         viewJsonLink.LinkClicked += (_, _) => OpenConfigJson();
+
+        var updateLink = new LinkLabel
+        {
+            Text = "Check for app update",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(0, 6, 0, 0)
+        };
+        updateLink.LinkClicked += async (_, _) =>
+        {
+            updateLink.Enabled = false;
+            try
+            {
+                await AppUpdater.CheckAndInstallLatestAsync(this);
+            }
+            finally
+            {
+                if (!IsDisposed)
+                {
+                    updateLink.Enabled = true;
+                }
+            }
+        };
+
+        linkPanel.Controls.Add(viewJsonLink);
+        linkPanel.Controls.Add(updateLink);
 
         var buttons = new FlowLayoutPanel
         {
@@ -714,7 +751,7 @@ internal sealed class RouteConfigForm : Form
         buttons.Controls.Add(saveButton);
         buttons.Controls.Add(cancelButton);
         buttons.Controls.Add(autoDetectButton);
-        footer.Controls.Add(viewJsonLink, 0, 0);
+        footer.Controls.Add(linkPanel, 0, 0);
         footer.Controls.Add(buttons, 1, 0);
         root.Controls.Add(footer, 0, 2);
 
@@ -1005,6 +1042,254 @@ internal sealed class RouteConfigForm : Form
             return _label;
         }
     }
+}
+
+internal static class AppUpdater
+{
+    private const string LatestReleaseApiUrl = "https://api.github.com/repos/TechlyAccurate/MonitorAudioRouter/releases/latest";
+    private const string SetupAssetName = "MonitorAudioRouterSetup.exe";
+    private const string ChecksumsAssetName = "SHA256SUMS.txt";
+
+    public static async Task CheckAndInstallLatestAsync(IWin32Window owner)
+    {
+        try
+        {
+            using var httpClient = CreateHttpClient();
+            var release = await GetLatestReleaseAsync(httpClient);
+            var currentVersion = GetCurrentVersion();
+            var latestVersion = ParseVersion(release.TagName);
+
+            if (latestVersion is not null &&
+                currentVersion is not null &&
+                CompareVersions(latestVersion, currentVersion) <= 0)
+            {
+                var statusLine = CompareVersions(latestVersion, currentVersion) < 0
+                    ? "This installed build is newer than the latest published release."
+                    : "Monitor Audio Router is up to date.";
+                MessageBox.Show(
+                    owner,
+                    $"{statusLine}\n\nInstalled version: {FormatVersion(currentVersion)}\nLatest release: {release.TagName}",
+                    "App update",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            var prompt = currentVersion is null
+                ? $"Latest release {release.TagName} is available. Download, verify, and run the installer now?"
+                : $"Latest release {release.TagName} is available.\n\nInstalled version: {FormatVersion(currentVersion)}\n\nDownload, verify, and run the installer now?";
+            if (MessageBox.Show(owner, prompt, "App update", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+            {
+                return;
+            }
+
+            var updateDir = Path.Combine(Paths.Root, "updates", SanitizePathPart(release.TagName));
+            Directory.CreateDirectory(updateDir);
+            var setupPath = Path.Combine(updateDir, SetupAssetName);
+            var checksumsPath = Path.Combine(updateDir, ChecksumsAssetName);
+
+            await DownloadFileAsync(httpClient, release.ChecksumsDownloadUrl, checksumsPath);
+            await DownloadFileAsync(httpClient, release.SetupDownloadUrl, setupPath);
+
+            var expectedHash = ReadExpectedHash(checksumsPath, SetupAssetName);
+            if (expectedHash is null)
+            {
+                throw new InvalidOperationException($"The release checksum file does not include {SetupAssetName}.");
+            }
+
+            var actualHash = ComputeSha256(setupPath);
+            if (!string.Equals(expectedHash, actualHash, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("The downloaded installer did not match the release checksum.");
+            }
+
+            Log.Write($"Verified update installer {release.TagName}: {SetupAssetName} sha256 {actualHash}.");
+            MessageBox.Show(
+                owner,
+                "The installer was downloaded and verified. Windows will ask for permission to install the update.",
+                "App update",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+
+            Process.Start(new ProcessStartInfo(setupPath, "/nobrowsersetup")
+            {
+                UseShellExecute = true,
+                Verb = "runas",
+                WorkingDirectory = updateDir
+            });
+        }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        {
+            Log.Write("App update canceled at the Windows permission prompt.");
+            MessageBox.Show(owner, "The update was canceled.", "App update", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            Log.Write($"App update failed: {ex}");
+            MessageBox.Show(owner, ex.Message, "Could not update app", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    private static HttpClient CreateHttpClient()
+    {
+        var httpClient = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(45)
+        };
+        httpClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("MonitorAudioRouter", "1.0"));
+        httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+        return httpClient;
+    }
+
+    private static async Task<ReleaseInfo> GetLatestReleaseAsync(HttpClient httpClient)
+    {
+        using var response = await httpClient.GetAsync(LatestReleaseApiUrl);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        using var document = await JsonDocument.ParseAsync(stream);
+        var root = document.RootElement;
+        var tagName = root.GetProperty("tag_name").GetString();
+        if (string.IsNullOrWhiteSpace(tagName))
+        {
+            throw new InvalidOperationException("GitHub did not return a release tag.");
+        }
+
+        var setupUrl = FindAssetDownloadUrl(root, SetupAssetName);
+        var checksumsUrl = FindAssetDownloadUrl(root, ChecksumsAssetName);
+        if (setupUrl is null || checksumsUrl is null)
+        {
+            throw new InvalidOperationException("The latest GitHub release is missing the installer or checksum asset.");
+        }
+
+        return new ReleaseInfo(tagName, setupUrl, checksumsUrl);
+    }
+
+    private static string? FindAssetDownloadUrl(JsonElement releaseRoot, string assetName)
+    {
+        if (!releaseRoot.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+
+        foreach (var asset in assets.EnumerateArray())
+        {
+            var name = asset.TryGetProperty("name", out var nameProperty) ? nameProperty.GetString() : null;
+            if (!string.Equals(name, assetName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var url = asset.TryGetProperty("browser_download_url", out var urlProperty) ? urlProperty.GetString() : null;
+            return string.IsNullOrWhiteSpace(url) ? null : url;
+        }
+
+        return null;
+    }
+
+    private static async Task DownloadFileAsync(HttpClient httpClient, string url, string destinationPath)
+    {
+        var tempPath = destinationPath + ".download";
+        File.Delete(tempPath);
+        using var response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+        response.EnsureSuccessStatusCode();
+        await using (var input = await response.Content.ReadAsStreamAsync())
+        await using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            await input.CopyToAsync(output);
+        }
+
+        File.Move(tempPath, destinationPath, overwrite: true);
+    }
+
+    private static string? ReadExpectedHash(string checksumsPath, string assetName)
+    {
+        foreach (var line in File.ReadLines(checksumsPath))
+        {
+            var parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 2 && string.Equals(parts[1], assetName, StringComparison.OrdinalIgnoreCase))
+            {
+                return parts[0];
+            }
+        }
+
+        return null;
+    }
+
+    private static string ComputeSha256(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+    }
+
+    private static Version? GetCurrentVersion()
+    {
+        try
+        {
+            var path = Environment.ProcessPath ?? Application.ExecutablePath;
+            return ParseVersion(FileVersionInfo.GetVersionInfo(path).ProductVersion);
+        }
+        catch
+        {
+            return typeof(Program).Assembly.GetName().Version;
+        }
+    }
+
+    private static Version? ParseVersion(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var normalized = value.Trim();
+        if (normalized.StartsWith("v", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized[1..];
+        }
+
+        var metadataIndex = normalized.IndexOfAny(new[] { '+', '-' });
+        if (metadataIndex >= 0)
+        {
+            normalized = normalized[..metadataIndex];
+        }
+
+        return Version.TryParse(normalized, out var version) ? version : null;
+    }
+
+    private static int CompareVersions(Version left, Version right)
+    {
+        var leftParts = new[] { left.Major, left.Minor, Math.Max(0, left.Build), Math.Max(0, left.Revision) };
+        var rightParts = new[] { right.Major, right.Minor, Math.Max(0, right.Build), Math.Max(0, right.Revision) };
+        for (var i = 0; i < leftParts.Length; i++)
+        {
+            var comparison = leftParts[i].CompareTo(rightParts[i]);
+            if (comparison != 0)
+            {
+                return comparison;
+            }
+        }
+
+        return 0;
+    }
+
+    private static string FormatVersion(Version version)
+    {
+        return version.Build >= 0 ? $"{version.Major}.{version.Minor}.{version.Build}" : $"{version.Major}.{version.Minor}";
+    }
+
+    private static string SanitizePathPart(string value)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        var builder = new StringBuilder(value.Length);
+        foreach (var c in value)
+        {
+            builder.Append(invalid.Contains(c) ? '_' : c);
+        }
+
+        return builder.Length == 0 ? "latest" : builder.ToString();
+    }
+
+    private sealed record ReleaseInfo(string TagName, string SetupDownloadUrl, string ChecksumsDownloadUrl);
 }
 
 internal static class MonitorAudioAutoDetector

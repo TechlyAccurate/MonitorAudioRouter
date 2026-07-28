@@ -53,6 +53,8 @@ Assign a playback device to each detected monitor. Leave a monitor set to `Defau
 
 `Auto-detect` can match displays with similarly named HDMI or DisplayPort audio devices. Advanced users can inspect the underlying file with `View config JSON`.
 
+The config page also includes `Check for app update`. This is a manual update check only. It downloads the latest GitHub release installer and release checksum file, verifies the installer SHA-256 hash, then asks Windows for permission to run the installer.
+
 ## Browser Support
 
 Modern browsers often share one audio process across several tabs and windows, so the companion extension tells the local tray app which browser window is producing sound.
