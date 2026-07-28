@@ -4,6 +4,7 @@ using System.Reflection;
 using System.Security.Principal;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Windows.Forms;
 using Microsoft.Win32;
 
 const string AppName = "Monitor Audio Router";
@@ -20,7 +21,13 @@ const string ChromeWebStoreUpdateUrl = "https://clients2.google.com/service/upda
 const string EdgeAddOnsUpdateUrl = "https://edge.microsoft.com/extensionwebstorebase/v1/crx";
 const string RunValueName = "Monitor Audio Router";
 
-var options = ParseOptions(args);
+var options = ApplyInteractiveOptions(ParseOptions(args));
+if (options.Canceled)
+{
+    Environment.ExitCode = 1223;
+    return;
+}
+
 var installDir = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
     AppName);
@@ -640,15 +647,55 @@ static void TryDeleteDirectory(string path)
 
 static InstallerOptions ParseOptions(string[] args)
 {
+    var hasExplicitBrowserExtensionChoice =
+        HasSwitch(args, "/browserextensions") ||
+        HasSwitch(args, "/nobrowserextensions");
+
     return new InstallerOptions(
         Launch: !HasSwitch(args, "/nolaunch"),
         OpenBrowserSetup: !HasSwitch(args, "/nobrowsersetup"),
-        InstallBrowserExtensions: !HasSwitch(args, "/nobrowserextensions"),
+        ShowOptions: !HasSwitch(args, "/nooptions") &&
+                     !HasSwitch(args, "/quiet") &&
+                     !hasExplicitBrowserExtensionChoice,
+        Canceled: false,
+        InstallBrowserExtensions: HasSwitch(args, "/browserextensions") || !HasSwitch(args, "/nobrowserextensions"),
         EnablePrivateBrowsing: HasSwitch(args, "/enableprivatebrowsing") || HasSwitch(args, "/browserprivate"),
         ChromeExtensionId: GetOptionValue(args, "ChromeExtensionId", DefaultChromeExtensionId),
         EdgeExtensionId: GetOptionValue(args, "EdgeExtensionId", DefaultEdgeExtensionId),
         FirefoxExtensionId: GetOptionValue(args, "FirefoxExtensionId", DefaultFirefoxExtensionId),
         FirefoxInstallUrl: GetOptionValue(args, "FirefoxInstallUrl", DefaultFirefoxInstallUrl));
+}
+
+static InstallerOptions ApplyInteractiveOptions(InstallerOptions options)
+{
+    if (!options.ShowOptions)
+    {
+        return options;
+    }
+
+    InstallerOptions result = options;
+    var thread = new Thread(() =>
+    {
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        using var form = new InstallOptionsForm(options);
+        if (form.ShowDialog() != DialogResult.OK)
+        {
+            result = options with { Canceled = true };
+            return;
+        }
+
+        result = options with
+        {
+            InstallBrowserExtensions = form.InstallBrowserExtensions,
+            EnablePrivateBrowsing = form.EnablePrivateBrowsing
+        };
+    });
+
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    return result;
 }
 
 static bool HasSwitch(string[] args, string switchName)
@@ -679,12 +726,101 @@ static bool HasPublishedValue(string? value)
 sealed record InstallerOptions(
     bool Launch,
     bool OpenBrowserSetup,
+    bool ShowOptions,
+    bool Canceled,
     bool InstallBrowserExtensions,
     bool EnablePrivateBrowsing,
     string ChromeExtensionId,
     string EdgeExtensionId,
     string FirefoxExtensionId,
     string FirefoxInstallUrl);
+
+sealed class InstallOptionsForm : Form
+{
+    private readonly CheckBox _browserExtensions;
+    private readonly CheckBox _privateBrowsing;
+
+    public InstallOptionsForm(InstallerOptions options)
+    {
+        Text = "Monitor Audio Router Setup";
+        StartPosition = FormStartPosition.CenterScreen;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MinimizeBox = false;
+        MaximizeBox = false;
+        ClientSize = new Size(460, 205);
+        ShowIcon = false;
+
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            Padding = new Padding(14)
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        root.Controls.Add(new Label
+        {
+            AutoSize = true,
+            MaximumSize = new Size(420, 0),
+            Text = "Choose install options. Browser companion extensions are recommended for routing browser audio."
+        }, 0, 0);
+
+        _browserExtensions = new CheckBox
+        {
+            AutoSize = true,
+            Checked = options.InstallBrowserExtensions,
+            Margin = new Padding(0, 14, 0, 0),
+            Text = "Install browser companion extensions"
+        };
+        root.Controls.Add(_browserExtensions, 0, 1);
+
+        _privateBrowsing = new CheckBox
+        {
+            AutoSize = true,
+            Checked = options.EnablePrivateBrowsing,
+            Enabled = options.InstallBrowserExtensions,
+            Margin = new Padding(0, 6, 0, 0),
+            Text = "Allow private/incognito browser windows"
+        };
+        _browserExtensions.CheckedChanged += (_, _) => _privateBrowsing.Enabled = _browserExtensions.Checked;
+        root.Controls.Add(_privateBrowsing, 0, 2);
+
+        var buttons = new FlowLayoutPanel
+        {
+            AutoSize = true,
+            Dock = DockStyle.Right,
+            FlowDirection = FlowDirection.RightToLeft,
+            WrapContents = false
+        };
+
+        var installButton = new Button
+        {
+            AutoSize = true,
+            DialogResult = DialogResult.OK,
+            Text = "Install"
+        };
+        var cancelButton = new Button
+        {
+            AutoSize = true,
+            DialogResult = DialogResult.Cancel,
+            Text = "Cancel"
+        };
+        buttons.Controls.Add(installButton);
+        buttons.Controls.Add(cancelButton);
+        root.Controls.Add(buttons, 0, 3);
+
+        AcceptButton = installButton;
+        CancelButton = cancelButton;
+        Controls.Add(root);
+    }
+
+    public bool InstallBrowserExtensions => _browserExtensions.Checked;
+    public bool EnablePrivateBrowsing => _browserExtensions.Checked && _privateBrowsing.Checked;
+}
 
 sealed class BrowserExtensionDeploymentResult
 {

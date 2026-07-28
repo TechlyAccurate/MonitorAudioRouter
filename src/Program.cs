@@ -1111,7 +1111,7 @@ internal static class AppUpdater
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
 
-            Process.Start(new ProcessStartInfo(setupPath, "/nobrowsersetup")
+            Process.Start(new ProcessStartInfo(setupPath, "/nobrowsersetup /nooptions")
             {
                 UseShellExecute = true,
                 Verb = "runas",
