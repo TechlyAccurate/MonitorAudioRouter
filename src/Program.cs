@@ -143,6 +143,7 @@ internal static class Program
             return 0;
         }
 
+        Log.Write("Tray startup requested.");
         using var singleInstance = SingleInstanceLock.TryAcquire();
         if (!singleInstance.Acquired)
         {
@@ -150,10 +151,12 @@ internal static class Program
             return 0;
         }
 
+        Log.Write("Tray single-instance lock acquired.");
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         using var context = new RouterTrayContext();
         Application.Run(context);
+        Log.Write("Tray stopped.");
         return 0;
     }
 }

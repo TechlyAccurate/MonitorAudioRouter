@@ -5,6 +5,7 @@ const SEND_INTERVAL_MS = 1500;
 
 let port = null;
 let sendTimer = null;
+let reconnectTimer = null;
 let hasTriedProcessPermission = false;
 
 function browserName() {
@@ -57,10 +58,18 @@ function chromeCall(fn, ...args) {
 }
 
 function connect() {
+  if (port) {
+    return;
+  }
+
   try {
-    port = chrome.runtime.connectNative(HOST_NAME);
-    port.onDisconnect.addListener(() => {
-      port = null;
+    const nextPort = chrome.runtime.connectNative(HOST_NAME);
+    port = nextPort;
+    nextPort.onDisconnect.addListener(() => {
+      if (port === nextPort) {
+        port = null;
+      }
+
       scheduleReconnect();
     });
   } catch {
@@ -70,7 +79,12 @@ function connect() {
 }
 
 function scheduleReconnect() {
-  setTimeout(() => {
+  if (reconnectTimer !== null) {
+    return;
+  }
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
     if (!port) {
       connect();
     }
@@ -86,10 +100,14 @@ function post(message) {
     return;
   }
 
+  const currentPort = port;
   try {
-    port.postMessage(message);
+    currentPort.postMessage(message);
   } catch {
-    port = null;
+    if (port === currentPort) {
+      port = null;
+    }
+
     scheduleReconnect();
   }
 }

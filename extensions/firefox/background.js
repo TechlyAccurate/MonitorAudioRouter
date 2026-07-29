@@ -4,18 +4,40 @@ const HOST_NAME = "com.monitoraudiorouter.router";
 const SEND_INTERVAL_MS = 1500;
 
 let port = null;
+let reconnectTimer = null;
 
 function connect() {
+  if (port) {
+    return;
+  }
+
   try {
-    port = browser.runtime.connectNative(HOST_NAME);
-    port.onDisconnect.addListener(() => {
-      port = null;
-      setTimeout(connect, 2500);
+    const nextPort = browser.runtime.connectNative(HOST_NAME);
+    port = nextPort;
+    nextPort.onDisconnect.addListener(() => {
+      if (port === nextPort) {
+        port = null;
+      }
+
+      scheduleReconnect();
     });
   } catch {
     port = null;
-    setTimeout(connect, 2500);
+    scheduleReconnect();
   }
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer !== null) {
+    return;
+  }
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (!port) {
+      connect();
+    }
+  }, 2500);
 }
 
 function post(message) {
@@ -27,11 +49,15 @@ function post(message) {
     return;
   }
 
+  const currentPort = port;
   try {
-    port.postMessage(message);
+    currentPort.postMessage(message);
   } catch {
-    port = null;
-    setTimeout(connect, 2500);
+    if (port === currentPort) {
+      port = null;
+    }
+
+    scheduleReconnect();
   }
 }
 

@@ -12,7 +12,7 @@ using Microsoft.Win32;
 
 const string AppName = "Monitor Audio Router";
 const string AppId = "MonitorAudioRouter";
-const string AppVersion = "0.1.8";
+const string AppVersion = "0.1.9";
 const string HostName = "com.monitoraudiorouter.router";
 const string DefaultChromeExtensionId = "jnjminkakfohjeffdpeamngcnfneckog";
 const string DefaultEdgeExtensionId = "";
@@ -100,16 +100,43 @@ static void StopExistingApp(string installDir)
 
     foreach (var processName in new[] { "MonitorAudioRouter", "MonitorAudioRouterNativeHost" })
     {
-        foreach (var process in Process.GetProcessesByName(processName))
+        var processes = Process.GetProcessesByName(processName);
+        try
         {
-            try
+            foreach (var process in processes)
             {
-                process.Kill(entireProcessTree: true);
-                process.WaitForExit(5000);
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // Best effort only. File replacement below will fail if the app is still locked.
+                }
             }
-            catch
+
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            foreach (var process in processes)
             {
-                // Best effort only. File replacement below will fail if the app is still locked.
+                try
+                {
+                    var remaining = deadline - DateTime.UtcNow;
+                    if (remaining > TimeSpan.Zero)
+                    {
+                        process.WaitForExit((int)Math.Min(remaining.TotalMilliseconds, int.MaxValue));
+                    }
+                }
+                catch
+                {
+                    // Best effort only. File replacement below will fail if the app is still locked.
+                }
+            }
+        }
+        finally
+        {
+            foreach (var process in processes)
+            {
+                process.Dispose();
             }
         }
     }
@@ -203,11 +230,20 @@ static void RegisterNativeMessagingHosts(string installDir)
 {
     var chromiumManifest = Path.Combine(installDir, "native-hosts", "chromium-com.monitoraudiorouter.router.json");
     var firefoxManifest = Path.Combine(installDir, "native-hosts", "firefox-com.monitoraudiorouter.router.json");
+    var softwareRoots = Environment.Is64BitOperatingSystem
+        ? new[] { "Software", @"Software\WOW6432Node" }
+        : new[] { "Software" };
 
-    SetDefaultValue(Registry.LocalMachine, $@"Software\Google\Chrome\NativeMessagingHosts\{HostName}", chromiumManifest);
-    SetDefaultValue(Registry.LocalMachine, $@"Software\Chromium\NativeMessagingHosts\{HostName}", chromiumManifest);
-    SetDefaultValue(Registry.LocalMachine, $@"Software\Microsoft\Edge\NativeMessagingHosts\{HostName}", chromiumManifest);
-    SetDefaultValue(Registry.LocalMachine, $@"Software\Mozilla\NativeMessagingHosts\{HostName}", firefoxManifest);
+    foreach (var hive in new[] { Registry.LocalMachine, Registry.CurrentUser })
+    {
+        foreach (var softwareRoot in softwareRoots)
+        {
+            SetDefaultValue(hive, $@"{softwareRoot}\Google\Chrome\NativeMessagingHosts\{HostName}", chromiumManifest);
+            SetDefaultValue(hive, $@"{softwareRoot}\Chromium\NativeMessagingHosts\{HostName}", chromiumManifest);
+            SetDefaultValue(hive, $@"{softwareRoot}\Microsoft\Edge\NativeMessagingHosts\{HostName}", chromiumManifest);
+            SetDefaultValue(hive, $@"{softwareRoot}\Mozilla\NativeMessagingHosts\{HostName}", firefoxManifest);
+        }
+    }
 }
 
 static void AddChromiumOrigin(List<string> origins, string extensionId)

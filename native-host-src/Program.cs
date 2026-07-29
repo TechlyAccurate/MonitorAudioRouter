@@ -8,37 +8,44 @@ namespace MonitorAudioRouterNativeHost;
 internal static class Program
 {
     private const string PipeName = "MonitorAudioRouterHints";
+    private const int TrayConnectTimeoutMs = 500;
     private const string BrowserBridgeTokenFileName = "browser-bridge.token";
     private const string AppDataFolderName = "Monitor Audio Router";
-    private static bool _loggedForwardSuccess;
+    private static readonly TimeSpan InitialMessageTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan IdleMessageTimeout = TimeSpan.FromSeconds(10);
 
     private static int Main()
     {
         using var input = Console.OpenStandardInput();
         using var output = Console.OpenStandardOutput();
+        var receivedMessage = false;
 
         while (true)
         {
-            var message = ReadMessage(input);
+            var message = ReadMessage(input, receivedMessage ? IdleMessageTimeout : InitialMessageTimeout);
             if (message is null)
             {
                 return 0;
             }
 
+            receivedMessage = true;
             var forwarded = ForwardToTray(message);
-            if (forwarded && !_loggedForwardSuccess)
+
+            if (!TryWriteMessage(output, JsonSerializer.Serialize(new { ok = forwarded })))
             {
-                _loggedForwardSuccess = true;
-                Log("Native host forward result True.");
+                return forwarded ? 0 : 1;
             }
 
-            WriteMessage(output, JsonSerializer.Serialize(new { ok = forwarded }));
+            if (!forwarded)
+            {
+                return 1;
+            }
         }
     }
 
-    private static string? ReadMessage(Stream input)
+    private static string? ReadMessage(Stream input, TimeSpan timeout)
     {
-        var lengthBytes = ReadExact(input, 4);
+        var lengthBytes = ReadExact(input, 4, timeout);
         if (lengthBytes is null)
         {
             return null;
@@ -54,7 +61,7 @@ internal static class Program
             return null;
         }
 
-        var payload = ReadExact(input, length);
+        var payload = ReadExact(input, length, timeout);
         if (payload is null)
         {
             Log($"Native host could not read payload length {length}.");
@@ -64,13 +71,28 @@ internal static class Program
         return Encoding.UTF8.GetString(payload);
     }
 
-    private static byte[]? ReadExact(Stream stream, int count)
+    private static byte[]? ReadExact(Stream stream, int count, TimeSpan timeout)
     {
         var buffer = new byte[count];
         var offset = 0;
         while (offset < count)
         {
-            var read = stream.Read(buffer, offset, count - offset);
+            int read;
+            try
+            {
+                var readTask = Task.Run(() => stream.Read(buffer, offset, count - offset));
+                if (!readTask.Wait(timeout))
+                {
+                    return null;
+                }
+
+                read = readTask.GetAwaiter().GetResult();
+            }
+            catch
+            {
+                return null;
+            }
+
             if (read == 0)
             {
                 return null;
@@ -87,10 +109,14 @@ internal static class Program
         try
         {
             using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.Out);
-            pipe.Connect(2000);
+            pipe.Connect(TrayConnectTimeoutMs);
             using var writer = new StreamWriter(pipe, new UTF8Encoding(false), 1024, leaveOpen: true) { AutoFlush = true };
             writer.WriteLine(BrowserBridgeSecurity.CreateEnvelope(json));
             return true;
+        }
+        catch (TimeoutException)
+        {
+            return false;
         }
         catch (Exception ex)
         {
@@ -98,6 +124,19 @@ internal static class Program
                 "native-host-forward-failed:" + ex.Message,
                 $"Native host forward failed: {ex.Message}",
                 TimeSpan.FromMinutes(5));
+            return false;
+        }
+    }
+
+    private static bool TryWriteMessage(Stream output, string json)
+    {
+        try
+        {
+            WriteMessage(output, json);
+            return true;
+        }
+        catch
+        {
             return false;
         }
     }

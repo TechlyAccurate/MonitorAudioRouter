@@ -87,10 +87,22 @@ if (Test-Path -LiteralPath $trayExe) {
 Get-Process MonitorAudioRouterNativeHost,MonitorAudioRouter -ErrorAction SilentlyContinue | Stop-Process -Force
 
 $nativeHostKeys = @(
+    "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$hostName",
+    "HKCU:\Software\Chromium\NativeMessagingHosts\$hostName",
+    "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\$hostName",
+    "HKCU:\Software\Mozilla\NativeMessagingHosts\$hostName",
+    "HKCU:\Software\WOW6432Node\Google\Chrome\NativeMessagingHosts\$hostName",
+    "HKCU:\Software\WOW6432Node\Chromium\NativeMessagingHosts\$hostName",
+    "HKCU:\Software\WOW6432Node\Microsoft\Edge\NativeMessagingHosts\$hostName",
+    "HKCU:\Software\WOW6432Node\Mozilla\NativeMessagingHosts\$hostName",
     "HKLM:\Software\Google\Chrome\NativeMessagingHosts\$hostName",
     "HKLM:\Software\Chromium\NativeMessagingHosts\$hostName",
     "HKLM:\Software\Microsoft\Edge\NativeMessagingHosts\$hostName",
-    "HKLM:\Software\Mozilla\NativeMessagingHosts\$hostName"
+    "HKLM:\Software\Mozilla\NativeMessagingHosts\$hostName",
+    "HKLM:\Software\WOW6432Node\Google\Chrome\NativeMessagingHosts\$hostName",
+    "HKLM:\Software\WOW6432Node\Chromium\NativeMessagingHosts\$hostName",
+    "HKLM:\Software\WOW6432Node\Microsoft\Edge\NativeMessagingHosts\$hostName",
+    "HKLM:\Software\WOW6432Node\Mozilla\NativeMessagingHosts\$hostName"
 )
 
 foreach ($key in $nativeHostKeys) {
