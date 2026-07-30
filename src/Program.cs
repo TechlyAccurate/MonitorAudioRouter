@@ -14,6 +14,9 @@ using Microsoft.Win32;
 
 namespace MonitorAudioRouter;
 
+// The app is a small Windows tray process with one central loop:
+// event watchers request scans, RoutingEngine decides the desired per-PID
+// output device, and AppAudioPolicy applies that decision through Windows.
 internal static class Program
 {
     [STAThread]
@@ -2064,6 +2067,10 @@ internal sealed class PowerEventWatcher : IDisposable
     }
 }
 
+// Browser extensions can see audible tabs and browser window bounds, but they
+// cannot directly set Windows audio routing. This store keeps those browser
+// snapshots as short-lived hints that the routing engine later reconciles
+// against native Windows windows and active Windows audio-session PIDs.
 internal static class BrowserHintStore
 {
     private const int MaxHintWindows = 32;
@@ -2091,6 +2098,8 @@ internal static class BrowserHintStore
                 return false;
             }
 
+            // Extension payloads are local, but still treated as a boundary:
+            // clamp counts and title lengths before saving anything in memory.
             var windows = (update.Windows ?? new List<BrowserHintWindowUpdate>())
                 .Where(w => w.Width > 0 && w.Height > 0)
                 .Take(MaxHintWindows)
@@ -2206,6 +2215,9 @@ internal static class BrowserHintStore
         BrowserHintSet? previous,
         List<BrowserHintWindow> windows)
     {
+        // When a playing tab is moved to another browser window, Firefox and
+        // Chromium can briefly report both the old and new windows as audible.
+        // Prefer the newly added window during that overlap so audio moves fast.
         var currentIds = windows
             .Where(window => window.WindowId > 0)
             .Select(window => window.WindowId)
@@ -2553,6 +2565,10 @@ internal sealed class BrowserBridgeEnvelope
     public string? Payload { get; set; }
 }
 
+// Native messaging hosts are launched by the browser, not by the tray app. The
+// host keeps the browser contract tiny: read one browser message, wrap it with
+// a local token, forward it to the tray pipe, and answer whether forwarding
+// worked. The tray app remains the only process that performs routing.
 internal static class NativeMessagingHost
 {
     public static void Run()
@@ -2639,6 +2655,9 @@ internal static class NativeMessagingHost
     }
 }
 
+// RoutingEngine owns the app's safety rules. A Windows PID is the address that
+// Volume Mixer exposes for a per-app output device, not a durable browser-tab
+// identity. The engine owns only routes it set and verified by readback.
 internal sealed class RoutingEngine : IDisposable
 {
     private static readonly TimeSpan PowerResumeRecoveryWindow = TimeSpan.FromHours(12);
@@ -2715,11 +2734,18 @@ internal sealed class RoutingEngine : IDisposable
             var changed = 0;
             var skippedManual = 0;
             var failed = 0;
+
+            // First clear routes the app used to own but that no current
+            // window/audio target still needs. Held browser routes are spared
+            // while the browser is paused, ambiguous, or waking after sleep.
             PrunePowerResumeManagedRoutes(DateTimeOffset.UtcNow);
             var untargeted = ClearUntargetedManagedRoutes(targetPids, targetBuild.HeldPids);
             changed += untargeted.Changed;
             failed += untargeted.Failed;
 
+            // Then apply the desired route for every PID that currently has a
+            // window/audio target. Manual Windows Volume Mixer assignments take
+            // priority over this automatic routing.
             foreach (var target in targetPids.Values)
             {
                 if (target.Endpoint is null)
@@ -2750,6 +2776,9 @@ internal sealed class RoutingEngine : IDisposable
 
                 if (hasManualOverride)
                 {
+                    // If Windows reports an explicit endpoint that does not
+                    // match the route we own, treat it as user-owned and leave
+                    // it alone until the user sets that app back to Default.
                     skippedManual++;
                     var currentEndpointName = endpoints.FirstOrDefault(endpoint =>
                         EndpointIdsEqual(endpoint.Id, currentEndpoint.EndpointId))?.Name
@@ -2766,6 +2795,8 @@ internal sealed class RoutingEngine : IDisposable
                 var desiredIsSystemDefault = EndpointIdsEqual(target.Endpoint.Id, defaultEndpoint.Id);
                 if (desiredIsSystemDefault)
                 {
+                    // "Default" means no per-app override. Clearing the stored
+                    // endpoint lets Windows follow the current system default.
                     if (existingState is not null || currentEndpoint.HasExplicitEndpoint)
                     {
                         if (existingState is null)
@@ -2861,6 +2892,10 @@ internal sealed class RoutingEngine : IDisposable
         Dictionary<int, PidTarget> targets,
         HashSet<int> heldPids)
     {
+        // A managed route becomes untargeted when no visible window/audio hint
+        // currently maps that PID to a monitor. For normal apps this usually
+        // means clear it. Browsers get extra protection because pause/resume,
+        // tab moves, and power transitions can briefly hide the correct target.
         var changed = 0;
         var failed = 0;
 
@@ -2917,6 +2952,9 @@ internal sealed class RoutingEngine : IDisposable
 
     private bool SetOwnedRouteWithReadback(PidTarget target, List<AudioEndpoint> endpoints)
     {
+        // Only write state.json after Windows reports the same explicit
+        // endpoint we just requested. This prevents the app from "owning" a
+        // route that Windows rejected or that was immediately changed elsewhere.
         if (target.Endpoint is null)
         {
             return false;
@@ -2946,6 +2984,9 @@ internal sealed class RoutingEngine : IDisposable
 
     private ManagedRouteClearOutcome ClearOwnedRouteWithReadback(ManagedRoute route, string reason)
     {
+        // Clearing is also verified by readback. If Windows still reports our
+        // endpoint, keep ownership so a later scan can retry instead of
+        // mistaking the stuck route for a manual user assignment.
         _policy.ClearPersistedEndpoint(route.ProcessId);
         var afterClear = _policy.GetPersistedEndpoint(route.ProcessId);
         if (!afterClear.HasExplicitEndpoint)
@@ -3002,6 +3043,10 @@ internal sealed class RoutingEngine : IDisposable
         PersistedEndpoint currentEndpoint,
         List<AudioEndpoint> endpoints)
     {
+        // Sleep/wake can disturb the scan timing before the browser extension
+        // and audio-session events settle. If Windows still has the exact route
+        // we set before resume, recover ownership instead of treating it as
+        // a manual Volume Mixer assignment.
         if (!currentEndpoint.HasExplicitEndpoint ||
             _state.LastPowerResumeUtc is not DateTimeOffset lastPowerResumeUtc ||
             DateTimeOffset.UtcNow - lastPowerResumeUtc > PowerResumeRecoveryWindow)
@@ -3060,6 +3105,11 @@ internal sealed class RoutingEngine : IDisposable
         AudioDeviceManager devices,
         List<AudioEndpoint> endpoints)
     {
+        // This translates "what is visible and audible" into "which Windows
+        // PID should be assigned to which endpoint." Native app windows can
+        // map directly by PID. Browsers need extension hints because many tabs
+        // can share a process and one browser process can have windows on
+        // several monitors.
         var audioSessionPids = devices.GetAudioSessionProcessIds().ToHashSet();
         var processSnapshot = _settings.RouteChildProcesses ? ProcessSnapshot.Capture() : ProcessSnapshot.Empty;
         var hints = BrowserHintStore.GetSnapshot();
@@ -3189,6 +3239,10 @@ internal sealed class RoutingEngine : IDisposable
         List<WindowInfo> windows,
         List<AudioEndpoint> endpoints)
     {
+        // Browser-provided PIDs are trusted only when Windows also reports an
+        // active audio session for that PID. If the extension cannot provide a
+        // usable PID, the fallback is a single active browser audio session plus
+        // one audible browser window.
         var monitors = WindowInspector.GetMonitors();
         foreach (var hintSet in hints.Values)
         {
@@ -4727,6 +4781,10 @@ internal sealed class AudioDeviceManager : IDisposable
 
 internal sealed record AudioEndpoint(string Id, string Name, bool IsDefault);
 
+// Windows exposes the Volume Mixer per-app output setting through internal COM
+// interfaces. Keep this class as the narrow boundary around that unsupported
+// API: callers ask for get/set/clear by PID, and this class handles Windows'
+// endpoint ID packing and version-specific factory variants.
 internal sealed class AppAudioPolicy : IDisposable
 {
     private const string AudioRenderInterface = "#{e6327cad-dcec-4949-ae8a-991e976a79d2}";
@@ -4789,6 +4847,9 @@ internal sealed class AppAudioPolicy : IDisposable
     {
         var ok = true;
         var policyEndpointId = endpointId is null ? null : GenerateDeviceId(endpointId, EDataFlow.eRender);
+
+        // Volume Mixer may query either Console or Multimedia depending on the
+        // app and Windows build. Set both roles so readback and playback agree.
         foreach (var role in ManagedRoles())
         {
             var hr = _policy!.SetPersistedDefaultAudioEndpoint((uint)processId, EDataFlow.eRender, role, policyEndpointId);
