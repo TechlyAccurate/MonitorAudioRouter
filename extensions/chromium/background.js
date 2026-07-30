@@ -1,5 +1,9 @@
 "use strict";
 
+// Chromium bridge:
+// - find audible tabs grouped by browser window;
+// - include OS process IDs only when Chromium exposes them;
+// - send local hints to the tray app through native messaging.
 const HOST_NAME = "com.monitoraudiorouter.router";
 const SEND_INTERVAL_MS = 1500;
 
@@ -7,6 +11,8 @@ let port = null;
 let sendTimer = null;
 let reconnectTimer = null;
 let hasTriedProcessPermission = false;
+
+// Browser identity
 
 function browserName() {
   const ua = navigator.userAgent;
@@ -20,6 +26,8 @@ function browserName() {
 
   return "chrome";
 }
+
+// Chrome callback APIs
 
 function chromeCall(fn, ...args) {
   return new Promise((resolve, reject) => {
@@ -57,6 +65,8 @@ function chromeCall(fn, ...args) {
   });
 }
 
+// Native messaging connection
+
 function connect() {
   if (port) {
     return;
@@ -83,6 +93,8 @@ function scheduleReconnect() {
     return;
   }
 
+  // Keep one reconnect timer alive at most. This prevents stale extension
+  // workers from repeatedly launching native-host helper processes.
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     if (!port) {
@@ -111,6 +123,8 @@ function post(message) {
     scheduleReconnect();
   }
 }
+
+// Optional process hints
 
 async function processIdsForTabs(tabs) {
   const api = chrome.processes;
@@ -145,6 +159,7 @@ async function processIdsForTabs(tabs) {
 }
 
 async function collectAudibleWindows() {
+  // Audible window collection
   const tabs = await chromeCall(chrome.tabs.query, {});
   const audibleTabs = tabs.filter((tab) => tab.audible && tab.windowId !== undefined);
   const grouped = new Map();
@@ -164,6 +179,8 @@ async function collectAudibleWindows() {
         continue;
       }
 
+      // Titles are local matching hints. The extension does not send URLs,
+      // page contents, history, cookies, or anything to a remote service.
       const windowTitles = [...new Set(tabs
         .filter((tab) => tab.windowId === windowId && tab.active)
         .map((tab) => tab.title)
@@ -191,6 +208,8 @@ async function collectAudibleWindows() {
   return windows;
 }
 
+// Snapshot scheduling
+
 async function sendSnapshot() {
   try {
     post({
@@ -203,6 +222,8 @@ async function sendSnapshot() {
     // The next scheduled pass will retry.
   }
 }
+
+// Extension entry point
 
 function start() {
   connect();
@@ -218,6 +239,9 @@ function start() {
   chrome.windows.onRemoved.addListener(sendSnapshot);
 
   chrome.action.onClicked.addListener(() => {
+    // The unpacked developer build can request the optional processes
+    // permission on click. Store packages strip this listener body and send
+    // snapshots without asking.
     if (hasTriedProcessPermission || !chrome.permissions) {
       sendSnapshot();
       return;
