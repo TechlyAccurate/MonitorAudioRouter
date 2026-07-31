@@ -117,7 +117,7 @@ It does this in order:
 
 1. Load active audio endpoints and the current system default endpoint.
 2. Enumerate visible windows.
-3. Build target routes with `BuildPidTargets`.
+3. Build target routes with `BuildProcessRouteTargets`.
 4. Clear managed routes that no longer have a valid target.
 5. Apply the desired route for each current target.
 6. Save route ownership state.

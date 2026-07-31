@@ -4,65 +4,65 @@
 // - find audible tabs grouped by browser window;
 // - send only the local window hints needed for routing;
 // - let the Windows tray app decide and apply audio routes.
-const HOST_NAME = "com.monitoraudiorouter.router";
-const SEND_INTERVAL_MS = 1500;
+const NATIVE_HOST_NAME = "com.monitoraudiorouter.router";
+const SNAPSHOT_INTERVAL_MS = 1500;
 
-let port = null;
-let reconnectTimer = null;
+let nativeHostPort = null;
+let nativeHostReconnectTimer = null;
 
 // Native messaging connection
 
-function connect() {
-  if (port) {
+function connectNativeHost() {
+  if (nativeHostPort) {
     return;
   }
 
   try {
-    const nextPort = browser.runtime.connectNative(HOST_NAME);
-    port = nextPort;
+    const nextPort = browser.runtime.connectNative(NATIVE_HOST_NAME);
+    nativeHostPort = nextPort;
     nextPort.onDisconnect.addListener(() => {
-      if (port === nextPort) {
-        port = null;
+      if (nativeHostPort === nextPort) {
+        nativeHostPort = null;
       }
 
       scheduleReconnect();
     });
   } catch {
-    port = null;
+    nativeHostPort = null;
     scheduleReconnect();
   }
 }
 
 function scheduleReconnect() {
-  if (reconnectTimer !== null) {
+  if (nativeHostReconnectTimer !== null) {
     return;
   }
 
   // Keep one reconnect timer alive at most. Older versions could create a
   // reconnect storm when Firefox held stale extension workers.
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    if (!port) {
-      connect();
+  nativeHostReconnectTimer = setTimeout(() => {
+    nativeHostReconnectTimer = null;
+    if (!nativeHostPort) {
+      connectNativeHost();
     }
   }, 2500);
 }
 
-function post(message) {
-  if (!port) {
-    connect();
+function postToNativeHost(message) {
+  if (!nativeHostPort) {
+    connectNativeHost();
   }
 
-  if (!port) {
+  if (!nativeHostPort) {
     return;
   }
 
-  const currentPort = port;
+  const connectedNativeHostPort = nativeHostPort;
   try {
-    currentPort.postMessage(message);
+    connectedNativeHostPort.postMessage(message);
   } catch {
-    if (port === currentPort) {
-      port = null;
+    if (nativeHostPort === connectedNativeHostPort) {
+      nativeHostPort = null;
     }
 
     scheduleReconnect();
@@ -73,33 +73,33 @@ function post(message) {
 
 async function collectAudibleWindows() {
   const tabs = await browser.tabs.query({});
-  const grouped = new Map();
+  const tabsByWindowId = new Map();
 
   // Firefox does not expose a useful OS audio-session PID to this extension.
   // The tray app infers the PID only when Windows reports one matching active
   // Firefox audio session.
-  for (const tab of tabs.filter((t) => t.audible && t.windowId !== undefined)) {
-    const current = grouped.get(tab.windowId) || [];
-    current.push(tab);
-    grouped.set(tab.windowId, current);
+  for (const tab of tabs.filter((tab) => tab.audible && tab.windowId !== undefined)) {
+    const tabsForWindow = tabsByWindowId.get(tab.windowId) || [];
+    tabsForWindow.push(tab);
+    tabsByWindowId.set(tab.windowId, tabsForWindow);
   }
 
   const windows = [];
-  for (const [windowId, windowTabs] of grouped) {
+  for (const [windowId, windowTabs] of tabsByWindowId) {
     try {
-      const win = await browser.windows.get(windowId);
-      if (!Number.isFinite(win.left) || !Number.isFinite(win.top) ||
-          !Number.isFinite(win.width) || !Number.isFinite(win.height)) {
+      const browserWindow = await browser.windows.get(windowId);
+      if (!Number.isFinite(browserWindow.left) || !Number.isFinite(browserWindow.top) ||
+          !Number.isFinite(browserWindow.width) || !Number.isFinite(browserWindow.height)) {
         continue;
       }
 
       // Titles are local matching hints. The extension does not send URLs,
       // page contents, history, cookies, or anything to a remote service.
-      const titles = [...new Set(windowTabs
+      const audibleTabTitles = [...new Set(windowTabs
         .map((tab) => tab.title)
         .filter((title) => typeof title === "string" && title.trim().length > 0)
         .map((title) => title.trim()))];
-      const windowTitles = [...new Set(tabs
+      const activeTabTitles = [...new Set(tabs
         .filter((tab) => tab.windowId === windowId && tab.active)
         .map((tab) => tab.title)
         .filter((title) => typeof title === "string" && title.trim().length > 0)
@@ -107,13 +107,13 @@ async function collectAudibleWindows() {
 
       windows.push({
         windowId,
-        left: win.left,
-        top: win.top,
-        width: win.width,
-        height: win.height,
+        left: browserWindow.left,
+        top: browserWindow.top,
+        width: browserWindow.width,
+        height: browserWindow.height,
         processIds: [],
-        titles,
-        windowTitles
+        titles: audibleTabTitles,
+        windowTitles: activeTabTitles
       });
     } catch {
       // Window may have closed during collection.
@@ -127,7 +127,7 @@ async function collectAudibleWindows() {
 
 async function sendSnapshot() {
   try {
-    post({
+    postToNativeHost({
       type: "audibleWindows",
       browser: "firefox",
       sentAt: Date.now(),
@@ -149,9 +149,9 @@ function sendSnapshotBurst() {
 // Extension entry point
 
 function start() {
-  connect();
+  connectNativeHost();
   sendSnapshot();
-  setInterval(sendSnapshot, SEND_INTERVAL_MS);
+  setInterval(sendSnapshot, SNAPSHOT_INTERVAL_MS);
 
   browser.tabs.onUpdated.addListener(sendSnapshotBurst);
   browser.tabs.onActivated.addListener(sendSnapshotBurst);

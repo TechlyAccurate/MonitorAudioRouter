@@ -24,28 +24,28 @@ internal static class Program
     {
         Paths.Initialize();
 
-        var exeName = Path.GetFileNameWithoutExtension(Environment.ProcessPath ?? "");
-        if (args.Any(a => a.Equals("--native-host", StringComparison.OrdinalIgnoreCase)) ||
-            exeName.Equals("MonitorAudioRouterNativeHost", StringComparison.OrdinalIgnoreCase))
+        var executableName = Path.GetFileNameWithoutExtension(Environment.ProcessPath ?? "");
+        if (args.Any(argument => argument.Equals("--native-host", StringComparison.OrdinalIgnoreCase)) ||
+            executableName.Equals("MonitorAudioRouterNativeHost", StringComparison.OrdinalIgnoreCase))
         {
             NativeMessagingHost.Run();
             return 0;
         }
-        if (args.Any(a => a.Equals("--list", StringComparison.OrdinalIgnoreCase)))
+        if (args.Any(argument => argument.Equals("--list", StringComparison.OrdinalIgnoreCase)))
         {
             NativeConsole.AttachToParent();
-            Cli.ListSetupInfo();
+            CommandLineDiagnostics.ListSetupInfo();
             return 0;
         }
 
-        if (args.Any(a => a.Equals("--list-audio-sessions", StringComparison.OrdinalIgnoreCase)))
+        if (args.Any(argument => argument.Equals("--list-audio-sessions", StringComparison.OrdinalIgnoreCase)))
         {
             NativeConsole.AttachToParent();
-            Cli.ListAudioSessions();
+            CommandLineDiagnostics.ListAudioSessions();
             return 0;
         }
 
-        if (args.Any(a => a.Equals("--scan-once", StringComparison.OrdinalIgnoreCase)))
+        if (args.Any(argument => argument.Equals("--scan-once", StringComparison.OrdinalIgnoreCase)))
         {
             NativeConsole.AttachToParent();
             var settings = SettingsStore.Load();
@@ -55,7 +55,7 @@ internal static class Program
             return result.Success ? 0 : 1;
         }
 
-        if (args.Any(a => a.Equals("--clear-managed-routes", StringComparison.OrdinalIgnoreCase)))
+        if (args.Any(argument => argument.Equals("--clear-managed-routes", StringComparison.OrdinalIgnoreCase)))
         {
             NativeConsole.AttachToParent();
             var settings = SettingsStore.Load();
@@ -65,7 +65,7 @@ internal static class Program
             return result.Success ? 0 : 1;
         }
 
-        if (TryGetIntArgument(args, "--clear-pid-route") is int clearPid)
+        if (TryGetIntArgument(args, "--clear-pid-route") is int processIdToClear)
         {
             NativeConsole.AttachToParent();
             using var policy = new AppAudioPolicy();
@@ -75,19 +75,19 @@ internal static class Program
                 return 1;
             }
 
-            var before = policy.GetPersistedEndpoint(clearPid);
-            var clearOk = policy.ClearPersistedEndpoint(clearPid);
-            var after = policy.GetPersistedEndpoint(clearPid);
-            Console.WriteLine(before.HasExplicitEndpoint
-                ? $"PID {clearPid} before clear: explicit endpoint {before.EndpointId}"
-                : $"PID {clearPid} before clear: Default");
-            Console.WriteLine(after.HasExplicitEndpoint
-                ? $"PID {clearPid} after clear: explicit endpoint {after.EndpointId}"
-                : $"PID {clearPid} after clear: Default");
-            return clearOk && !after.HasExplicitEndpoint ? 0 : 1;
+            var beforeClear = policy.GetPersistedEndpoint(processIdToClear);
+            var clearSucceeded = policy.ClearPersistedEndpoint(processIdToClear);
+            var afterClear = policy.GetPersistedEndpoint(processIdToClear);
+            Console.WriteLine(beforeClear.HasExplicitEndpoint
+                ? $"PID {processIdToClear} before clear: explicit endpoint {beforeClear.EndpointId}"
+                : $"PID {processIdToClear} before clear: Default");
+            Console.WriteLine(afterClear.HasExplicitEndpoint
+                ? $"PID {processIdToClear} after clear: explicit endpoint {afterClear.EndpointId}"
+                : $"PID {processIdToClear} after clear: Default");
+            return clearSucceeded && !afterClear.HasExplicitEndpoint ? 0 : 1;
         }
 
-        if (args.Any(a => a.Equals("--probe-set-clear", StringComparison.OrdinalIgnoreCase)))
+        if (args.Any(argument => argument.Equals("--probe-set-clear", StringComparison.OrdinalIgnoreCase)))
         {
             NativeConsole.AttachToParent();
             using var devices = new AudioDeviceManager();
@@ -105,17 +105,17 @@ internal static class Program
                 return 1;
             }
 
-            var pid = Environment.ProcessId;
-            var setOk = policy.SetPersistedEndpoint(pid, endpoint.Id);
-            var afterSet = policy.GetPersistedEndpoint(pid);
-            var clearOk = policy.ClearPersistedEndpoint(pid);
-            var afterClear = policy.GetPersistedEndpoint(pid);
-            Console.WriteLine($"Set current PID {pid} to default endpoint explicitly: {setOk}; readback explicit={afterSet.HasExplicitEndpoint}");
-            Console.WriteLine($"Cleared current PID {pid} back to Default: {clearOk}; readback explicit={afterClear.HasExplicitEndpoint}");
-            return setOk && clearOk && !afterClear.HasExplicitEndpoint ? 0 : 1;
+            var currentProcessId = Environment.ProcessId;
+            var setSucceeded = policy.SetPersistedEndpoint(currentProcessId, endpoint.Id);
+            var afterSet = policy.GetPersistedEndpoint(currentProcessId);
+            var clearSucceeded = policy.ClearPersistedEndpoint(currentProcessId);
+            var afterClear = policy.GetPersistedEndpoint(currentProcessId);
+            Console.WriteLine($"Set current PID {currentProcessId} to default endpoint explicitly: {setSucceeded}; readback explicit={afterSet.HasExplicitEndpoint}");
+            Console.WriteLine($"Cleared current PID {currentProcessId} back to Default: {clearSucceeded}; readback explicit={afterClear.HasExplicitEndpoint}");
+            return setSucceeded && clearSucceeded && !afterClear.HasExplicitEndpoint ? 0 : 1;
         }
 
-        if (args.Any(a => a.Equals("--probe-tone-set-clear", StringComparison.OrdinalIgnoreCase)))
+        if (args.Any(argument => argument.Equals("--probe-tone-set-clear", StringComparison.OrdinalIgnoreCase)))
         {
             NativeConsole.AttachToParent();
             using var devices = new AudioDeviceManager();
@@ -138,33 +138,33 @@ internal static class Program
             player.PlayLooping();
             Thread.Sleep(1000);
 
-            var pid = Environment.ProcessId;
-            var setOk = policy.SetPersistedEndpoint(pid, endpoint.Id);
-            var afterSet = policy.GetPersistedEndpoint(pid);
-            var clearOk = policy.ClearPersistedEndpoint(pid);
-            var afterClear = policy.GetPersistedEndpoint(pid);
+            var currentProcessId = Environment.ProcessId;
+            var setSucceeded = policy.SetPersistedEndpoint(currentProcessId, endpoint.Id);
+            var afterSet = policy.GetPersistedEndpoint(currentProcessId);
+            var clearSucceeded = policy.ClearPersistedEndpoint(currentProcessId);
+            var afterClear = policy.GetPersistedEndpoint(currentProcessId);
             player.Stop();
 
-            Console.WriteLine($"Set audio-active PID {pid} to default endpoint explicitly: {setOk}; readback explicit={afterSet.HasExplicitEndpoint}");
-            Console.WriteLine($"Cleared audio-active PID {pid} back to Default: {clearOk}; readback explicit={afterClear.HasExplicitEndpoint}");
-            return setOk && clearOk && !afterClear.HasExplicitEndpoint ? 0 : 1;
+            Console.WriteLine($"Set audio-active PID {currentProcessId} to default endpoint explicitly: {setSucceeded}; readback explicit={afterSet.HasExplicitEndpoint}");
+            Console.WriteLine($"Cleared audio-active PID {currentProcessId} back to Default: {clearSucceeded}; readback explicit={afterClear.HasExplicitEndpoint}");
+            return setSucceeded && clearSucceeded && !afterClear.HasExplicitEndpoint ? 0 : 1;
         }
 
-        if (args.Any(a => a.Equals("--probe-policy", StringComparison.OrdinalIgnoreCase)))
+        if (args.Any(argument => argument.Equals("--probe-policy", StringComparison.OrdinalIgnoreCase)))
         {
             NativeConsole.AttachToParent();
             using var policy = new AppAudioPolicy();
-            var pid = Environment.ProcessId;
+            var currentProcessId = Environment.ProcessId;
             if (!policy.IsAvailable)
             {
                 Console.WriteLine("Policy backend unavailable. See router.log.");
                 return 1;
             }
 
-            var endpoint = policy.GetPersistedEndpoint(pid);
+            var endpoint = policy.GetPersistedEndpoint(currentProcessId);
             Console.WriteLine(endpoint.HasExplicitEndpoint
-                ? $"Policy query OK for PID {pid}: explicit endpoint {endpoint.EndpointId}"
-                : $"Policy query OK for PID {pid}: Default");
+                ? $"Policy query OK for PID {currentProcessId}: explicit endpoint {endpoint.EndpointId}"
+                : $"Policy query OK for PID {currentProcessId}: Default");
             return 0;
         }
 
@@ -248,9 +248,9 @@ internal static class Paths
         {
             File.Copy(source, destination);
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Log.Write($"Could not migrate {fileName} to user data folder: {ex.Message}");
+            Log.Write($"Could not migrate {fileName} to user data folder: {exception.Message}");
         }
     }
 }
@@ -291,10 +291,10 @@ internal sealed class SingleInstanceLock : IDisposable
             mutex.Dispose();
             return new SingleInstanceLock(null, ownsMutex: false);
         }
-        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or SystemException)
+        catch (Exception exception) when (exception is UnauthorizedAccessException or IOException or SystemException)
         {
             mutex?.Dispose();
-            Log.Write($"Could not acquire tray single-instance lock; exiting duplicate defensively: {ex.Message}");
+            Log.Write($"Could not acquire tray single-instance lock; exiting duplicate defensively: {exception.Message}");
             return new SingleInstanceLock(null, ownsMutex: false);
         }
     }
@@ -487,10 +487,10 @@ internal sealed class AboutForm : Form
         {
             Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Log.Write($"Could not open URL {url}: {ex}");
-            MessageBox.Show(ex.Message, "Could not open link", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log.Write($"Could not open URL {url}: {exception}");
+            MessageBox.Show(exception.Message, "Could not open link", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 }
@@ -574,7 +574,7 @@ internal sealed class RouterTrayContext : ApplicationContext
         configureRoutesItem.Click += (_, _) => ConfigureRoutes();
 
         var showInfoItem = new ToolStripMenuItem("Show setup info");
-        showInfoItem.Click += (_, _) => MessageBox.Show(Cli.BuildSetupInfo(), "Monitor Audio Router", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        showInfoItem.Click += (_, _) => MessageBox.Show(CommandLineDiagnostics.BuildSetupInfo(), "Monitor Audio Router", MessageBoxButtons.OK, MessageBoxIcon.Information);
 
         var aboutItem = new ToolStripMenuItem("About");
         aboutItem.Click += (_, _) => ShowAbout();
@@ -622,11 +622,11 @@ internal sealed class RouterTrayContext : ApplicationContext
             SettingsStore.Save(_settings);
             _lastStatus = desired ? "Autostart enabled" : "Autostart disabled";
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            _lastStatus = $"Autostart update failed: {ex.Message}";
-            Log.Write($"Autostart update failed: {ex}");
-            MessageBox.Show(ex.Message, "Could not update autostart", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            _lastStatus = $"Autostart update failed: {exception.Message}";
+            Log.Write($"Autostart update failed: {exception}");
+            MessageBox.Show(exception.Message, "Could not update autostart", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         RefreshTray();
@@ -638,10 +638,10 @@ internal sealed class RouterTrayContext : ApplicationContext
         {
             StartupRegistration.SetEnabled(_settings.AutostartEnabled);
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            _lastStatus = $"Autostart update failed: {ex.Message}";
-            Log.Write($"Autostart update failed: {ex}");
+            _lastStatus = $"Autostart update failed: {exception.Message}";
+            Log.Write($"Autostart update failed: {exception}");
         }
     }
 
@@ -674,10 +674,10 @@ internal sealed class RouterTrayContext : ApplicationContext
             RefreshTray();
             _scanScheduler.RequestBurst("routes saved");
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Log.Write($"Route configuration failed: {ex}");
-            MessageBox.Show(ex.Message, "Could not configure routes", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log.Write($"Route configuration failed: {exception}");
+            MessageBox.Show(exception.Message, "Could not configure routes", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -688,10 +688,10 @@ internal sealed class RouterTrayContext : ApplicationContext
             using var form = new AboutForm();
             form.ShowDialog();
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Log.Write($"About dialog failed: {ex}");
-            MessageBox.Show(ex.Message, "Could not open About", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log.Write($"About dialog failed: {exception}");
+            MessageBox.Show(exception.Message, "Could not open About", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -737,9 +737,9 @@ internal sealed class RouterTrayContext : ApplicationContext
         {
             Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            MessageBox.Show(ex.Message, "Could not open file", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(exception.Message, "Could not open file", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -766,9 +766,9 @@ internal sealed class RouterTrayContext : ApplicationContext
             var result = _engine.ClearManagedRoutes();
             Log.Write($"Exit cleanup: {result}");
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Log.Write($"Exit cleanup failed: {ex}");
+            Log.Write($"Exit cleanup failed: {exception}");
         }
     }
 }
@@ -786,14 +786,14 @@ internal sealed class RouteConfigForm : Form
     {
         _settings = settings;
         _monitors = WindowInspector.GetMonitors()
-            .OrderByDescending(m => m.Primary)
-            .ThenBy(m => m.DeviceName, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(monitor => monitor.Primary)
+            .ThenBy(monitor => monitor.DeviceName, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         using var devices = new AudioDeviceManager();
         _endpoints = devices.GetRenderEndpoints()
-            .OrderByDescending(e => e.IsDefault)
-            .ThenBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(endpoint => endpoint.IsDefault)
+            .ThenBy(endpoint => endpoint.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         InitializeComponent();
@@ -1010,7 +1010,7 @@ internal sealed class RouteConfigForm : Form
 
     private IEnumerable<AudioDeviceChoice> BuildAudioChoices()
     {
-        var defaultEndpoint = _endpoints.FirstOrDefault(e => e.IsDefault);
+        var defaultEndpoint = _endpoints.FirstOrDefault(endpoint => endpoint.IsDefault);
         var defaultLabel = defaultEndpoint is null
             ? "Default"
             : $"Default (current system default: {defaultEndpoint.Name})";
@@ -1024,7 +1024,7 @@ internal sealed class RouteConfigForm : Form
 
     private void SelectConfiguredChoice(ComboBox combo, MonitorInfo monitor)
     {
-        var route = _settings.MonitorRoutes.FirstOrDefault(r => r.Matches(monitor));
+        var route = _settings.MonitorRoutes.FirstOrDefault(route => route.Matches(monitor));
         if (route is not null && !route.UsesSystemDefault)
         {
             var endpoint = route.FindEndpoint(_endpoints);
@@ -1040,13 +1040,13 @@ internal sealed class RouteConfigForm : Form
 
     private static void SelectEndpoint(ComboBox combo, AudioEndpoint endpoint)
     {
-        for (var i = 0; i < combo.Items.Count; i++)
+        for (var itemIndex = 0; itemIndex < combo.Items.Count; itemIndex++)
         {
-            if (combo.Items[i] is AudioDeviceChoice choice &&
+            if (combo.Items[itemIndex] is AudioDeviceChoice choice &&
                 choice.Endpoint is not null &&
                 string.Equals(choice.Endpoint.Id, endpoint.Id, StringComparison.OrdinalIgnoreCase))
             {
-                combo.SelectedIndex = i;
+                combo.SelectedIndex = itemIndex;
                 return;
             }
         }
@@ -1082,9 +1082,9 @@ internal sealed class RouteConfigForm : Form
         {
             Process.Start(new ProcessStartInfo(Paths.ConfigFile) { UseShellExecute = true });
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            MessageBox.Show(ex.Message, "Could not open config JSON", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(exception.Message, "Could not open config JSON", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -1152,7 +1152,8 @@ internal sealed class RouteConfigForm : Form
             return null;
         }
 
-        var duplicateCount = _monitors.Count(m => string.Equals(GetStableMonitorDeviceId(m.DeviceId), stableId, StringComparison.OrdinalIgnoreCase));
+        var duplicateCount = _monitors.Count(monitor =>
+            string.Equals(GetStableMonitorDeviceId(monitor.DeviceId), stableId, StringComparison.OrdinalIgnoreCase));
         return duplicateCount <= 1 ? stableId : monitor.DeviceId.Trim();
     }
 
@@ -1309,15 +1310,15 @@ internal static class AppUpdater
                 WorkingDirectory = updateDir
             });
         }
-        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        catch (System.ComponentModel.Win32Exception exception) when (exception.NativeErrorCode == 1223)
         {
             Log.Write("App update canceled at the Windows permission prompt.");
             MessageBox.Show(owner, "The update was canceled.", "App update", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Log.Write($"App update failed: {ex}");
-            MessageBox.Show(owner, ex.Message, "Could not update app", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            Log.Write($"App update failed: {exception}");
+            MessageBox.Show(owner, exception.Message, "Could not update app", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
     }
 
@@ -1451,9 +1452,9 @@ internal static class AppUpdater
     {
         var leftParts = new[] { left.Major, left.Minor, Math.Max(0, left.Build), Math.Max(0, left.Revision) };
         var rightParts = new[] { right.Major, right.Minor, Math.Max(0, right.Build), Math.Max(0, right.Revision) };
-        for (var i = 0; i < leftParts.Length; i++)
+        for (var partIndex = 0; partIndex < leftParts.Length; partIndex++)
         {
-            var comparison = leftParts[i].CompareTo(rightParts[i]);
+            var comparison = leftParts[partIndex].CompareTo(rightParts[partIndex]);
             if (comparison != 0)
             {
                 return comparison;
@@ -1470,14 +1471,14 @@ internal static class AppUpdater
 
     private static string SanitizePathPart(string value)
     {
-        var invalid = Path.GetInvalidFileNameChars();
-        var builder = new StringBuilder(value.Length);
-        foreach (var c in value)
+        var invalidPathCharacters = Path.GetInvalidFileNameChars();
+        var pathPartBuilder = new StringBuilder(value.Length);
+        foreach (var character in value)
         {
-            builder.Append(invalid.Contains(c) ? '_' : c);
+            pathPartBuilder.Append(invalidPathCharacters.Contains(character) ? '_' : character);
         }
 
-        return builder.Length == 0 ? "latest" : builder.ToString();
+        return pathPartBuilder.Length == 0 ? "latest" : pathPartBuilder.ToString();
     }
 
     private sealed record ReleaseInfo(string TagName, string SetupDownloadUrl, string ChecksumsDownloadUrl);
@@ -1570,37 +1571,37 @@ internal static class MonitorAudioAutoDetector
 
     private static IEnumerable<string> Tokenize(string text)
     {
-        var token = new StringBuilder();
-        foreach (var ch in text)
+        var currentToken = new StringBuilder();
+        foreach (var character in text)
         {
-            if (char.IsLetterOrDigit(ch))
+            if (char.IsLetterOrDigit(character))
             {
-                token.Append(char.ToUpperInvariant(ch));
+                currentToken.Append(char.ToUpperInvariant(character));
                 continue;
             }
 
-            foreach (var value in FlushToken(token))
+            foreach (var value in FlushToken(currentToken))
             {
                 yield return value;
             }
         }
 
-        foreach (var value in FlushToken(token))
+        foreach (var value in FlushToken(currentToken))
         {
             yield return value;
         }
     }
 
-    private static IEnumerable<string> FlushToken(StringBuilder token)
+    private static IEnumerable<string> FlushToken(StringBuilder tokenBuilder)
     {
-        if (token.Length == 0)
+        if (tokenBuilder.Length == 0)
         {
             yield break;
         }
 
-        var value = token.ToString();
-        token.Clear();
-        foreach (var candidate in ExpandToken(value))
+        var tokenValue = tokenBuilder.ToString();
+        tokenBuilder.Clear();
+        foreach (var candidate in ExpandToken(tokenValue))
         {
             if (candidate.Length >= 3 && !NoiseTokens.Contains(candidate))
             {
@@ -1615,15 +1616,15 @@ internal static class MonitorAudioAutoDetector
 
         var letters = new StringBuilder();
         var digits = new StringBuilder();
-        foreach (var ch in token)
+        foreach (var character in token)
         {
-            if (char.IsLetter(ch))
+            if (char.IsLetter(character))
             {
-                letters.Append(ch);
+                letters.Append(character);
             }
-            else if (char.IsDigit(ch))
+            else if (char.IsDigit(character))
             {
-                digits.Append(ch);
+                digits.Append(character);
             }
         }
 
@@ -1650,16 +1651,16 @@ internal static class MonitorAudioAutoDetector
             return "";
         }
 
-        var builder = new StringBuilder(value.Length);
-        foreach (var ch in value)
+        var compactValueBuilder = new StringBuilder(value.Length);
+        foreach (var character in value)
         {
-            if (char.IsLetterOrDigit(ch))
+            if (char.IsLetterOrDigit(character))
             {
-                builder.Append(char.ToUpperInvariant(ch));
+                compactValueBuilder.Append(char.ToUpperInvariant(character));
             }
         }
 
-        return builder.ToString();
+        return compactValueBuilder.ToString();
     }
 }
 
@@ -1741,11 +1742,11 @@ internal sealed class ScanScheduler : IDisposable
         {
             _scan(reason);
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
             Log.WriteThrottled(
-                "scan-scheduler-failed:" + ex.Message,
-                $"Scheduled scan failed: {ex.Message}",
+                "scan-scheduler-failed:" + exception.Message,
+                $"Scheduled scan failed: {exception.Message}",
                 TimeSpan.FromMinutes(1));
         }
 
@@ -1888,9 +1889,9 @@ internal sealed class BrowserHintServer : IDisposable
             {
                 break;
             }
-            catch (Exception ex)
+            catch (Exception exception)
             {
-                Log.Write($"Browser hint server error: {ex.Message}");
+                Log.Write($"Browser hint server error: {exception.Message}");
                 await Task.Delay(1000, token).ContinueWith(_ => { }, TaskScheduler.Default);
             }
         }
@@ -2101,25 +2102,25 @@ internal static class BrowserHintStore
             // Extension payloads are local, but still treated as a boundary:
             // clamp counts and title lengths before saving anything in memory.
             var windows = (update.Windows ?? new List<BrowserHintWindowUpdate>())
-                .Where(w => w.Width > 0 && w.Height > 0)
+                .Where(windowUpdate => windowUpdate.Width > 0 && windowUpdate.Height > 0)
                 .Take(MaxHintWindows)
-                .Select(w => new BrowserHintWindow(
-                    w.WindowId,
-                    new Rectangle(w.Left, w.Top, w.Width, w.Height),
-                    (w.ProcessIds ?? new List<int>())
-                        .Where(pid => pid > 0)
+                .Select(windowUpdate => new BrowserHintWindow(
+                    windowUpdate.WindowId,
+                    new Rectangle(windowUpdate.Left, windowUpdate.Top, windowUpdate.Width, windowUpdate.Height),
+                    (windowUpdate.ProcessIds ?? new List<int>())
+                        .Where(processId => processId > 0)
                         .Distinct()
                         .Take(MaxProcessIdsPerWindow)
                         .ToList(),
-                    (w.Titles ?? new List<string>())
+                    (windowUpdate.Titles ?? new List<string>())
                         .Select(NormalizeHintTitle)
-                        .Where(t => t.Length > 0)
+                        .Where(title => title.Length > 0)
                         .Distinct(StringComparer.OrdinalIgnoreCase)
                         .Take(MaxTitlesPerWindow)
                         .ToList(),
-                    (w.WindowTitles ?? new List<string>())
+                    (windowUpdate.WindowTitles ?? new List<string>())
                         .Select(NormalizeHintTitle)
-                        .Where(t => t.Length > 0)
+                        .Where(title => title.Length > 0)
                         .Distinct(StringComparer.OrdinalIgnoreCase)
                         .Take(MaxTitlesPerWindow)
                         .ToList()))
@@ -2140,11 +2141,11 @@ internal static class BrowserHintStore
             var changed = LogHintIfChanged(processName, windows, preferredWindowId);
             return changed;
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
             Log.WriteThrottled(
-                "browser-hint-parse-error:" + ex.Message,
-                $"Browser hint parse error: {ShortError(ex.Message)}",
+                "browser-hint-parse-error:" + exception.Message,
+                $"Browser hint parse error: {ShortError(exception.Message)}",
                 TimeSpan.FromMinutes(1));
             return false;
         }
@@ -2155,12 +2156,12 @@ internal static class BrowserHintStore
         var cutoff = DateTimeOffset.UtcNow.AddSeconds(-12);
         lock (LockObject)
         {
-            foreach (var stale in HintsByProcess.Where(kvp => kvp.Value.UpdatedUtc < cutoff).Select(kvp => kvp.Key).ToList())
+            foreach (var stale in HintsByProcess.Where(entry => entry.Value.UpdatedUtc < cutoff).Select(entry => entry.Key).ToList())
             {
                 HintsByProcess.Remove(stale);
             }
 
-            return HintsByProcess.ToDictionary(kvp => kvp.Key, kvp => kvp.Value, StringComparer.OrdinalIgnoreCase);
+            return HintsByProcess.ToDictionary(entry => entry.Key, entry => entry.Value, StringComparer.OrdinalIgnoreCase);
         }
     }
 
@@ -2255,10 +2256,10 @@ internal static class BrowserHintStore
     {
         var monitors = WindowInspector.GetMonitors();
         var signatureParts = windows
-            .Select(w =>
+            .Select(hintWindow =>
             {
-                var monitor = WindowInspector.PickMonitor(w.Bounds, monitors);
-                return $"id={w.WindowId};{ShortBounds(w.Bounds)}>{monitor.BoundsKey};pids={CompactPidList(w.ProcessIds)};tabs={w.Titles.Count};active={w.WindowTitles.Count};titles={CompactTitleSignature(w)}";
+                var monitor = WindowInspector.PickMonitor(hintWindow.Bounds, monitors);
+                return $"id={hintWindow.WindowId};{ShortBounds(hintWindow.Bounds)}>{monitor.BoundsKey};processIds={CompactProcessIdList(hintWindow.ProcessIds)};tabs={hintWindow.Titles.Count};active={hintWindow.WindowTitles.Count};titles={CompactTitleSignature(hintWindow)}";
             });
         var signature = $"{processName}|preferred={preferredWindowId?.ToString() ?? "none"}|{string.Join("|", signatureParts)}";
         lock (LockObject)
@@ -2272,11 +2273,11 @@ internal static class BrowserHintStore
             LastLoggedHintSignatures[processName] = signature;
         }
 
-        var summary = string.Join("; ", windows.Select((w, index) =>
+        var summary = string.Join("; ", windows.Select((hintWindow, index) =>
         {
-            var monitor = WindowInspector.PickMonitor(w.Bounds, monitors);
-            var activeTitle = w.WindowTitles.FirstOrDefault() ?? w.Titles.FirstOrDefault() ?? "";
-            return $"w{index + 1}@{ShortMonitor(monitor)} bounds={ShortBounds(w.Bounds)} pids={CompactPidList(w.ProcessIds)} tabs={w.Titles.Count} active=\"{ShortLogValue(activeTitle)}\"";
+            var monitor = WindowInspector.PickMonitor(hintWindow.Bounds, monitors);
+            var activeTitle = hintWindow.WindowTitles.FirstOrDefault() ?? hintWindow.Titles.FirstOrDefault() ?? "";
+            return $"w{index + 1}@{ShortMonitor(monitor)} bounds={ShortBounds(hintWindow.Bounds)} processIds={CompactProcessIdList(hintWindow.ProcessIds)} tabs={hintWindow.Titles.Count} active=\"{ShortLogValue(activeTitle)}\"";
         }));
         Log.Write(
             $"Browser hint: {processName} windows={windows.Count} preferred={preferredWindowId?.ToString() ?? "none"}" +
@@ -2305,8 +2306,8 @@ internal static class BrowserHintStore
     {
         return hintWindow.Titles
             .Concat(hintWindow.WindowTitles)
-            .Select(t => t.Trim())
-            .Where(t => t.Length > 0)
+            .Select(title => title.Trim())
+            .Where(title => title.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
@@ -2385,17 +2386,17 @@ internal static class BrowserHintStore
         return $"{bounds.X},{bounds.Y},{bounds.Width}x{bounds.Height}";
     }
 
-    private static string CompactPidList(List<int> processIds)
+    private static string CompactProcessIdList(List<int> processIds)
     {
         if (processIds.Count == 0)
         {
             return "none";
         }
 
-        var visible = processIds.Take(3).Select(pid => pid.ToString());
+        var visibleProcessIds = processIds.Take(3).Select(processId => processId.ToString());
         return processIds.Count <= 3
-            ? string.Join(",", visible)
-            : string.Join(",", visible) + $"+{processIds.Count - 3}";
+            ? string.Join(",", visibleProcessIds)
+            : string.Join(",", visibleProcessIds) + $"+{processIds.Count - 3}";
     }
 
     private static string CompactTitleSignature(BrowserHintWindow window)
@@ -2591,38 +2592,38 @@ internal static class NativeMessagingHost
 
     private static string? ReadMessage(Stream input)
     {
-        var lengthBytes = ReadExact(input, 4);
-        if (lengthBytes is null)
+        var messageLengthBytes = ReadExact(input, 4);
+        if (messageLengthBytes is null)
         {
             return null;
         }
 
-        var length = BitConverter.ToInt32(lengthBytes, 0);
-        if (length <= 0 || length > 1024 * 1024)
+        var messageLength = BitConverter.ToInt32(messageLengthBytes, 0);
+        if (messageLength <= 0 || messageLength > 1024 * 1024)
         {
             return null;
         }
 
-        var payload = ReadExact(input, length);
-        return payload is null ? null : Encoding.UTF8.GetString(payload);
+        var payloadBytes = ReadExact(input, messageLength);
+        return payloadBytes is null ? null : Encoding.UTF8.GetString(payloadBytes);
     }
 
-    private static byte[]? ReadExact(Stream stream, int count)
+    private static byte[]? ReadExact(Stream stream, int requestedByteCount)
     {
-        var buffer = new byte[count];
-        var offset = 0;
-        while (offset < count)
+        var resultBuffer = new byte[requestedByteCount];
+        var bytesRead = 0;
+        while (bytesRead < requestedByteCount)
         {
-            var read = stream.Read(buffer, offset, count - offset);
-            if (read == 0)
+            var bytesReadThisCall = stream.Read(resultBuffer, bytesRead, requestedByteCount - bytesRead);
+            if (bytesReadThisCall == 0)
             {
                 return null;
             }
 
-            offset += read;
+            bytesRead += bytesReadThisCall;
         }
 
-        return buffer;
+        return resultBuffer;
     }
 
     private static bool ForwardToTray(string json)
@@ -2635,11 +2636,11 @@ internal static class NativeMessagingHost
             writer.WriteLine(BrowserBridgeSecurity.CreateEnvelope(json));
             return true;
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
             Log.WriteThrottled(
-                "native-host-forward-failed:" + ex.Message,
-                $"Native host forward failed: {ex.Message}",
+                "native-host-forward-failed:" + exception.Message,
+                $"Native host forward failed: {exception.Message}",
                 TimeSpan.FromMinutes(5));
             return false;
         }
@@ -2648,8 +2649,8 @@ internal static class NativeMessagingHost
     private static void WriteMessage(Stream output, string json)
     {
         var payload = Encoding.UTF8.GetBytes(json);
-        var length = BitConverter.GetBytes(payload.Length);
-        output.Write(length, 0, length.Length);
+        var lengthBytes = BitConverter.GetBytes(payload.Length);
+        output.Write(lengthBytes, 0, lengthBytes.Length);
         output.Write(payload, 0, payload.Length);
         output.Flush();
     }
@@ -2729,8 +2730,8 @@ internal sealed class RoutingEngine : IDisposable
             var windows = WindowInspector.GetVisibleWindows()
                 .Where(IsAllowedWindow)
                 .ToList();
-            var targetBuild = BuildPidTargets(windows, devices, endpoints);
-            var targetPids = targetBuild.Targets;
+            var routeTargetBuild = BuildProcessRouteTargets(windows, devices, endpoints);
+            var processRouteTargets = routeTargetBuild.Targets;
             var changed = 0;
             var skippedManual = 0;
             var failed = 0;
@@ -2739,14 +2740,14 @@ internal sealed class RoutingEngine : IDisposable
             // window/audio target still needs. Held browser routes are spared
             // while the browser is paused, ambiguous, or waking after sleep.
             PrunePowerResumeManagedRoutes(DateTimeOffset.UtcNow);
-            var untargeted = ClearUntargetedManagedRoutes(targetPids, targetBuild.HeldPids);
+            var untargeted = ClearUntargetedManagedRoutes(processRouteTargets, routeTargetBuild.HeldProcessIds);
             changed += untargeted.Changed;
             failed += untargeted.Failed;
 
             // Then apply the desired route for every PID that currently has a
             // window/audio target. Manual Windows Volume Mixer assignments take
             // priority over this automatic routing.
-            foreach (var target in targetPids.Values)
+            foreach (var target in processRouteTargets.Values)
             {
                 if (target.Endpoint is null)
                 {
@@ -2844,12 +2845,12 @@ internal sealed class RoutingEngine : IDisposable
             }
 
             StateStore.Save(_state);
-            return new ScanResult(failed == 0, $"Windows: {windows.Count}, targets: {targetPids.Count}", targetPids.Count, changed, skippedManual);
+            return new ScanResult(failed == 0, $"Windows: {windows.Count}, targets: {processRouteTargets.Count}", processRouteTargets.Count, changed, skippedManual);
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Log.Write(ex.ToString());
-            return new ScanResult(false, ex.Message, 0, 0, 0);
+            Log.Write(exception.ToString());
+            return new ScanResult(false, exception.Message, 0, 0, 0);
         }
     }
 
@@ -2889,8 +2890,8 @@ internal sealed class RoutingEngine : IDisposable
     }
 
     private (int Changed, int Failed) ClearUntargetedManagedRoutes(
-        Dictionary<int, PidTarget> targets,
-        HashSet<int> heldPids)
+        Dictionary<int, ProcessRouteTarget> targets,
+        HashSet<int> heldProcessIds)
     {
         // A managed route becomes untargeted when no visible window/audio hint
         // currently maps that PID to a monitor. For normal apps this usually
@@ -2912,7 +2913,7 @@ internal sealed class RoutingEngine : IDisposable
                 continue;
             }
 
-            if (heldPids.Contains(route.ProcessId))
+            if (heldProcessIds.Contains(route.ProcessId))
             {
                 var heldEndpoint = _policy.GetPersistedEndpoint(route.ProcessId);
                 if (heldEndpoint.HasExplicitEndpoint &&
@@ -2950,7 +2951,7 @@ internal sealed class RoutingEngine : IDisposable
         return (changed, failed);
     }
 
-    private bool SetOwnedRouteWithReadback(PidTarget target, List<AudioEndpoint> endpoints)
+    private bool SetOwnedRouteWithReadback(ProcessRouteTarget target, List<AudioEndpoint> endpoints)
     {
         // Only write state.json after Windows reports the same explicit
         // endpoint we just requested. This prevents the app from "owning" a
@@ -3039,7 +3040,7 @@ internal sealed class RoutingEngine : IDisposable
     }
 
     private ManagedRoute? TryGetPowerResumeManagedRoute(
-        PidTarget target,
+        ProcessRouteTarget target,
         PersistedEndpoint currentEndpoint,
         List<AudioEndpoint> endpoints)
     {
@@ -3100,7 +3101,7 @@ internal sealed class RoutingEngine : IDisposable
         return process is not null && MatchesProcessIdentity(route, process.Value);
     }
 
-    private PidTargetBuildResult BuildPidTargets(
+    private ProcessRouteTargetBuildResult BuildProcessRouteTargets(
         List<WindowInfo> windows,
         AudioDeviceManager devices,
         List<AudioEndpoint> endpoints)
@@ -3110,19 +3111,19 @@ internal sealed class RoutingEngine : IDisposable
         // map directly by PID. Browsers need extension hints because many tabs
         // can share a process and one browser process can have windows on
         // several monitors.
-        var audioSessionPids = devices.GetAudioSessionProcessIds().ToHashSet();
+        var audioSessionProcessIds = devices.GetAudioSessionProcessIds().ToHashSet();
         var processSnapshot = _settings.RouteChildProcesses ? ProcessSnapshot.Capture() : ProcessSnapshot.Empty;
         var hints = BrowserHintStore.GetSnapshot();
-        var result = new Dictionary<int, PidTarget>();
-        var ambiguousPids = new HashSet<int>();
-        var authoritativeHintPids = new HashSet<int>();
+        var processRouteTargets = new Dictionary<int, ProcessRouteTarget>();
+        var ambiguousProcessIds = new HashSet<int>();
+        var authoritativeHintProcessIds = new HashSet<int>();
 
         AddHintTargets(
-            result,
-            ambiguousPids,
-            authoritativeHintPids,
+            processRouteTargets,
+            ambiguousProcessIds,
+            authoritativeHintProcessIds,
             hints,
-            audioSessionPids,
+            audioSessionProcessIds,
             windows,
             endpoints);
 
@@ -3134,11 +3135,11 @@ internal sealed class RoutingEngine : IDisposable
             }
 
             var endpoint = FindEndpointForMonitor(window.Monitor, endpoints);
-            if (audioSessionPids.Contains(window.ProcessId) &&
-                !authoritativeHintPids.Contains(window.ProcessId))
+            if (audioSessionProcessIds.Contains(window.ProcessId) &&
+                !authoritativeHintProcessIds.Contains(window.ProcessId))
             {
-                var target = new PidTarget(window.ProcessId, window.ProcessName, window.ProcessStartUtc, window.Monitor, endpoint);
-                AddTarget(result, ambiguousPids, target);
+                var target = new ProcessRouteTarget(window.ProcessId, window.ProcessName, window.ProcessStartUtc, window.Monitor, endpoint);
+                AddRouteTarget(processRouteTargets, ambiguousProcessIds, target);
             }
 
             if (!_settings.RouteChildProcesses)
@@ -3153,25 +3154,25 @@ internal sealed class RoutingEngine : IDisposable
                     continue;
                 }
 
-                if (!audioSessionPids.Contains(child.ProcessId) ||
-                    authoritativeHintPids.Contains(child.ProcessId))
+                if (!audioSessionProcessIds.Contains(child.ProcessId) ||
+                    authoritativeHintProcessIds.Contains(child.ProcessId))
                 {
                     continue;
                 }
 
-                AddTarget(result, ambiguousPids, new PidTarget(child.ProcessId, child.ProcessName, child.ProcessStartUtc, window.Monitor, endpoint));
+                AddRouteTarget(processRouteTargets, ambiguousProcessIds, new ProcessRouteTarget(child.ProcessId, child.ProcessName, child.ProcessStartUtc, window.Monitor, endpoint));
             }
         }
 
-        foreach (var pid in result.Keys)
+        foreach (var processId in processRouteTargets.Keys)
         {
-            _lastAmbiguousTarget.Remove(pid);
+            _lastAmbiguousTarget.Remove(processId);
         }
 
-        var heldPids = new HashSet<int>(ambiguousPids);
+        var heldProcessIds = new HashSet<int>(ambiguousProcessIds);
         foreach (var route in _state.Managed.Values)
         {
-            if (result.ContainsKey(route.ProcessId) ||
+            if (processRouteTargets.ContainsKey(route.ProcessId) ||
                 !BrowserHintStore.IsBrowserProcessName(route.ProcessName))
             {
                 continue;
@@ -3180,7 +3181,7 @@ internal sealed class RoutingEngine : IDisposable
             var process = GetProcessInfo(route.ProcessId);
             if (process is not null && MatchesProcessIdentity(route, process.Value))
             {
-                heldPids.Add(route.ProcessId);
+                heldProcessIds.Add(route.ProcessId);
                 Log.WriteThrottled(
                     $"held-browser-route-{route.ProcessId}",
                     $"Held the last verified route for PID {route.ProcessId} ({route.ProcessName}) while its browser window is paused or ambiguous.",
@@ -3188,16 +3189,16 @@ internal sealed class RoutingEngine : IDisposable
             }
         }
 
-        LogDebugRoutingIfChanged(windows, audioSessionPids, hints, result);
+        LogDebugRoutingIfChanged(windows, audioSessionProcessIds, hints, processRouteTargets);
 
-        return new PidTargetBuildResult(result, heldPids);
+        return new ProcessRouteTargetBuildResult(processRouteTargets, heldProcessIds);
     }
 
     private void LogDebugRoutingIfChanged(
         List<WindowInfo> windows,
-        HashSet<int> audioSessionPids,
+        HashSet<int> audioSessionProcessIds,
         Dictionary<string, BrowserHintSet> hints,
-        Dictionary<int, PidTarget> targets)
+        Dictionary<int, ProcessRouteTarget> targets)
     {
         if (!_settings.DebugLogging)
         {
@@ -3211,12 +3212,12 @@ internal sealed class RoutingEngine : IDisposable
         }
 
         var browserWindows = windows
-            .Where(w => BrowserHintStore.IsBrowserProcessName(w.ProcessName))
-            .Select(w => $"{w.ProcessId}@{w.Monitor.BoundsKey}:{ShortTitle(w.Title)}");
-        var hintSummary = hints.Values.Select(h => $"{h.ProcessName}:{h.Windows.Count}");
-        var targetSummary = targets.Values.Select(t => $"{t.ProcessId}->{t.Endpoint?.Name ?? "<none>"}@{t.Monitor.BoundsKey}");
+            .Where(window => BrowserHintStore.IsBrowserProcessName(window.ProcessName))
+            .Select(window => $"{window.ProcessId}@{window.Monitor.BoundsKey}:{ShortTitle(window.Title)}");
+        var hintSummary = hints.Values.Select(hintSet => $"{hintSet.ProcessName}:{hintSet.Windows.Count}");
+        var targetSummary = targets.Values.Select(target => $"{target.ProcessId}->{target.Endpoint?.Name ?? "<none>"}@{target.Monitor.BoundsKey}");
         var signature =
-            $"audio=[{string.Join(",", audioSessionPids.OrderBy(pid => pid))}] " +
+            $"audio=[{string.Join(",", audioSessionProcessIds.OrderBy(processId => processId))}] " +
             $"hints=[{string.Join(",", hintSummary)}] " +
             $"browserWindows=[{string.Join(";", browserWindows)}] " +
             $"targets=[{string.Join(";", targetSummary)}]";
@@ -3231,11 +3232,11 @@ internal sealed class RoutingEngine : IDisposable
     }
 
     private void AddHintTargets(
-        Dictionary<int, PidTarget> targets,
-        HashSet<int> ambiguousPids,
-        HashSet<int> authoritativeHintPids,
+        Dictionary<int, ProcessRouteTarget> targets,
+        HashSet<int> ambiguousProcessIds,
+        HashSet<int> authoritativeHintProcessIds,
         Dictionary<string, BrowserHintSet> hints,
-        HashSet<int> audioSessionPids,
+        HashSet<int> audioSessionProcessIds,
         List<WindowInfo> windows,
         List<AudioEndpoint> endpoints)
     {
@@ -3248,7 +3249,7 @@ internal sealed class RoutingEngine : IDisposable
         {
             var usableExplicitProcessIds = hintSet.Windows
                 .SelectMany(window => window.ProcessIds)
-                .Where(audioSessionPids.Contains)
+                .Where(audioSessionProcessIds.Contains)
                 .ToHashSet();
             var routeWindows = hintSet.Windows;
             if (hintSet.PreferredWindowId is int preferredWindowId &&
@@ -3265,7 +3266,7 @@ internal sealed class RoutingEngine : IDisposable
             }
 
             var inferredProcess = routeWindows.Count == 1
-                ? audioSessionPids
+                ? audioSessionProcessIds
                     .Select(GetProcessInfo)
                     .Where(process =>
                         process is not null &&
@@ -3294,7 +3295,7 @@ internal sealed class RoutingEngine : IDisposable
                 var matchedExplicitProcessIds = 0;
                 foreach (var processId in hintWindow.ProcessIds.Distinct())
                 {
-                    if (!audioSessionPids.Contains(processId))
+                    if (!audioSessionProcessIds.Contains(processId))
                     {
                         continue;
                     }
@@ -3306,8 +3307,8 @@ internal sealed class RoutingEngine : IDisposable
                     }
 
                     matchedExplicitProcessIds++;
-                    AddTarget(targets, ambiguousPids, new PidTarget(processId, process.Value.ProcessName, process.Value.StartUtc, monitor, endpoint));
-                    authoritativeHintPids.Add(processId);
+                    AddRouteTarget(targets, ambiguousProcessIds, new ProcessRouteTarget(processId, process.Value.ProcessName, process.Value.StartUtc, monitor, endpoint));
+                    authoritativeHintProcessIds.Add(processId);
                 }
 
                 if (matchedExplicitProcessIds == 0 && inferredProcess.Count == 1)
@@ -3317,11 +3318,11 @@ internal sealed class RoutingEngine : IDisposable
                         $"inferred-browser-route-{process.ProcessId}-{monitor.BoundsKey}",
                         $"Matched PID {process.ProcessId} ({process.ProcessName}) to the sole audible browser window on {monitor.DeviceName}.",
                         TimeSpan.FromMinutes(5));
-                    AddTarget(
+                    AddRouteTarget(
                         targets,
-                        ambiguousPids,
-                        new PidTarget(process.ProcessId, process.ProcessName, process.StartUtc, monitor, endpoint));
-                    authoritativeHintPids.Add(process.ProcessId);
+                        ambiguousProcessIds,
+                        new ProcessRouteTarget(process.ProcessId, process.ProcessName, process.StartUtc, monitor, endpoint));
+                    authoritativeHintProcessIds.Add(process.ProcessId);
                 }
             }
         }
@@ -3429,9 +3430,12 @@ internal sealed class RoutingEngine : IDisposable
                route.ProcessStartUtcTicks.Value == process.StartUtc.Value.UtcTicks;
     }
 
-    private void AddTarget(Dictionary<int, PidTarget> targets, HashSet<int> ambiguousPids, PidTarget target)
+    private void AddRouteTarget(
+        Dictionary<int, ProcessRouteTarget> targets,
+        HashSet<int> ambiguousProcessIds,
+        ProcessRouteTarget target)
     {
-        if (ambiguousPids.Contains(target.ProcessId))
+        if (ambiguousProcessIds.Contains(target.ProcessId))
         {
             return;
         }
@@ -3441,7 +3445,7 @@ internal sealed class RoutingEngine : IDisposable
             if (!EndpointIdsEqual(existing.Endpoint?.Id, target.Endpoint?.Id))
             {
                 targets.Remove(target.ProcessId);
-                ambiguousPids.Add(target.ProcessId);
+                ambiguousProcessIds.Add(target.ProcessId);
                 var key = $"{existing.Endpoint?.Id ?? "<none>"}|{target.Endpoint?.Id ?? "<none>"}";
                 if (!_lastAmbiguousTarget.TryGetValue(target.ProcessId, out var previous) ||
                     !previous.Equals(key, StringComparison.OrdinalIgnoreCase))
@@ -3459,7 +3463,7 @@ internal sealed class RoutingEngine : IDisposable
 
     private AudioEndpoint? FindEndpointForMonitor(MonitorInfo monitor, List<AudioEndpoint> endpoints)
     {
-        var defaultEndpoint = endpoints.FirstOrDefault(e => e.IsDefault);
+        var defaultEndpoint = endpoints.FirstOrDefault(endpoint => endpoint.IsDefault);
         foreach (var route in _settings.MonitorRoutes)
         {
             if (route.Matches(monitor))
@@ -3479,8 +3483,8 @@ internal sealed class RoutingEngine : IDisposable
             return false;
         }
 
-        if (_settings.IgnoreWindowTitlesContaining.Any(s => !string.IsNullOrWhiteSpace(s) &&
-                                                            window.Title.Contains(s, StringComparison.OrdinalIgnoreCase)))
+        if (_settings.IgnoreWindowTitlesContaining.Any(ignoredTitleText => !string.IsNullOrWhiteSpace(ignoredTitleText) &&
+                                                                           window.Title.Contains(ignoredTitleText, StringComparison.OrdinalIgnoreCase)))
         {
             return false;
         }
@@ -3490,13 +3494,13 @@ internal sealed class RoutingEngine : IDisposable
 
     private bool IsAllowedProcessName(string processName)
     {
-        if (_settings.IgnoreProcessNames.Any(p => ProcessNameMatches(processName, p)))
+        if (_settings.IgnoreProcessNames.Any(configuredProcessName => ProcessNameMatches(processName, configuredProcessName)))
         {
             return false;
         }
 
         return _settings.AllowProcessNames.Count == 0 ||
-               _settings.AllowProcessNames.Any(p => ProcessNameMatches(processName, p));
+               _settings.AllowProcessNames.Any(configuredProcessName => ProcessNameMatches(processName, configuredProcessName));
     }
 
     private static bool ProcessNameMatches(string actual, string configured)
@@ -3675,7 +3679,7 @@ internal static class EndpointMatcher
     {
         if (!string.IsNullOrWhiteSpace(idContains))
         {
-            var match = endpoints.FirstOrDefault(e => e.Id.Contains(idContains, StringComparison.OrdinalIgnoreCase));
+            var match = endpoints.FirstOrDefault(endpoint => endpoint.Id.Contains(idContains, StringComparison.OrdinalIgnoreCase));
             if (match is not null)
             {
                 return match;
@@ -3684,7 +3688,7 @@ internal static class EndpointMatcher
 
         if (!string.IsNullOrWhiteSpace(nameContains))
         {
-            var match = endpoints.FirstOrDefault(e => e.Name.Contains(nameContains, StringComparison.OrdinalIgnoreCase));
+            var match = endpoints.FirstOrDefault(endpoint => endpoint.Name.Contains(nameContains, StringComparison.OrdinalIgnoreCase));
             if (match is not null)
             {
                 return match;
@@ -3716,7 +3720,7 @@ internal sealed class ManagedRoute
     public string EndpointName { get; set; } = "";
     public DateTimeOffset LastSetUtc { get; set; }
 
-    public static ManagedRoute FromTarget(PidTarget target)
+    public static ManagedRoute FromTarget(ProcessRouteTarget target)
     {
         return new ManagedRoute
         {
@@ -3730,7 +3734,7 @@ internal sealed class ManagedRoute
     }
 }
 
-internal sealed record PidTarget(int ProcessId, string ProcessName, DateTimeOffset? ProcessStartUtc, MonitorInfo Monitor, AudioEndpoint? Endpoint)
+internal sealed record ProcessRouteTarget(int ProcessId, string ProcessName, DateTimeOffset? ProcessStartUtc, MonitorInfo Monitor, AudioEndpoint? Endpoint)
 {
     public bool MatchesProcessIdentity(ManagedRoute route)
     {
@@ -3746,9 +3750,9 @@ internal sealed record PidTarget(int ProcessId, string ProcessName, DateTimeOffs
     }
 }
 
-internal sealed record PidTargetBuildResult(
-    Dictionary<int, PidTarget> Targets,
-    HashSet<int> HeldPids);
+internal sealed record ProcessRouteTargetBuildResult(
+    Dictionary<int, ProcessRouteTarget> Targets,
+    HashSet<int> HeldProcessIds);
 
 internal static class SettingsStore
 {
@@ -3775,9 +3779,9 @@ internal static class SettingsStore
             var json = File.ReadAllText(Paths.ConfigFile);
             return JsonSerializer.Deserialize<RouterSettings>(json, JsonOptions) ?? new RouterSettings();
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Log.Write($"Could not load config: {ex}");
+            Log.Write($"Could not load config: {exception}");
             return new RouterSettings();
         }
     }
@@ -3804,9 +3808,9 @@ internal static class StateStore
             var json = File.ReadAllText(Paths.StateFile);
             return Normalize(JsonSerializer.Deserialize<RouterState>(json, JsonOptions) ?? new RouterState());
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Log.Write($"Could not load state: {ex}");
+            Log.Write($"Could not load state: {exception}");
             return new RouterState();
         }
     }
@@ -3835,9 +3839,9 @@ internal static class AtomicFile
             Directory.CreateDirectory(directory);
         }
 
-        var tempPath = path + ".tmp";
-        File.WriteAllText(tempPath, content, Encoding.UTF8);
-        File.Move(tempPath, path, overwrite: true);
+        var temporaryPath = path + ".tmp";
+        File.WriteAllText(temporaryPath, content, Encoding.UTF8);
+        File.Move(temporaryPath, path, overwrite: true);
     }
 }
 
@@ -3984,13 +3988,13 @@ internal static class Log
         }
     }
 
-    private static int FindFirstCompleteLineStart(byte[] buffer, int length)
+    private static int FindFirstCompleteLineStart(byte[] buffer, int byteCount)
     {
-        for (var i = 0; i < length; i++)
+        for (var bufferIndex = 0; bufferIndex < byteCount; bufferIndex++)
         {
-            if (buffer[i] == (byte)'\n')
+            if (buffer[bufferIndex] == (byte)'\n')
             {
-                return i + 1;
+                return bufferIndex + 1;
             }
         }
 
@@ -3998,7 +4002,7 @@ internal static class Log
     }
 }
 
-internal static class Cli
+internal static class CommandLineDiagnostics
 {
     public static void ListSetupInfo()
     {
@@ -4007,32 +4011,32 @@ internal static class Cli
 
     public static string BuildSetupInfo()
     {
-        var sb = new StringBuilder();
-        sb.AppendLine("Monitor Audio Router setup info");
-        sb.AppendLine();
-        sb.AppendLine($"Config: {Paths.ConfigFile}");
-        sb.AppendLine($"State:  {Paths.StateFile}");
-        sb.AppendLine($"Log:    {Paths.LogFile}");
-        sb.AppendLine();
-        sb.AppendLine("Monitors:");
+        var output = new StringBuilder();
+        output.AppendLine("Monitor Audio Router setup info");
+        output.AppendLine();
+        output.AppendLine($"Config: {Paths.ConfigFile}");
+        output.AppendLine($"State:  {Paths.StateFile}");
+        output.AppendLine($"Log:    {Paths.LogFile}");
+        output.AppendLine();
+        output.AppendLine("Monitors:");
         foreach (var monitor in WindowInspector.GetMonitors())
         {
-            sb.AppendLine($"- {monitor.DeviceName} name={monitor.FriendlyName} id={monitor.DeviceId} bounds={monitor.BoundsKey} primary={monitor.Primary}");
+            output.AppendLine($"- {monitor.DeviceName} name={monitor.FriendlyName} id={monitor.DeviceId} bounds={monitor.BoundsKey} primary={monitor.Primary}");
         }
 
-        sb.AppendLine();
-        sb.AppendLine("Render audio endpoints:");
+        output.AppendLine();
+        output.AppendLine("Render audio endpoints:");
         using var devices = new AudioDeviceManager();
         foreach (var endpoint in devices.GetRenderEndpoints())
         {
             var defaultMark = endpoint.IsDefault ? " default" : "";
-            sb.AppendLine($"- {endpoint.Name}{defaultMark}");
-            sb.AppendLine($"  id={endpoint.Id}");
+            output.AppendLine($"- {endpoint.Name}{defaultMark}");
+            output.AppendLine($"  id={endpoint.Id}");
         }
 
-        sb.AppendLine();
-        sb.AppendLine("Use the tray menu's Open config page to assign audio devices to monitors, or use View config JSON there to edit config.json directly.");
-        return sb.ToString();
+        output.AppendLine();
+        output.AppendLine("Use the tray menu's Open config page to assign audio devices to monitors, or use View config JSON there to edit config.json directly.");
+        return output.ToString();
     }
 
     public static void ListAudioSessions()
@@ -4089,20 +4093,20 @@ internal sealed class AudioEventWatcher : IDisposable
         {
             _enumerator = (IMMDeviceEnumerator)(object)new MMDeviceEnumeratorComObject();
             _endpointClient = new AudioEndpointNotificationClient(OnEndpointEvent);
-            var hr = _enumerator.RegisterEndpointNotificationCallback(_endpointClient);
-            if (hr != 0)
+            var hResult = _enumerator.RegisterEndpointNotificationCallback(_endpointClient);
+            if (hResult != 0)
             {
-                Log.Write($"Audio endpoint notification registration failed: hr 0x{hr:X8}.");
+                Log.Write($"Audio endpoint notification registration failed: HRESULT 0x{hResult:X8}.");
             }
 
             RefreshSubscriptions("audio watcher start");
             Log.Write("Audio event watcher started.");
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
             Log.WriteThrottled(
-                "audio-watcher-start-failed:" + ex.Message,
-                $"Audio event watcher unavailable: {ex.Message}",
+                "audio-watcher-start-failed:" + exception.Message,
+                $"Audio event watcher unavailable: {exception.Message}",
                 TimeSpan.FromMinutes(5));
         }
     }
@@ -4123,12 +4127,12 @@ internal sealed class AudioEventWatcher : IDisposable
 
             _sessionSubscriptions.Clear();
 
-            var hr = _enumerator.EnumAudioEndpoints(EDataFlow.eRender, DeviceState.Active, out var collection);
-            if (hr != 0 || collection is null)
+            var hResult = _enumerator.EnumAudioEndpoints(EDataFlow.eRender, DeviceState.Active, out var collection);
+            if (hResult != 0 || collection is null)
             {
                 Log.WriteThrottled(
-                    "audio-session-enum-failed:" + hr,
-                    $"Audio session subscription refresh failed: hr 0x{hr:X8}.",
+                    "audio-session-enum-failed:" + hResult,
+                    $"Audio session subscription refresh failed: HRESULT 0x{hResult:X8}.",
                     TimeSpan.FromMinutes(5));
                 return;
             }
@@ -4163,11 +4167,11 @@ internal sealed class AudioEventWatcher : IDisposable
                     }
                 }
             }
-            catch (Exception ex)
+            catch (Exception exception)
             {
                 Log.WriteThrottled(
-                    "audio-session-subscribe-failed:" + ex.Message,
-                    $"Audio session subscription refresh failed: {ex.Message}",
+                    "audio-session-subscribe-failed:" + exception.Message,
+                    $"Audio session subscription refresh failed: {exception.Message}",
                     TimeSpan.FromMinutes(5));
             }
             finally
@@ -4236,14 +4240,14 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
 
     public static AudioSessionDeviceSubscription? TryCreate(IMMDevice device, Action<string> requestBurst)
     {
-        var iid = typeof(IAudioSessionManager2).GUID;
+        var interfaceId = typeof(IAudioSessionManager2).GUID;
         var managerPtr = IntPtr.Zero;
         IAudioSessionManager2? manager = null;
         IAudioSessionEnumerator? sessionEnumerator = null;
         try
         {
-            var hr = device.Activate(ref iid, 23, IntPtr.Zero, out managerPtr);
-            if (hr != 0 || managerPtr == IntPtr.Zero)
+            var hResult = device.Activate(ref interfaceId, 23, IntPtr.Zero, out managerPtr);
+            if (hResult != 0 || managerPtr == IntPtr.Zero)
             {
                 return null;
             }
@@ -4257,22 +4261,22 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
             var subscription = new AudioSessionDeviceSubscription(manager, requestBurst);
             manager = null;
             subscription.RegisterExistingSessions(sessionEnumerator);
-            hr = subscription._manager.RegisterSessionNotification(subscription._sessionNotification);
-            if (hr != 0)
+            hResult = subscription._manager.RegisterSessionNotification(subscription._sessionNotification);
+            if (hResult != 0)
             {
                 Log.WriteThrottled(
-                    "audio-session-notification-register-failed:" + hr,
-                    $"Audio session notification registration failed: hr 0x{hr:X8}.",
+                    "audio-session-notification-register-failed:" + hResult,
+                    $"Audio session notification registration failed: HRESULT 0x{hResult:X8}.",
                     TimeSpan.FromMinutes(5));
             }
 
             return subscription;
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
             Log.WriteThrottled(
-                "audio-session-device-subscribe-failed:" + ex.Message,
-                $"Audio session subscription failed: {ex.Message}",
+                "audio-session-device-subscribe-failed:" + exception.Message,
+                $"Audio session subscription failed: {exception.Message}",
                 TimeSpan.FromMinutes(5));
             return null;
         }
@@ -4304,9 +4308,9 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
             return;
         }
 
-        for (var i = 0; i < count; i++)
+        for (var sessionIndex = 0; sessionIndex < count; sessionIndex++)
         {
-            if (sessionEnumerator.GetSession(i, out var control) != 0 || control is null)
+            if (sessionEnumerator.GetSession(sessionIndex, out var control) != 0 || control is null)
             {
                 continue;
             }
@@ -4388,12 +4392,12 @@ internal sealed class AudioSessionControlSubscription : IDisposable
     public static AudioSessionControlSubscription? TryCreate(IAudioSessionControl2 control, Action<string> requestBurst)
     {
         var eventsClient = new AudioSessionEventsClient(requestBurst);
-        var hr = control.RegisterAudioSessionNotification(eventsClient);
-        if (hr != 0)
+        var hResult = control.RegisterAudioSessionNotification(eventsClient);
+        if (hResult != 0)
         {
             Log.WriteThrottled(
-                "audio-session-events-register-failed:" + hr,
-                $"Audio session state notification registration failed: hr 0x{hr:X8}.",
+                "audio-session-events-register-failed:" + hResult,
+                $"Audio session state notification registration failed: HRESULT 0x{hResult:X8}.",
                 TimeSpan.FromMinutes(5));
             return null;
         }
@@ -4605,8 +4609,8 @@ internal sealed class AudioDeviceManager : IDisposable
 
     public AudioEndpoint? GetDefaultRenderEndpoint()
     {
-        var hr = _enumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eConsole, out var devicePtr);
-        if (hr != 0 || devicePtr == IntPtr.Zero)
+        var hResult = _enumerator.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eConsole, out var devicePtr);
+        if (hResult != 0 || devicePtr == IntPtr.Zero)
         {
             return null;
         }
@@ -4631,11 +4635,11 @@ internal sealed class AudioDeviceManager : IDisposable
     {
         foreach (var device in GetRenderDevices())
         {
-            foreach (var pid in GetAudioSessionProcessIds(device))
+            foreach (var processId in GetAudioSessionProcessIds(device))
             {
-                if (pid > 0)
+                if (processId > 0)
                 {
-                    yield return pid;
+                    yield return processId;
                 }
             }
         }
@@ -4667,14 +4671,14 @@ internal sealed class AudioDeviceManager : IDisposable
 
     private static IEnumerable<int> GetAudioSessionProcessIds(IMMDevice device)
     {
-        var iid = typeof(IAudioSessionManager2).GUID;
+        var interfaceId = typeof(IAudioSessionManager2).GUID;
         var managerPtr = IntPtr.Zero;
         IAudioSessionManager2? manager = null;
         IAudioSessionEnumerator? enumerator = null;
         try
         {
-            var hr = device.Activate(ref iid, 23, IntPtr.Zero, out managerPtr);
-            if (hr != 0 || managerPtr == IntPtr.Zero)
+            var hResult = device.Activate(ref interfaceId, 23, IntPtr.Zero, out managerPtr);
+            if (hResult != 0 || managerPtr == IntPtr.Zero)
             {
                 yield break;
             }
@@ -4690,18 +4694,18 @@ internal sealed class AudioDeviceManager : IDisposable
                 yield break;
             }
 
-            for (var i = 0; i < count; i++)
+            for (var sessionIndex = 0; sessionIndex < count; sessionIndex++)
             {
-                if (enumerator.GetSession(i, out var control) != 0 || control is null)
+                if (enumerator.GetSession(sessionIndex, out var control) != 0 || control is null)
                 {
                     continue;
                 }
 
                 try
                 {
-                    if (control.GetProcessId(out var pid) == 0)
+                    if (control.GetProcessId(out var processId) == 0)
                     {
-                        yield return (int)pid;
+                        yield return (int)processId;
                     }
                 }
                 finally
@@ -4809,8 +4813,8 @@ internal sealed class AppAudioPolicy : IDisposable
 
         foreach (var role in ManagedRoles())
         {
-            var hr = _policy.GetPersistedDefaultAudioEndpoint((uint)processId, EDataFlow.eRender, role, out var endpoint);
-            if (hr == 0)
+            var hResult = _policy.GetPersistedDefaultAudioEndpoint((uint)processId, EDataFlow.eRender, role, out var endpoint);
+            if (hResult == 0)
             {
                 if (!string.IsNullOrWhiteSpace(endpoint) &&
                     !endpoint.Equals("DefaultRenderDevice", StringComparison.OrdinalIgnoreCase))
@@ -4845,22 +4849,22 @@ internal sealed class AppAudioPolicy : IDisposable
 
     private bool SetForAllRoles(int processId, string? endpointId)
     {
-        var ok = true;
+        var allRolesSucceeded = true;
         var policyEndpointId = endpointId is null ? null : GenerateDeviceId(endpointId, EDataFlow.eRender);
 
         // Volume Mixer may query either Console or Multimedia depending on the
         // app and Windows build. Set both roles so readback and playback agree.
         foreach (var role in ManagedRoles())
         {
-            var hr = _policy!.SetPersistedDefaultAudioEndpoint((uint)processId, EDataFlow.eRender, role, policyEndpointId);
-            if (hr != 0)
+            var hResult = _policy!.SetPersistedDefaultAudioEndpoint((uint)processId, EDataFlow.eRender, role, policyEndpointId);
+            if (hResult != 0)
             {
-                ok = false;
-                Log.Write($"SetPersistedDefaultAudioEndpoint failed for PID {processId}, role {role}, hr 0x{hr:X8}.");
+                allRolesSucceeded = false;
+                Log.Write($"SetPersistedDefaultAudioEndpoint failed for PID {processId}, role {role}, HRESULT 0x{hResult:X8}.");
             }
         }
 
-        return ok;
+        return allRolesSucceeded;
     }
 
     private static ERole[] ManagedRoles()
@@ -4917,13 +4921,13 @@ internal sealed class AppAudioPolicy : IDisposable
     {
         try
         {
-            var iid = typeof(IAudioPolicyConfigFactoryVariantFor21H2).GUID;
-            var factory = GetAudioPolicyActivationFactoryPointer(iid);
+            var interfaceId = typeof(IAudioPolicyConfigFactoryVariantFor21H2).GUID;
+            var factory = GetAudioPolicyActivationFactoryPointer(interfaceId);
             return new RawAudioPolicyConfigFactory(factory, "21H2");
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Log.Write($"21H2 audio policy factory unavailable: {ex.Message}");
+            Log.Write($"21H2 audio policy factory unavailable: {exception.Message}");
             return null;
         }
     }
@@ -4932,39 +4936,39 @@ internal sealed class AppAudioPolicy : IDisposable
     {
         try
         {
-            var iid = typeof(IAudioPolicyConfigFactoryVariantForDownlevel).GUID;
-            var factory = GetAudioPolicyActivationFactoryPointer(iid);
+            var interfaceId = typeof(IAudioPolicyConfigFactoryVariantForDownlevel).GUID;
+            var factory = GetAudioPolicyActivationFactoryPointer(interfaceId);
             return new RawAudioPolicyConfigFactory(factory, "Downlevel");
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Log.Write($"Downlevel audio policy factory unavailable: {ex.Message}");
+            Log.Write($"Downlevel audio policy factory unavailable: {exception.Message}");
             return null;
         }
     }
 
-    private static IntPtr GetAudioPolicyActivationFactoryPointer(Guid iid)
+    private static IntPtr GetAudioPolicyActivationFactoryPointer(Guid interfaceId)
     {
         var className = "Windows.Media.Internal.AudioPolicyConfig";
         var hstring = IntPtr.Zero;
         var factoryPtr = IntPtr.Zero;
         try
         {
-            var hr = NativeMethods.WindowsCreateString(className, className.Length, out hstring);
-            if (hr != 0)
+            var hResult = NativeMethods.WindowsCreateString(className, className.Length, out hstring);
+            if (hResult != 0)
             {
-                Marshal.ThrowExceptionForHR(hr);
+                Marshal.ThrowExceptionForHR(hResult);
             }
 
-            hr = NativeMethods.RoGetActivationFactoryRaw(hstring, ref iid, out factoryPtr);
-            if (hr != 0)
+            hResult = NativeMethods.RoGetActivationFactoryRaw(hstring, ref interfaceId, out factoryPtr);
+            if (hResult != 0)
             {
-                Marshal.ThrowExceptionForHR(hr);
+                Marshal.ThrowExceptionForHR(hResult);
             }
 
-            var ret = factoryPtr;
+            var activationFactoryPointer = factoryPtr;
             factoryPtr = IntPtr.Zero;
-            return ret;
+            return activationFactoryPointer;
         }
         finally
         {
@@ -5004,9 +5008,9 @@ internal sealed class AudioPolicyConfigFactory21H2 : IAudioPolicyConfigFactory
 
     public int GetPersistedDefaultAudioEndpoint(uint processId, EDataFlow flow, ERole role, out string? deviceId)
     {
-        var hr = _factory.GetPersistedDefaultAudioEndpoint(processId, flow, role, out var value);
+        var hResult = _factory.GetPersistedDefaultAudioEndpoint(processId, flow, role, out var value);
         deviceId = value;
-        return hr;
+        return hResult;
     }
 
     public int ClearAllPersistedApplicationDefaultEndpoints()
@@ -5029,10 +5033,10 @@ internal sealed class AudioPolicyConfigFactory21H2 : IAudioPolicyConfigFactory
         {
             if (!string.IsNullOrWhiteSpace(value))
             {
-                var hr = NativeMethods.WindowsCreateString(value, value.Length, out hstring);
-                if (hr != 0)
+                var hResult = NativeMethods.WindowsCreateString(value, value.Length, out hstring);
+                if (hResult != 0)
                 {
-                    return hr;
+                    return hResult;
                 }
             }
 
@@ -5079,10 +5083,10 @@ internal sealed class RawAudioPolicyConfigFactory : IAudioPolicyConfigFactory
         {
             if (!string.IsNullOrWhiteSpace(deviceId))
             {
-                var hr = NativeMethods.WindowsCreateString(deviceId, deviceId.Length, out hstring);
-                if (hr != 0)
+                var hResult = NativeMethods.WindowsCreateString(deviceId, deviceId.Length, out hstring);
+                if (hResult != 0)
                 {
-                    return hr;
+                    return hResult;
                 }
             }
 
@@ -5100,17 +5104,17 @@ internal sealed class RawAudioPolicyConfigFactory : IAudioPolicyConfigFactory
     public int GetPersistedDefaultAudioEndpoint(uint processId, EDataFlow flow, ERole role, out string? deviceId)
     {
         deviceId = null;
-        var hr = _get(_thisPtr, processId, flow, role, out var hstring);
-        if (hr != 0 || hstring == IntPtr.Zero)
+        var hResult = _get(_thisPtr, processId, flow, role, out var hstring);
+        if (hResult != 0 || hstring == IntPtr.Zero)
         {
-            return hr;
+            return hResult;
         }
 
         try
         {
             var buffer = NativeMethods.WindowsGetStringRawBuffer(hstring, out var length);
             deviceId = buffer == IntPtr.Zero ? null : Marshal.PtrToStringUni(buffer, (int)length);
-            return hr;
+            return hResult;
         }
         finally
         {
@@ -5165,9 +5169,9 @@ internal sealed class AudioPolicyConfigFactoryDownlevel : IAudioPolicyConfigFact
 
     public int GetPersistedDefaultAudioEndpoint(uint processId, EDataFlow flow, ERole role, out string? deviceId)
     {
-        var hr = _factory.GetPersistedDefaultAudioEndpoint(processId, flow, role, out var value);
+        var hResult = _factory.GetPersistedDefaultAudioEndpoint(processId, flow, role, out var value);
         deviceId = value;
-        return hr;
+        return hResult;
     }
 
     public int ClearAllPersistedApplicationDefaultEndpoints()
@@ -5190,10 +5194,10 @@ internal sealed class AudioPolicyConfigFactoryDownlevel : IAudioPolicyConfigFact
         {
             if (!string.IsNullOrWhiteSpace(value))
             {
-                var hr = NativeMethods.WindowsCreateString(value, value.Length, out hstring);
-                if (hr != 0)
+                var hResult = NativeMethods.WindowsCreateString(value, value.Length, out hstring);
+                if (hResult != 0)
                 {
-                    return hr;
+                    return hResult;
                 }
             }
 
@@ -5222,19 +5226,19 @@ internal static class WindowInspector
         var windows = new List<WindowInfo>();
         var monitors = GetMonitors();
 
-        NativeMethods.EnumWindows((hwnd, lParam) =>
+        NativeMethods.EnumWindows((windowHandle, unusedCallbackParameter) =>
         {
-            if (!NativeMethods.IsWindowVisible(hwnd) || NativeMethods.IsIconic(hwnd))
+            if (!NativeMethods.IsWindowVisible(windowHandle) || NativeMethods.IsIconic(windowHandle))
             {
                 return true;
             }
 
-            if (NativeMethods.TryGetCloaked(hwnd, out var cloaked) && cloaked)
+            if (NativeMethods.TryGetCloaked(windowHandle, out var cloaked) && cloaked)
             {
                 return true;
             }
 
-            if (!NativeMethods.GetWindowRect(hwnd, out var rect))
+            if (!NativeMethods.GetWindowRect(windowHandle, out var rect))
             {
                 return true;
             }
@@ -5245,13 +5249,13 @@ internal static class WindowInspector
                 return true;
             }
 
-            _ = NativeMethods.GetWindowThreadProcessId(hwnd, out var pid);
-            if (pid == 0)
+            _ = NativeMethods.GetWindowThreadProcessId(windowHandle, out var processId);
+            if (processId == 0)
             {
                 return true;
             }
 
-            var processName = GetProcessName((int)pid);
+            var processName = GetProcessName((int)processId);
             if (string.IsNullOrWhiteSpace(processName))
             {
                 return true;
@@ -5259,11 +5263,11 @@ internal static class WindowInspector
 
             var monitor = PickMonitor(bounds, monitors);
             windows.Add(new WindowInfo(
-                hwnd,
-                (int)pid,
+                windowHandle,
+                (int)processId,
                 processName,
-                GetProcessStart((int)pid),
-                GetWindowText(hwnd),
+                GetProcessStart((int)processId),
+                GetWindowText(windowHandle),
                 bounds,
                 monitor));
             return true;
@@ -5275,10 +5279,10 @@ internal static class WindowInspector
     public static List<MonitorInfo> GetMonitors()
     {
         return Screen.AllScreens
-            .Select(s =>
+            .Select(screen =>
             {
-                var identity = GetMonitorIdentity(s.DeviceName);
-                return new MonitorInfo(s.DeviceName, identity.FriendlyName, identity.DeviceId, s.Bounds, s.Primary);
+                var identity = GetMonitorIdentity(screen.DeviceName);
+                return new MonitorInfo(screen.DeviceName, identity.FriendlyName, identity.DeviceId, screen.Bounds, screen.Primary);
             })
             .ToList();
     }
@@ -5375,24 +5379,24 @@ internal static class WindowInspector
     public static MonitorInfo PickMonitor(Rectangle windowBounds, List<MonitorInfo> monitors)
     {
         return monitors
-            .OrderByDescending(m => IntersectionArea(windowBounds, m.Bounds))
+            .OrderByDescending(monitor => IntersectionArea(windowBounds, monitor.Bounds))
             .FirstOrDefault() ?? monitors.First();
     }
 
-    private static long IntersectionArea(Rectangle a, Rectangle b)
+    private static long IntersectionArea(Rectangle firstBounds, Rectangle secondBounds)
     {
-        var x1 = Math.Max((long)a.Left, b.Left);
-        var y1 = Math.Max((long)a.Top, b.Top);
-        var x2 = Math.Min((long)a.Left + a.Width, (long)b.Left + b.Width);
-        var y2 = Math.Min((long)a.Top + a.Height, (long)b.Top + b.Height);
-        return Math.Max(0L, x2 - x1) * Math.Max(0L, y2 - y1);
+        var intersectionLeft = Math.Max((long)firstBounds.Left, secondBounds.Left);
+        var intersectionTop = Math.Max((long)firstBounds.Top, secondBounds.Top);
+        var intersectionRight = Math.Min((long)firstBounds.Left + firstBounds.Width, (long)secondBounds.Left + secondBounds.Width);
+        var intersectionBottom = Math.Min((long)firstBounds.Top + firstBounds.Height, (long)secondBounds.Top + secondBounds.Height);
+        return Math.Max(0L, intersectionRight - intersectionLeft) * Math.Max(0L, intersectionBottom - intersectionTop);
     }
 
-    private static string GetProcessName(int pid)
+    private static string GetProcessName(int processId)
     {
         try
         {
-            using var process = Process.GetProcessById(pid);
+            using var process = Process.GetProcessById(processId);
             return process.ProcessName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
                 ? process.ProcessName
                 : process.ProcessName + ".exe";
@@ -5403,11 +5407,11 @@ internal static class WindowInspector
         }
     }
 
-    private static DateTimeOffset? GetProcessStart(int pid)
+    private static DateTimeOffset? GetProcessStart(int processId)
     {
         try
         {
-            using var process = Process.GetProcessById(pid);
+            using var process = Process.GetProcessById(processId);
             return process.StartTime.ToUniversalTime();
         }
         catch
@@ -5416,17 +5420,17 @@ internal static class WindowInspector
         }
     }
 
-    private static string GetWindowText(IntPtr hwnd)
+    private static string GetWindowText(IntPtr windowHandle)
     {
-        var length = NativeMethods.GetWindowTextLength(hwnd);
-        if (length <= 0)
+        var windowTextLength = NativeMethods.GetWindowTextLength(windowHandle);
+        if (windowTextLength <= 0)
         {
             return "";
         }
 
-        var builder = new StringBuilder(length + 1);
-        _ = NativeMethods.GetWindowText(hwnd, builder, builder.Capacity);
-        return builder.ToString();
+        var windowTextBuilder = new StringBuilder(windowTextLength + 1);
+        _ = NativeMethods.GetWindowText(windowHandle, windowTextBuilder, windowTextBuilder.Capacity);
+        return windowTextBuilder.ToString();
     }
 }
 
@@ -5488,8 +5492,8 @@ internal sealed class ProcessSnapshot
         }
 
         var children = processes
-            .GroupBy(p => p.ParentProcessId)
-            .ToDictionary(g => g.Key, g => g.ToList());
+            .GroupBy(processInfo => processInfo.ParentProcessId)
+            .ToDictionary(group => group.Key, group => group.ToList());
         return new ProcessSnapshot(children);
     }
 
@@ -5513,11 +5517,11 @@ internal sealed class ProcessSnapshot
         }
     }
 
-    private static DateTimeOffset? GetProcessStart(int pid)
+    private static DateTimeOffset? GetProcessStart(int processId)
     {
         try
         {
-            using var process = Process.GetProcessById(pid);
+            using var process = Process.GetProcessById(processId);
             return process.StartTime.ToUniversalTime();
         }
         catch
@@ -5533,10 +5537,10 @@ internal static class TrayIconFactory
 {
     public static Icon Create(bool enabled)
     {
-        using var bmp = new Bitmap(32, 32);
-        using var g = Graphics.FromImage(bmp);
-        g.Clear(Color.Transparent);
-        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        using var bitmap = new Bitmap(32, 32);
+        using var graphics = Graphics.FromImage(bitmap);
+        graphics.Clear(Color.Transparent);
+        graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
 
         using var speakerBrush = new SolidBrush(enabled ? Color.FromArgb(36, 110, 185) : Color.FromArgb(92, 92, 92));
         using var wavePen = new Pen(enabled ? Color.FromArgb(36, 110, 185) : Color.FromArgb(92, 92, 92), 3);
@@ -5549,18 +5553,18 @@ internal static class TrayIconFactory
             new Point(11, 19),
             new Point(5, 19)
         };
-        g.FillPolygon(speakerBrush, speaker);
-        g.DrawArc(wavePen, 15, 9, 9, 14, -45, 90);
-        g.DrawArc(wavePen, 18, 6, 11, 20, -45, 90);
+        graphics.FillPolygon(speakerBrush, speaker);
+        graphics.DrawArc(wavePen, 15, 9, 9, 14, -45, 90);
+        graphics.DrawArc(wavePen, 18, 6, 11, 20, -45, 90);
 
         if (!enabled)
         {
-            using var xPen = new Pen(Color.FromArgb(210, 20, 20), 4);
-            g.DrawLine(xPen, 20, 20, 30, 30);
-            g.DrawLine(xPen, 30, 20, 20, 30);
+            using var disabledIconPen = new Pen(Color.FromArgb(210, 20, 20), 4);
+            graphics.DrawLine(disabledIconPen, 20, 20, 30, 30);
+            graphics.DrawLine(disabledIconPen, 30, 20, 20, 30);
         }
 
-        var handle = bmp.GetHicon();
+        var handle = bitmap.GetHicon();
         try
         {
             return (Icon)Icon.FromHandle(handle).Clone();
@@ -5599,10 +5603,10 @@ internal static class TestTone
         writer.Write("data"u8.ToArray());
         writer.Write(dataSize);
 
-        for (var i = 0; i < sampleCount; i++)
+        for (var sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++)
         {
-            var t = i / (double)sampleRate;
-            var sample = (short)(Math.Sin(2 * Math.PI * 440 * t) * short.MaxValue * 0.04);
+            var timeSeconds = sampleIndex / (double)sampleRate;
+            var sample = (short)(Math.Sin(2 * Math.PI * 440 * timeSeconds) * short.MaxValue * 0.04);
             writer.Write(sample);
         }
 
@@ -5675,9 +5679,9 @@ internal static class NativeMethods
 
     public static bool TryGetCloaked(IntPtr hwnd, out bool cloaked)
     {
-        var hr = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, out var value, sizeof(int));
+        var hResult = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, out var value, sizeof(int));
         cloaked = value != 0;
-        return hr == 0;
+        return hResult == 0;
     }
 
     [DllImport("kernel32.dll")]

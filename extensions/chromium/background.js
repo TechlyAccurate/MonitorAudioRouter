@@ -4,23 +4,22 @@
 // - find audible tabs grouped by browser window;
 // - include OS process IDs only when Chromium exposes them;
 // - send local hints to the tray app through native messaging.
-const HOST_NAME = "com.monitoraudiorouter.router";
-const SEND_INTERVAL_MS = 1500;
+const NATIVE_HOST_NAME = "com.monitoraudiorouter.router";
+const SNAPSHOT_INTERVAL_MS = 1500;
 
-let port = null;
-let sendTimer = null;
-let reconnectTimer = null;
+let nativeHostPort = null;
+let nativeHostReconnectTimer = null;
 let hasTriedProcessPermission = false;
 
 // Browser identity
 
-function browserName() {
-  const ua = navigator.userAgent;
-  if (ua.includes("Edg/")) {
+function detectBrowserName() {
+  const userAgent = navigator.userAgent;
+  if (userAgent.includes("Edg/")) {
     return "edge";
   }
 
-  if (ua.includes("Firefox/")) {
+  if (userAgent.includes("Firefox/")) {
     return "firefox";
   }
 
@@ -29,95 +28,95 @@ function browserName() {
 
 // Chrome callback APIs
 
-function chromeCall(fn, ...args) {
+function callChromeApi(chromeApiFunction, ...chromeApiArguments) {
   return new Promise((resolve, reject) => {
-    let settled = false;
-    const finish = (value) => {
-      if (!settled) {
-        settled = true;
+    let hasSettled = false;
+    const resolveOnce = (value) => {
+      if (!hasSettled) {
+        hasSettled = true;
         resolve(value);
       }
     };
-    const fail = (error) => {
-      if (!settled) {
-        settled = true;
+    const rejectOnce = (error) => {
+      if (!hasSettled) {
+        hasSettled = true;
         reject(error);
       }
     };
 
     try {
-      const maybePromise = fn(...args, (result) => {
+      const possiblePromise = chromeApiFunction(...chromeApiArguments, (apiResult) => {
         const error = chrome.runtime.lastError;
         if (error) {
-          fail(new Error(error.message));
+          rejectOnce(new Error(error.message));
           return;
         }
 
-        finish(result);
+        resolveOnce(apiResult);
       });
 
-      if (maybePromise && typeof maybePromise.then === "function") {
-        maybePromise.then(finish, fail);
+      if (possiblePromise && typeof possiblePromise.then === "function") {
+        possiblePromise.then(resolveOnce, rejectOnce);
       }
     } catch (error) {
-      fail(error);
+      rejectOnce(error);
     }
   });
 }
 
 // Native messaging connection
 
-function connect() {
-  if (port) {
+function connectNativeHost() {
+  if (nativeHostPort) {
     return;
   }
 
   try {
-    const nextPort = chrome.runtime.connectNative(HOST_NAME);
-    port = nextPort;
+    const nextPort = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+    nativeHostPort = nextPort;
     nextPort.onDisconnect.addListener(() => {
-      if (port === nextPort) {
-        port = null;
+      if (nativeHostPort === nextPort) {
+        nativeHostPort = null;
       }
 
       scheduleReconnect();
     });
   } catch {
-    port = null;
+    nativeHostPort = null;
     scheduleReconnect();
   }
 }
 
 function scheduleReconnect() {
-  if (reconnectTimer !== null) {
+  if (nativeHostReconnectTimer !== null) {
     return;
   }
 
   // Keep one reconnect timer alive at most. This prevents stale extension
   // workers from repeatedly launching native-host helper processes.
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    if (!port) {
-      connect();
+  nativeHostReconnectTimer = setTimeout(() => {
+    nativeHostReconnectTimer = null;
+    if (!nativeHostPort) {
+      connectNativeHost();
     }
   }, 2500);
 }
 
-function post(message) {
-  if (!port) {
-    connect();
+function postToNativeHost(message) {
+  if (!nativeHostPort) {
+    connectNativeHost();
   }
 
-  if (!port) {
+  if (!nativeHostPort) {
     return;
   }
 
-  const currentPort = port;
+  const connectedNativeHostPort = nativeHostPort;
   try {
-    currentPort.postMessage(message);
+    connectedNativeHostPort.postMessage(message);
   } catch {
-    if (port === currentPort) {
-      port = null;
+    if (nativeHostPort === connectedNativeHostPort) {
+      nativeHostPort = null;
     }
 
     scheduleReconnect();
@@ -127,15 +126,17 @@ function post(message) {
 // Optional process hints
 
 async function processIdsForTabs(tabs) {
-  const api = chrome.processes;
-  if (!api || typeof api.getProcessIdForTab !== "function" || typeof api.getProcessInfo !== "function") {
+  const processesApi = chrome.processes;
+  if (!processesApi ||
+      typeof processesApi.getProcessIdForTab !== "function" ||
+      typeof processesApi.getProcessInfo !== "function") {
     return [];
   }
 
   const browserProcessIds = [];
   for (const tab of tabs) {
     try {
-      const processId = await chromeCall(api.getProcessIdForTab, tab.id);
+      const processId = await callChromeApi(processesApi.getProcessIdForTab, tab.id);
       if (Number.isInteger(processId) && !browserProcessIds.includes(processId)) {
         browserProcessIds.push(processId);
       }
@@ -149,10 +150,11 @@ async function processIdsForTabs(tabs) {
   }
 
   try {
-    const infos = await chromeCall(api.getProcessInfo, browserProcessIds, false);
-    return Object.values(infos || {})
+    const processInfoByBrowserProcessId = await callChromeApi(processesApi.getProcessInfo, browserProcessIds, false);
+    return Object.values(processInfoByBrowserProcessId || {})
       .map((info) => info && info.osProcessId)
-      .filter((pid, index, values) => Number.isInteger(pid) && pid > 0 && values.indexOf(pid) === index);
+      .filter((processId, index, values) =>
+        Number.isInteger(processId) && processId > 0 && values.indexOf(processId) === index);
   } catch {
     return [];
   }
@@ -160,45 +162,46 @@ async function processIdsForTabs(tabs) {
 
 async function collectAudibleWindows() {
   // Audible window collection
-  const tabs = await chromeCall(chrome.tabs.query, {});
+  const tabs = await callChromeApi(chrome.tabs.query, {});
   const audibleTabs = tabs.filter((tab) => tab.audible && tab.windowId !== undefined);
-  const grouped = new Map();
+  const tabsByWindowId = new Map();
 
   for (const tab of audibleTabs) {
-    const current = grouped.get(tab.windowId) || [];
-    current.push(tab);
-    grouped.set(tab.windowId, current);
+    const tabsForWindow = tabsByWindowId.get(tab.windowId) || [];
+    tabsForWindow.push(tab);
+    tabsByWindowId.set(tab.windowId, tabsForWindow);
   }
 
   const windows = [];
-  for (const [windowId, windowTabs] of grouped) {
+  for (const [windowId, windowTabs] of tabsByWindowId) {
     try {
-      const win = await chromeCall(chrome.windows.get, windowId);
-      if (!Number.isFinite(win.left) || !Number.isFinite(win.top) ||
-          !Number.isFinite(win.width) || !Number.isFinite(win.height)) {
+      const browserWindow = await callChromeApi(chrome.windows.get, windowId);
+      if (!Number.isFinite(browserWindow.left) || !Number.isFinite(browserWindow.top) ||
+          !Number.isFinite(browserWindow.width) || !Number.isFinite(browserWindow.height)) {
         continue;
       }
 
       // Titles are local matching hints. The extension does not send URLs,
       // page contents, history, cookies, or anything to a remote service.
-      const windowTitles = [...new Set(tabs
+      const activeTabTitles = [...new Set(tabs
         .filter((tab) => tab.windowId === windowId && tab.active)
+        .map((tab) => tab.title)
+        .filter((title) => typeof title === "string" && title.trim().length > 0)
+        .map((title) => title.trim()))];
+      const audibleTabTitles = [...new Set(windowTabs
         .map((tab) => tab.title)
         .filter((title) => typeof title === "string" && title.trim().length > 0)
         .map((title) => title.trim()))];
 
       windows.push({
         windowId,
-        left: win.left,
-        top: win.top,
-        width: win.width,
-        height: win.height,
+        left: browserWindow.left,
+        top: browserWindow.top,
+        width: browserWindow.width,
+        height: browserWindow.height,
         processIds: await processIdsForTabs(windowTabs),
-        titles: [...new Set(windowTabs
-          .map((tab) => tab.title)
-          .filter((title) => typeof title === "string" && title.trim().length > 0)
-          .map((title) => title.trim()))],
-        windowTitles
+        titles: audibleTabTitles,
+        windowTitles: activeTabTitles
       });
     } catch {
       // Window may have closed during collection.
@@ -212,9 +215,9 @@ async function collectAudibleWindows() {
 
 async function sendSnapshot() {
   try {
-    post({
+    postToNativeHost({
       type: "audibleWindows",
-      browser: browserName(),
+      browser: detectBrowserName(),
       sentAt: Date.now(),
       windows: await collectAudibleWindows()
     });
@@ -226,9 +229,9 @@ async function sendSnapshot() {
 // Extension entry point
 
 function start() {
-  connect();
+  connectNativeHost();
   sendSnapshot();
-  sendTimer = setInterval(sendSnapshot, SEND_INTERVAL_MS);
+  setInterval(sendSnapshot, SNAPSHOT_INTERVAL_MS);
 
   chrome.tabs.onUpdated.addListener(sendSnapshot);
   chrome.tabs.onActivated.addListener(sendSnapshot);
