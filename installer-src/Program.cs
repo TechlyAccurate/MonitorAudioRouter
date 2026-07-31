@@ -12,7 +12,7 @@ using Microsoft.Win32;
 
 const string AppName = "Monitor Audio Router";
 const string AppId = "MonitorAudioRouter";
-const string AppVersion = "0.1.11";
+const string AppVersion = "0.1.12";
 const string HostName = "com.monitoraudiorouter.router";
 const string DefaultChromeExtensionId = "jnjminkakfohjeffdpeamngcnfneckog";
 const string DefaultEdgeExtensionId = "";
@@ -34,8 +34,11 @@ if (options.Canceled)
     return;
 }
 
+WriteInstallerLog($"Setup started. Version={AppVersion}; ProcessId={Environment.ProcessId}; Arguments={FormatArgumentsForLog(args)}");
+
 if (options.UpdateToLatestDuringInstall && TryLaunchNewerInstaller(options))
 {
+    WriteInstallerLog("Setup handed off to a newer published installer.");
     return;
 }
 
@@ -49,20 +52,29 @@ try
     Directory.CreateDirectory(tempDir);
     try
     {
+        WriteInstallerLog($"Extracting payload to {tempDir}.");
         ExtractPayload(tempDir);
+        WriteInstallerLog($"Stopping existing app processes before installing to {installDir}.");
         StopExistingApp(installDir);
+        WriteInstallerLog("Copying application files.");
         InstallFiles(tempDir, installDir);
+        WriteInstallerLog("Writing native messaging manifests.");
         WriteNativeMessagingManifests(installDir, options);
+        WriteInstallerLog("Registering native messaging hosts.");
         RegisterNativeMessagingHosts(installDir);
+        WriteInstallerLog("Registering browser extension deployment policies.");
         var browserExtensionDeployment = RegisterBrowserExtensionPolicies(options);
+        WriteInstallerLog("Applying startup and shortcut settings.");
         SetStartup(installDir, options.Autostart);
         InstallStartMenuShortcut(installDir);
         WriteUserAutostartSetting(options.Autostart);
         WriteInstallInfo(installDir, options);
         RegisterUninstaller(installDir);
+        WriteInstallerLog("Install registry state written.");
 
         if (options.Launch)
         {
+            WriteInstallerLog("Launching installed tray app.");
             StartAppForUser(Path.Combine(installDir, "MonitorAudioRouter.exe"));
         }
 
@@ -73,16 +85,27 @@ try
         }
 
         Console.WriteLine("Monitor Audio Router installed.");
+        WriteInstallerLog("Setup completed successfully.");
     }
     finally
     {
         TryDeleteDirectory(tempDir);
     }
 }
-catch (Exception ex)
+catch (Exception exception)
 {
     Console.Error.WriteLine("Install failed:");
-    Console.Error.WriteLine(ex);
+    Console.Error.WriteLine(exception);
+    WriteInstallerLog($"Setup failed: {exception}");
+    if (!HasSwitch(args, "/quiet"))
+    {
+        MessageBox.Show(
+            "Monitor Audio Router could not be installed.\n\n" + exception.Message + "\n\nSee installer.log in the app data folder for details.",
+            "Monitor Audio Router setup failed",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Error);
+    }
+
     Environment.ExitCode = 1;
 }
 
@@ -107,11 +130,17 @@ static void StopExistingApp(string installDir)
             {
                 try
                 {
-                    process.Kill(entireProcessTree: true);
+                    if (process.Id == Environment.ProcessId)
+                    {
+                        continue;
+                    }
+
+                    WriteInstallerLog($"Stopping {process.ProcessName} PID {process.Id}.");
+                    process.Kill(entireProcessTree: false);
                 }
-                catch
+                catch (Exception exception)
                 {
-                    // Best effort only. File replacement below will fail if the app is still locked.
+                    WriteInstallerLog($"Could not stop {process.ProcessName} PID {process.Id}: {exception.Message}");
                 }
             }
 
@@ -152,6 +181,7 @@ static void TryClearManagedRoutes(string installDir)
 
     try
     {
+        WriteInstallerLog("Clearing managed audio routes before app shutdown.");
         using var process = Process.Start(new ProcessStartInfo(existingExe, "--clear-managed-routes")
         {
             UseShellExecute = false,
@@ -159,9 +189,9 @@ static void TryClearManagedRoutes(string installDir)
         });
         process?.WaitForExit(5000);
     }
-    catch
+    catch (Exception exception)
     {
-        // Older builds may not have the cleanup command; upgrade can still continue.
+        WriteInstallerLog($"Managed route cleanup did not complete: {exception.Message}");
     }
 }
 
@@ -536,6 +566,32 @@ static void CopyIfExists(string source, string destination)
         Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
         File.Copy(source, destination, overwrite: true);
     }
+}
+
+static void WriteInstallerLog(string message)
+{
+    try
+    {
+        var logPath = GetInstallerLogPath();
+        Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+        File.AppendAllText(logPath, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}", Encoding.UTF8);
+    }
+    catch
+    {
+        // Setup logging is diagnostic only and must not block install or rollback.
+    }
+}
+
+static string GetInstallerLogPath()
+{
+    var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    var root = Path.Combine(localAppData, AppName);
+    return Path.Combine(root, "installer.log");
+}
+
+static string FormatArgumentsForLog(string[] args)
+{
+    return args.Length == 0 ? "<none>" : string.Join(" ", args.Select(Quote));
 }
 
 static void StartProcess(string path)
