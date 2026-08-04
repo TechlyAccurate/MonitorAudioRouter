@@ -2829,7 +2829,10 @@ internal sealed class RoutingEngine : IDisposable
                     continue;
                 }
 
-                if (existingState is not null && EndpointIdsEqual(existingState.EndpointId, target.Endpoint.Id))
+                if (existingState is not null &&
+                    EndpointIdsEqual(existingState.EndpointId, target.Endpoint.Id) &&
+                    currentEndpoint.HasExplicitEndpoint &&
+                    EndpointIdsEqual(currentEndpoint.EndpointId, target.Endpoint.Id))
                 {
                     continue;
                 }
@@ -2916,8 +2919,19 @@ internal sealed class RoutingEngine : IDisposable
             if (heldProcessIds.Contains(route.ProcessId))
             {
                 var heldEndpoint = _policy.GetPersistedEndpoint(route.ProcessId);
-                if (heldEndpoint.HasExplicitEndpoint &&
-                    EndpointIdsEqual(heldEndpoint.EndpointId, route.EndpointId))
+                if (!heldEndpoint.HasExplicitEndpoint)
+                {
+                    if (ManagedRouteProcessStillMatches(route))
+                    {
+                        KeepManagedRouteWhileEndpointIsUnavailable(route, "browser window is paused or ambiguous");
+                        continue;
+                    }
+
+                    ForgetManagedRoute(route.ProcessId);
+                    continue;
+                }
+
+                if (EndpointIdsEqual(heldEndpoint.EndpointId, route.EndpointId))
                 {
                     continue;
                 }
@@ -2981,6 +2995,22 @@ internal sealed class RoutingEngine : IDisposable
             $"Did not claim managed ownership for PID {target.ProcessId} ({target.ProcessName}) because Windows reported {reportedEndpointName} after assigning {target.Endpoint.Name}.",
             TimeSpan.FromMinutes(5));
         return false;
+    }
+
+    private void KeepManagedRouteWhileEndpointIsUnavailable(ManagedRoute route, string reason)
+    {
+        // A sleeping or powered-off display can make Windows temporarily report
+        // Default while the old per-app route is still able to reappear later.
+        // Keep ownership so the next real target can clear or reapply it.
+        if (IsPowerResumeRecoveryActive(DateTimeOffset.UtcNow))
+        {
+            _state.PowerResumeManaged[route.ProcessId.ToString()] = route;
+        }
+
+        Log.WriteThrottled(
+            $"managed-route-temporary-default-{route.ProcessId}-{route.EndpointId}",
+            $"Kept managed ownership for PID {route.ProcessId} ({route.ProcessName}) because Windows reported Default while {reason}.",
+            TimeSpan.FromMinutes(5));
     }
 
     private ManagedRouteClearOutcome ClearOwnedRouteWithReadback(ManagedRoute route, string reason)
@@ -3085,14 +3115,19 @@ internal sealed class RoutingEngine : IDisposable
 
     private void PrunePowerResumeManagedRoutes(DateTimeOffset now)
     {
-        if (_state.LastPowerResumeUtc is not DateTimeOffset lastPowerResumeUtc ||
-            now - lastPowerResumeUtc <= PowerResumeRecoveryWindow)
+        if (IsPowerResumeRecoveryActive(now))
         {
             return;
         }
 
         _state.PowerResumeManaged.Clear();
         _state.LastPowerResumeUtc = null;
+    }
+
+    private bool IsPowerResumeRecoveryActive(DateTimeOffset now)
+    {
+        return _state.LastPowerResumeUtc is DateTimeOffset lastPowerResumeUtc &&
+               now - lastPowerResumeUtc <= PowerResumeRecoveryWindow;
     }
 
     private static bool ManagedRouteProcessStillMatches(ManagedRoute route)
