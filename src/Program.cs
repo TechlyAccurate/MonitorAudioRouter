@@ -2666,6 +2666,7 @@ internal sealed class RoutingEngine : IDisposable
     private readonly AppAudioPolicy _policy = new();
     private readonly RouterState _state;
     private readonly Dictionary<int, string> _lastAmbiguousTarget = new();
+    private readonly Dictionary<int, DateTimeOffset> _lastActiveSessionReassertUtc = new();
     private readonly Dictionary<string, IntPtr> _browserWindowHandles = new(StringComparer.OrdinalIgnoreCase);
     private DateTimeOffset _holdManagedRoutesUntilUtc = DateTimeOffset.MinValue;
     private string? _lastDebugSignature;
@@ -2730,7 +2731,14 @@ internal sealed class RoutingEngine : IDisposable
             var windows = WindowInspector.GetVisibleWindows()
                 .Where(IsAllowedWindow)
                 .ToList();
-            var routeTargetBuild = BuildProcessRouteTargets(windows, devices, endpoints);
+            var audioSessions = devices.GetAudioSessions().ToList();
+            var audioSessionProcessIds = audioSessions
+                .Select(session => session.ProcessId)
+                .ToHashSet();
+            var activeAudioSessions = audioSessions
+                .Where(session => session.State == AudioSessionState.Active)
+                .ToList();
+            var routeTargetBuild = BuildProcessRouteTargets(windows, audioSessionProcessIds, endpoints);
             var processRouteTargets = routeTargetBuild.Targets;
             var changed = 0;
             var skippedManual = 0;
@@ -2764,6 +2772,12 @@ internal sealed class RoutingEngine : IDisposable
                 }
 
                 var currentEndpoint = _policy.GetPersistedEndpoint(target.ProcessId);
+                var activeSessionOnWrongEndpoint = ActiveSessionIsOnlyOnDifferentEndpoint(target, activeAudioSessions);
+                if (!activeSessionOnWrongEndpoint)
+                {
+                    _lastActiveSessionReassertUtc.Remove(target.ProcessId);
+                }
+
                 if (existingState is null &&
                     TryGetPowerResumeManagedRoute(target, currentEndpoint, endpoints) is ManagedRoute recoveredRoute)
                 {
@@ -2798,14 +2812,26 @@ internal sealed class RoutingEngine : IDisposable
                 {
                     // "Default" means no per-app override. Clearing the stored
                     // endpoint lets Windows follow the current system default.
-                    if (existingState is not null || currentEndpoint.HasExplicitEndpoint)
+                    if (existingState is not null ||
+                        currentEndpoint.HasExplicitEndpoint ||
+                        activeSessionOnWrongEndpoint)
                     {
+                        if (activeSessionOnWrongEndpoint &&
+                            !ShouldReassertActiveSessionRoute(target.ProcessId))
+                        {
+                            continue;
+                        }
+
                         if (existingState is null)
                         {
                             if (_policy.ClearPersistedEndpoint(target.ProcessId) &&
                                 !_policy.GetPersistedEndpoint(target.ProcessId).HasExplicitEndpoint)
                             {
                                 changed++;
+                                if (activeSessionOnWrongEndpoint)
+                                {
+                                    LogActiveSessionReassertion(target, activeAudioSessions);
+                                }
                             }
                             else
                             {
@@ -2818,6 +2844,11 @@ internal sealed class RoutingEngine : IDisposable
                             {
                                 case ManagedRouteClearOutcome.ClearedToDefault:
                                     changed++;
+                                    if (activeSessionOnWrongEndpoint)
+                                    {
+                                        LogActiveSessionReassertion(target, activeAudioSessions);
+                                    }
+
                                     break;
                                 case ManagedRouteClearOutcome.StillOwned:
                                     failed++;
@@ -2832,7 +2863,14 @@ internal sealed class RoutingEngine : IDisposable
                 if (existingState is not null &&
                     EndpointIdsEqual(existingState.EndpointId, target.Endpoint.Id) &&
                     currentEndpoint.HasExplicitEndpoint &&
-                    EndpointIdsEqual(currentEndpoint.EndpointId, target.Endpoint.Id))
+                    EndpointIdsEqual(currentEndpoint.EndpointId, target.Endpoint.Id) &&
+                    !activeSessionOnWrongEndpoint)
+                {
+                    continue;
+                }
+
+                if (activeSessionOnWrongEndpoint &&
+                    !ShouldReassertActiveSessionRoute(target.ProcessId))
                 {
                     continue;
                 }
@@ -2840,6 +2878,10 @@ internal sealed class RoutingEngine : IDisposable
                 if (SetOwnedRouteWithReadback(target, endpoints))
                 {
                     changed++;
+                    if (activeSessionOnWrongEndpoint)
+                    {
+                        LogActiveSessionReassertion(target, activeAudioSessions);
+                    }
                 }
                 else
                 {
@@ -3062,6 +3104,70 @@ internal sealed class RoutingEngine : IDisposable
                ?? "<unknown>";
     }
 
+    private static bool ActiveSessionIsOnlyOnDifferentEndpoint(
+        ProcessRouteTarget target,
+        List<AudioSessionInfo> activeAudioSessions)
+    {
+        if (target.Endpoint is null)
+        {
+            return false;
+        }
+
+        var processSessions = activeAudioSessions
+            .Where(session => session.ProcessId == target.ProcessId)
+            .ToList();
+        if (processSessions.Count == 0)
+        {
+            return false;
+        }
+
+        var hasTargetEndpoint = processSessions.Any(session =>
+            EndpointIdsEqual(session.EndpointId, target.Endpoint.Id));
+        var hasOtherEndpoint = processSessions.Any(session =>
+            !EndpointIdsEqual(session.EndpointId, target.Endpoint.Id));
+        return hasOtherEndpoint && !hasTargetEndpoint;
+    }
+
+    private bool ShouldReassertActiveSessionRoute(int processId)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (_lastActiveSessionReassertUtc.TryGetValue(processId, out var lastReassertUtc) &&
+            now - lastReassertUtc < TimeSpan.FromMilliseconds(750))
+        {
+            return false;
+        }
+
+        _lastActiveSessionReassertUtc[processId] = now;
+        return true;
+    }
+
+    private static void LogActiveSessionReassertion(
+        ProcessRouteTarget target,
+        List<AudioSessionInfo> activeAudioSessions)
+    {
+        if (target.Endpoint is null)
+        {
+            return;
+        }
+
+        var currentEndpoints = string.Join(
+            ", ",
+            activeAudioSessions
+                .Where(session => session.ProcessId == target.ProcessId)
+                .Select(session => session.EndpointName)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(name => name, StringComparer.OrdinalIgnoreCase));
+        if (currentEndpoints.Length == 0)
+        {
+            currentEndpoints = "<unknown>";
+        }
+
+        Log.WriteThrottled(
+            $"active-session-route-reassert-{target.ProcessId}-{target.Endpoint.Id}",
+            $"Reasserted route for PID {target.ProcessId} ({target.ProcessName}) because its active audio session was still on {currentEndpoints} while the target monitor maps to {target.Endpoint.Name}.",
+            TimeSpan.FromSeconds(30));
+    }
+
     private enum ManagedRouteClearOutcome
     {
         ClearedToDefault,
@@ -3138,7 +3244,7 @@ internal sealed class RoutingEngine : IDisposable
 
     private ProcessRouteTargetBuildResult BuildProcessRouteTargets(
         List<WindowInfo> windows,
-        AudioDeviceManager devices,
+        HashSet<int> audioSessionProcessIds,
         List<AudioEndpoint> endpoints)
     {
         // This translates "what is visible and audible" into "which Windows
@@ -3146,7 +3252,6 @@ internal sealed class RoutingEngine : IDisposable
         // map directly by PID. Browsers need extension hints because many tabs
         // can share a process and one browser process can have windows on
         // several monitors.
-        var audioSessionProcessIds = devices.GetAudioSessionProcessIds().ToHashSet();
         var processSnapshot = _settings.RouteChildProcesses ? ProcessSnapshot.Capture() : ProcessSnapshot.Empty;
         var hints = BrowserHintStore.GetSnapshot();
         var processRouteTargets = new Dictionary<int, ProcessRouteTarget>();
@@ -4081,8 +4186,13 @@ internal static class CommandLineDiagnostics
         var endpoints = devices.GetRenderEndpoints().ToList();
 
         Console.WriteLine("Active render audio sessions:");
-        foreach (var processId in devices.GetAudioSessionProcessIds().Distinct().OrderBy(id => id))
+        var sessionsByProcess = devices.GetAudioSessions()
+            .Where(session => session.State == AudioSessionState.Active)
+            .GroupBy(session => session.ProcessId)
+            .OrderBy(group => group.Key);
+        foreach (var sessionGroup in sessionsByProcess)
         {
+            var processId = sessionGroup.Key;
             string processName;
             try
             {
@@ -4103,7 +4213,13 @@ internal static class CommandLineDiagnostics
                   ?? persisted.EndpointId
                   ?? "<unknown>"
                 : "Default";
-            Console.WriteLine($"- PID {processId} {processName}: {endpointName}");
+            var activeEndpointNames = string.Join(
+                ", ",
+                sessionGroup
+                    .Select(session => session.EndpointName)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(name => name, StringComparer.OrdinalIgnoreCase));
+            Console.WriteLine($"- PID {processId} {processName}: persisted {endpointName}; active on {activeEndpointNames}");
         }
     }
 }
@@ -4668,14 +4784,35 @@ internal sealed class AudioDeviceManager : IDisposable
 
     public IEnumerable<int> GetAudioSessionProcessIds()
     {
+        return GetAudioSessions()
+            .Select(session => session.ProcessId)
+            .Where(processId => processId > 0);
+    }
+
+    public IEnumerable<AudioSessionInfo> GetAudioSessions()
+    {
         foreach (var device in GetRenderDevices())
         {
-            foreach (var processId in GetAudioSessionProcessIds(device))
+            AudioEndpoint? endpoint;
+            try
             {
-                if (processId > 0)
-                {
-                    yield return processId;
-                }
+                endpoint = ReadEndpoint(device, null);
+            }
+            catch
+            {
+                ComInterop.FinalRelease(device);
+                continue;
+            }
+
+            if (endpoint is null)
+            {
+                ComInterop.FinalRelease(device);
+                continue;
+            }
+
+            foreach (var session in GetAudioSessions(device, endpoint))
+            {
+                yield return session;
             }
         }
     }
@@ -4704,7 +4841,7 @@ internal sealed class AudioDeviceManager : IDisposable
         }
     }
 
-    private static IEnumerable<int> GetAudioSessionProcessIds(IMMDevice device)
+    private static IEnumerable<AudioSessionInfo> GetAudioSessions(IMMDevice device, AudioEndpoint endpoint)
     {
         var interfaceId = typeof(IAudioSessionManager2).GUID;
         var managerPtr = IntPtr.Zero;
@@ -4738,9 +4875,16 @@ internal sealed class AudioDeviceManager : IDisposable
 
                 try
                 {
-                    if (control.GetProcessId(out var processId) == 0)
+                    var state = AudioSessionState.Inactive;
+                    _ = control.GetState(out state);
+                    if (control.GetProcessId(out var processId) == 0 &&
+                        processId > 0)
                     {
-                        yield return (int)processId;
+                        yield return new AudioSessionInfo(
+                            (int)processId,
+                            endpoint.Id,
+                            endpoint.Name,
+                            state);
                     }
                 }
                 finally
@@ -4820,6 +4964,12 @@ internal sealed class AudioDeviceManager : IDisposable
 
 internal sealed record AudioEndpoint(string Id, string Name, bool IsDefault);
 
+internal sealed record AudioSessionInfo(
+    int ProcessId,
+    string EndpointId,
+    string EndpointName,
+    AudioSessionState State);
+
 // Windows exposes the Volume Mixer per-app output setting through internal COM
 // interfaces. Keep this class as the narrow boundary around that unsupported
 // API: callers ask for get/set/clear by PID, and this class handles Windows'
@@ -4887,8 +5037,8 @@ internal sealed class AppAudioPolicy : IDisposable
         var allRolesSucceeded = true;
         var policyEndpointId = endpointId is null ? null : GenerateDeviceId(endpointId, EDataFlow.eRender);
 
-        // Volume Mixer may query either Console or Multimedia depending on the
-        // app and Windows build. Set both roles so readback and playback agree.
+        // Volume Mixer may query different roles depending on the app and
+        // Windows build. Set every render role so readback and playback agree.
         foreach (var role in ManagedRoles())
         {
             var hResult = _policy!.SetPersistedDefaultAudioEndpoint((uint)processId, EDataFlow.eRender, role, policyEndpointId);
@@ -4904,7 +5054,7 @@ internal sealed class AppAudioPolicy : IDisposable
 
     private static ERole[] ManagedRoles()
     {
-        return new[] { ERole.eMultimedia, ERole.eConsole };
+        return new[] { ERole.eMultimedia, ERole.eConsole, ERole.eCommunications };
     }
 
     private static string GenerateDeviceId(string deviceId, EDataFlow flow)
