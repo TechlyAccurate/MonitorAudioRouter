@@ -5,6 +5,8 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const repositoryRoot = path.resolve(__dirname, "..");
+const chromiumUserAgent = "Mozilla/5.0 Chrome/140.0";
+const firefoxUserAgent = "Mozilla/5.0 Firefox/140.0";
 const tests = [];
 
 function addTest(name, check) {
@@ -122,13 +124,13 @@ function createFirefoxApi(postedMessages) {
   };
 }
 
-async function evaluateBackgroundScript(browserDirectory, browserApiName, browserApi) {
+async function evaluateBackgroundScript(browserDirectory, browserApiName, browserApi, userAgent) {
   const backgroundPath = path.join(repositoryRoot, "extensions", browserDirectory, "background.js");
   const timers = createTimerStubs();
   const context = {
     [browserApiName]: browserApi,
     console,
-    navigator: { userAgent: "Mozilla/5.0 Chrome/140.0" },
+    navigator: { userAgent },
     setInterval: timers.setInterval,
     setTimeout: timers.setTimeout
   };
@@ -136,6 +138,7 @@ async function evaluateBackgroundScript(browserDirectory, browserApiName, browse
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(backgroundPath, "utf8"), context, { filename: backgroundPath });
   await new Promise((resolve) => setImmediate(resolve));
+  return context.navigator.userAgent;
 }
 
 addTest("Chromium manifest parses as JSON", () => {
@@ -152,16 +155,22 @@ addTest("Firefox manifest parses as JSON", () => {
 
 addTest("Chromium background evaluates with stub browser APIs", async () => {
   const postedMessages = [];
-  await evaluateBackgroundScript("chromium", "chrome", createChromiumApi(postedMessages));
+  await evaluateBackgroundScript("chromium", "chrome", createChromiumApi(postedMessages), chromiumUserAgent);
   assertEqual(1, postedMessages.length, "Chromium startup should send one initial snapshot.");
   assertEqual("audibleWindows", postedMessages[0].type, "Chromium should send the expected message type.");
 });
 
 addTest("Firefox background evaluates with stub browser APIs", async () => {
   const postedMessages = [];
-  await evaluateBackgroundScript("firefox", "browser", createFirefoxApi(postedMessages));
+  await evaluateBackgroundScript("firefox", "browser", createFirefoxApi(postedMessages), firefoxUserAgent);
   assertEqual(1, postedMessages.length, "Firefox startup should send one initial snapshot.");
   assertEqual("audibleWindows", postedMessages[0].type, "Firefox should send the expected message type.");
+});
+
+addTest("Firefox VM uses a Firefox user agent", async () => {
+  const userAgent = await evaluateBackgroundScript("firefox", "browser", createFirefoxApi([]), firefoxUserAgent);
+  assertEqual("string", typeof userAgent, "The evaluator should report its VM user agent.");
+  assertTrue(userAgent.includes("Firefox/"), "The Firefox VM should expose a Firefox user agent.");
 });
 
 async function runTests() {

@@ -1,3 +1,7 @@
+param(
+    [switch]$HarnessSelfTestOnly
+)
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 2.0
 
@@ -32,11 +36,18 @@ if (-not (Test-Path -LiteralPath $nugetConfigPath -PathType Leaf)) {
     [System.IO.File]::WriteAllText($nugetConfigPath, $nugetConfig, $utf8NoBom)
 }
 $env:APPDATA = $testAppData
+$env:NuGetAudit = "false"
 
-function Assert-NativeSuccess([string]$Action) {
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Action failed with exit code $LASTEXITCODE"
+function Assert-NativeSuccess([string]$Action, [int]$ExitCode) {
+    if ($ExitCode -ne 0) {
+        throw "$Action failed with exit code $ExitCode"
     }
+}
+
+function Invoke-CheckedCommand([string]$Action, [scriptblock]$Command) {
+    & $Command
+    $exitCode = $LASTEXITCODE
+    Assert-NativeSuccess $Action $exitCode
 }
 
 function Test-PowerShellSyntax([string]$Path) {
@@ -53,6 +64,37 @@ function Test-PowerShellSyntax([string]$Path) {
     }
 }
 
+function Assert-IsolatedNuGetAuditDisabled {
+    if ($env:NuGetAudit -ne "false") {
+        throw "The isolated regression harness must set NuGetAudit=false."
+    }
+}
+
+function Assert-CheckedInvocationRejectsNativeFailure {
+    $expectedMessage = "Native failure probe failed with exit code 23"
+    $actualMessage = $null
+    try {
+        Invoke-CheckedCommand "Native failure probe" {
+            & $env:ComSpec /d /c "exit 23"
+        }
+    }
+    catch {
+        $actualMessage = $_.Exception.Message
+    }
+
+    if ($actualMessage -ne $expectedMessage) {
+        throw "Checked invocation did not reject the native failure as expected. Actual: $actualMessage"
+    }
+}
+
+Assert-IsolatedNuGetAuditDisabled
+Assert-CheckedInvocationRejectsNativeFailure
+Write-Host "[PASS] NuGet audit disabled for isolated validation"
+Write-Host "[PASS] Checked invocation rejects native failures"
+if ($HarnessSelfTestOnly) {
+    exit 0
+}
+
 $dotnetCommand = Get-Command dotnet.exe -ErrorAction SilentlyContinue
 if ($null -eq $dotnetCommand) {
     throw "dotnet.exe is required to run the C# regression tests."
@@ -63,8 +105,8 @@ if ($null -eq $nodeCommand) {
     throw "node.exe is required to run the browser extension regression tests."
 }
 
-$passedSuites = 0
-$totalSuites = 5
+$passedSuites = 1
+$totalSuites = 6
 
 $powerShellScripts = @(
     Get-ChildItem -LiteralPath $repositoryRoot -Filter "*.ps1" -File
@@ -78,7 +120,9 @@ foreach ($script in $powerShellScripts) {
 $passedSuites++
 Write-Host "[PASS] PowerShell syntax ($($powerShellScripts.Count) scripts)"
 
-& $installerBuild
+Invoke-CheckedCommand "Full installer build" {
+    & $installerBuild
+}
 $passedSuites++
 Write-Host "[PASS] Full installer build"
 
@@ -88,18 +132,21 @@ $javaScriptFiles = @(
     (Join-Path $repositoryRoot "extensions\firefox\background.js")
 )
 foreach ($javaScriptFile in $javaScriptFiles) {
-    & $nodeCommand.Source --check $javaScriptFile
-    Assert-NativeSuccess "JavaScript syntax check for $javaScriptFile"
+    Invoke-CheckedCommand "JavaScript syntax check for $javaScriptFile" {
+        & $nodeCommand.Source --check $javaScriptFile
+    }
 }
 $passedSuites++
 Write-Host "[PASS] JavaScript syntax ($($javaScriptFiles.Count) scripts)"
 
-& $dotnetCommand.Source run --project $csharpTestProject -c Release -p:NuGetAudit=false
-Assert-NativeSuccess "C# regression tests"
+Invoke-CheckedCommand "C# regression tests" {
+    & $dotnetCommand.Source run --project $csharpTestProject -c Release
+}
 $passedSuites++
 
-& $nodeCommand.Source $browserTestRunner
-Assert-NativeSuccess "Browser extension regression tests"
+Invoke-CheckedCommand "Browser extension regression tests" {
+    & $nodeCommand.Source $browserTestRunner
+}
 $passedSuites++
 
 Write-Host "Regression suites passed: $passedSuites/$totalSuites."
