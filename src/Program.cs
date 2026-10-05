@@ -76,15 +76,11 @@ internal static class Program
             }
 
             var beforeClear = policy.GetPersistedEndpoint(processIdToClear);
-            var clearSucceeded = policy.ClearPersistedEndpoint(processIdToClear);
+            policy.ClearPersistedEndpoint(processIdToClear);
             var afterClear = policy.GetPersistedEndpoint(processIdToClear);
-            Console.WriteLine(beforeClear.HasExplicitEndpoint
-                ? $"PID {processIdToClear} before clear: explicit endpoint {beforeClear.EndpointId}"
-                : $"PID {processIdToClear} before clear: Default");
-            Console.WriteLine(afterClear.HasExplicitEndpoint
-                ? $"PID {processIdToClear} after clear: explicit endpoint {afterClear.EndpointId}"
-                : $"PID {processIdToClear} after clear: Default");
-            return clearSucceeded && !afterClear.HasExplicitEndpoint ? 0 : 1;
+            Console.WriteLine($"PID {processIdToClear} before clear: {DescribePersistedEndpoint(beforeClear)}");
+            Console.WriteLine($"PID {processIdToClear} after clear: {DescribePersistedEndpoint(afterClear)}");
+            return afterClear.IsDefault ? 0 : 1;
         }
 
         if (args.Any(argument => argument.Equals("--probe-set-clear", StringComparison.OrdinalIgnoreCase)))
@@ -112,7 +108,7 @@ internal static class Program
             var afterClear = policy.GetPersistedEndpoint(currentProcessId);
             Console.WriteLine($"Set current PID {currentProcessId} to default endpoint explicitly: {setSucceeded}; readback explicit={afterSet.HasExplicitEndpoint}");
             Console.WriteLine($"Cleared current PID {currentProcessId} back to Default: {clearSucceeded}; readback explicit={afterClear.HasExplicitEndpoint}");
-            return setSucceeded && clearSucceeded && !afterClear.HasExplicitEndpoint ? 0 : 1;
+            return afterSet.HasExplicitEndpoint && afterClear.IsDefault ? 0 : 1;
         }
 
         if (args.Any(argument => argument.Equals("--probe-tone-set-clear", StringComparison.OrdinalIgnoreCase)))
@@ -147,7 +143,7 @@ internal static class Program
 
             Console.WriteLine($"Set audio-active PID {currentProcessId} to default endpoint explicitly: {setSucceeded}; readback explicit={afterSet.HasExplicitEndpoint}");
             Console.WriteLine($"Cleared audio-active PID {currentProcessId} back to Default: {clearSucceeded}; readback explicit={afterClear.HasExplicitEndpoint}");
-            return setSucceeded && clearSucceeded && !afterClear.HasExplicitEndpoint ? 0 : 1;
+            return afterSet.HasExplicitEndpoint && afterClear.IsDefault ? 0 : 1;
         }
 
         if (args.Any(argument => argument.Equals("--probe-policy", StringComparison.OrdinalIgnoreCase)))
@@ -162,10 +158,8 @@ internal static class Program
             }
 
             var endpoint = policy.GetPersistedEndpoint(currentProcessId);
-            Console.WriteLine(endpoint.HasExplicitEndpoint
-                ? $"Policy query OK for PID {currentProcessId}: explicit endpoint {endpoint.EndpointId}"
-                : $"Policy query OK for PID {currentProcessId}: Default");
-            return 0;
+            Console.WriteLine($"Policy query for PID {currentProcessId}: {DescribePersistedEndpoint(endpoint)}");
+            return endpoint.Status == PersistedEndpointStatus.Unavailable ? 1 : 0;
         }
 
         Log.Write("Tray startup requested.");
@@ -201,6 +195,16 @@ internal static class Program
         }
 
         return null;
+    }
+
+    private static string DescribePersistedEndpoint(PersistedEndpoint endpoint)
+    {
+        return endpoint.Status switch
+        {
+            PersistedEndpointStatus.Default => "Default",
+            PersistedEndpointStatus.Explicit => $"explicit endpoint {endpoint.EndpointId}",
+            _ => "Unavailable"
+        };
     }
 }
 
@@ -2764,14 +2768,40 @@ internal sealed class RoutingEngine : IDisposable
                     continue;
                 }
 
-                var existingState = _state.Get(target.ProcessId);
-                if (existingState is not null && !target.MatchesProcessIdentity(existingState))
+                var targetProcess = GetProcessInfo(target.ProcessId);
+                if (targetProcess is null || targetProcess.Value.ExecutablePath is null)
                 {
-                    ForgetManagedRoute(target.ProcessId);
-                    existingState = null;
+                    failed++;
+                    Log.WriteThrottled(
+                        $"route-process-identity-unavailable-{target.ProcessId}",
+                        $"Skipped PID {target.ProcessId} ({target.ProcessName}) because its executable path could not be verified.",
+                        TimeSpan.FromMinutes(5));
+                    continue;
+                }
+
+                var targetExecutablePath = targetProcess.Value.ExecutablePath;
+                var existingState = _state.Get(target.ProcessId);
+                if (existingState is not null && !MatchesProcessIdentity(existingState, targetProcess.Value))
+                {
+                    failed++;
+                    Log.WriteThrottled(
+                        $"managed-route-process-identity-mismatch-{target.ProcessId}",
+                        $"Kept managed ownership for PID {target.ProcessId} because its saved process identity no longer matches the running process.",
+                        TimeSpan.FromMinutes(5));
+                    continue;
                 }
 
                 var currentEndpoint = _policy.GetPersistedEndpoint(target.ProcessId);
+                if (currentEndpoint.Status == PersistedEndpointStatus.Unavailable)
+                {
+                    failed++;
+                    Log.WriteThrottled(
+                        $"route-endpoint-unavailable-{target.ProcessId}",
+                        $"Skipped PID {target.ProcessId} ({target.ProcessName}) because Windows could not read its persisted endpoint.",
+                        TimeSpan.FromMinutes(5));
+                    continue;
+                }
+
                 var activeSessionOnWrongEndpoint = ActiveSessionIsOnlyOnDifferentEndpoint(target, activeAudioSessions);
                 if (!activeSessionOnWrongEndpoint)
                 {
@@ -2779,10 +2809,16 @@ internal sealed class RoutingEngine : IDisposable
                 }
 
                 if (existingState is null &&
-                    TryGetPowerResumeManagedRoute(target, currentEndpoint, endpoints) is ManagedRoute recoveredRoute)
+                    TryGetPowerResumeManagedRoute(target, targetExecutablePath, currentEndpoint, endpoints) is ManagedRoute recoveredRoute)
                 {
                     existingState = recoveredRoute;
                     _state.Managed[target.ProcessId.ToString()] = recoveredRoute;
+                }
+
+                if (existingState is null &&
+                    TryRebindDormantManagedRoute(target, targetExecutablePath, currentEndpoint) is ManagedRoute reboundRoute)
+                {
+                    existingState = reboundRoute;
                 }
 
                 var hasManualOverride = currentEndpoint.HasExplicitEndpoint &&
@@ -2824,8 +2860,8 @@ internal sealed class RoutingEngine : IDisposable
 
                         if (existingState is null)
                         {
-                            if (_policy.ClearPersistedEndpoint(target.ProcessId) &&
-                                !_policy.GetPersistedEndpoint(target.ProcessId).HasExplicitEndpoint)
+                            _policy.ClearPersistedEndpoint(target.ProcessId);
+                            if (_policy.GetPersistedEndpoint(target.ProcessId).IsDefault)
                             {
                                 changed++;
                                 if (activeSessionOnWrongEndpoint)
@@ -2851,6 +2887,8 @@ internal sealed class RoutingEngine : IDisposable
 
                                     break;
                                 case ManagedRouteClearOutcome.StillOwned:
+                                case ManagedRouteClearOutcome.ReadbackUnavailable:
+                                case ManagedRouteClearOutcome.IdentityUnverified:
                                     failed++;
                                     break;
                             }
@@ -2875,7 +2913,7 @@ internal sealed class RoutingEngine : IDisposable
                     continue;
                 }
 
-                if (SetOwnedRouteWithReadback(target, endpoints))
+                if (SetOwnedRouteWithReadback(target, targetExecutablePath, endpoints))
                 {
                     changed++;
                     if (activeSessionOnWrongEndpoint)
@@ -2906,8 +2944,23 @@ internal sealed class RoutingEngine : IDisposable
 
         foreach (var route in _state.Managed.Values.ToList())
         {
+            var process = GetProcessInfo(route.ProcessId);
+            if (process is null ||
+                !MatchesProcessIdentity(route, process.Value) ||
+                !RouteOwnershipDecisions.CanClearManagedRoute(route, process.Value.ProcessId, process.Value.ExecutablePath))
+            {
+                failed++;
+                continue;
+            }
+
             var currentEndpoint = _policy.GetPersistedEndpoint(route.ProcessId);
-            if (!currentEndpoint.HasExplicitEndpoint)
+            if (currentEndpoint.Status == PersistedEndpointStatus.Unavailable)
+            {
+                failed++;
+                continue;
+            }
+
+            if (currentEndpoint.IsDefault)
             {
                 ForgetManagedRoute(route.ProcessId);
                 continue;
@@ -2925,6 +2978,8 @@ internal sealed class RoutingEngine : IDisposable
                     changed++;
                     break;
                 case ManagedRouteClearOutcome.StillOwned:
+                case ManagedRouteClearOutcome.ReadbackUnavailable:
+                case ManagedRouteClearOutcome.IdentityUnverified:
                     failed++;
                     break;
             }
@@ -2953,7 +3008,15 @@ internal sealed class RoutingEngine : IDisposable
                 continue;
             }
 
-            if (temporarilyHoldingManagedRoutes && ManagedRouteProcessStillMatches(route))
+            var process = GetProcessInfo(route.ProcessId);
+            var processIdentityMatches = process is not null &&
+                                         MatchesProcessIdentity(route, process.Value) &&
+                                         RouteOwnershipDecisions.CanClearManagedRoute(
+                                             route,
+                                             process.Value.ProcessId,
+                                             process.Value.ExecutablePath);
+
+            if (temporarilyHoldingManagedRoutes && processIdentityMatches)
             {
                 continue;
             }
@@ -2961,15 +3024,14 @@ internal sealed class RoutingEngine : IDisposable
             if (heldProcessIds.Contains(route.ProcessId))
             {
                 var heldEndpoint = _policy.GetPersistedEndpoint(route.ProcessId);
-                if (!heldEndpoint.HasExplicitEndpoint)
+                if (heldEndpoint.Status == PersistedEndpointStatus.Unavailable || !processIdentityMatches)
                 {
-                    if (ManagedRouteProcessStillMatches(route))
-                    {
-                        KeepManagedRouteWhileEndpointIsUnavailable(route, "browser window is paused or ambiguous");
-                        continue;
-                    }
+                    continue;
+                }
 
-                    ForgetManagedRoute(route.ProcessId);
+                if (heldEndpoint.IsDefault)
+                {
+                    KeepManagedRouteWhileEndpointIsUnavailable(route, "browser window is paused or ambiguous");
                     continue;
                 }
 
@@ -2984,7 +3046,17 @@ internal sealed class RoutingEngine : IDisposable
                 continue;
             }
 
+            if (!processIdentityMatches)
+            {
+                continue;
+            }
+
             var currentEndpoint = _policy.GetPersistedEndpoint(route.ProcessId);
+            if (currentEndpoint.Status == PersistedEndpointStatus.Unavailable)
+            {
+                continue;
+            }
+
             if (currentEndpoint.HasExplicitEndpoint &&
                 EndpointIdsEqual(currentEndpoint.EndpointId, route.EndpointId))
             {
@@ -2994,6 +3066,8 @@ internal sealed class RoutingEngine : IDisposable
                         changed++;
                         break;
                     case ManagedRouteClearOutcome.StillOwned:
+                    case ManagedRouteClearOutcome.ReadbackUnavailable:
+                    case ManagedRouteClearOutcome.IdentityUnverified:
                         failed++;
                         break;
                 }
@@ -3007,7 +3081,10 @@ internal sealed class RoutingEngine : IDisposable
         return (changed, failed);
     }
 
-    private bool SetOwnedRouteWithReadback(ProcessRouteTarget target, List<AudioEndpoint> endpoints)
+    private bool SetOwnedRouteWithReadback(
+        ProcessRouteTarget target,
+        string executablePath,
+        List<AudioEndpoint> endpoints)
     {
         // Only write state.json after Windows reports the same explicit
         // endpoint we just requested. This prevents the app from "owning" a
@@ -3017,16 +3094,11 @@ internal sealed class RoutingEngine : IDisposable
             return false;
         }
 
-        if (!_policy.SetPersistedEndpoint(target.ProcessId, target.Endpoint.Id))
-        {
-            return false;
-        }
-
+        var writeSucceeded = _policy.SetPersistedEndpoint(target.ProcessId, target.Endpoint.Id);
         var afterSet = _policy.GetPersistedEndpoint(target.ProcessId);
-        if (afterSet.HasExplicitEndpoint &&
-            EndpointIdsEqual(afterSet.EndpointId, target.Endpoint.Id))
+        if (RouteOwnershipDecisions.ShouldClaimAfterSet(writeSucceeded, target.Endpoint.Id, afterSet))
         {
-            _state.Managed[target.ProcessId.ToString()] = ManagedRoute.FromTarget(target);
+            _state.Managed[target.ProcessId.ToString()] = ManagedRoute.FromTarget(target, executablePath);
             _state.PowerResumeManaged.Remove(target.ProcessId.ToString());
             return true;
         }
@@ -3060,21 +3132,43 @@ internal sealed class RoutingEngine : IDisposable
         // Clearing is also verified by readback. If Windows still reports our
         // endpoint, keep ownership so a later scan can retry instead of
         // mistaking the stuck route for a manual user assignment.
-        _policy.ClearPersistedEndpoint(route.ProcessId);
-        var afterClear = _policy.GetPersistedEndpoint(route.ProcessId);
-        if (!afterClear.HasExplicitEndpoint)
+        var process = GetProcessInfo(route.ProcessId);
+        if (process is null ||
+            !MatchesProcessIdentity(route, process.Value) ||
+            !RouteOwnershipDecisions.CanClearManagedRoute(route, process.Value.ProcessId, process.Value.ExecutablePath))
         {
-            ForgetManagedRoute(route.ProcessId);
-            return ManagedRouteClearOutcome.ClearedToDefault;
+            Log.WriteThrottled(
+                $"managed-route-clear-identity-unverified-{route.ProcessId}-{route.EndpointId}",
+                $"Kept managed ownership for PID {route.ProcessId} because its executable identity could not be verified before {reason}.",
+                TimeSpan.FromMinutes(5));
+            return ManagedRouteClearOutcome.IdentityUnverified;
         }
 
-        if (EndpointIdsEqual(afterClear.EndpointId, route.EndpointId))
+        _policy.ClearPersistedEndpoint(route.ProcessId);
+        var afterClear = _policy.GetPersistedEndpoint(route.ProcessId);
+        var outcome = RouteOwnershipDecisions.EvaluateClearReadback(afterClear, route.EndpointId);
+        if (outcome == ManagedRouteClearOutcome.ClearedToDefault)
+        {
+            ForgetManagedRoute(route.ProcessId);
+            return outcome;
+        }
+
+        if (outcome == ManagedRouteClearOutcome.ReadbackUnavailable)
+        {
+            Log.WriteThrottled(
+                $"managed-route-clear-readback-unavailable-{route.ProcessId}-{route.EndpointId}",
+                $"Kept managed ownership for PID {route.ProcessId} ({route.ProcessName}) because Windows could not verify the endpoint after {reason}.",
+                TimeSpan.FromMinutes(5));
+            return outcome;
+        }
+
+        if (outcome == ManagedRouteClearOutcome.StillOwned)
         {
             Log.WriteThrottled(
                 $"managed-route-clear-still-explicit-{route.ProcessId}-{route.EndpointId}",
                 $"Kept managed ownership for PID {route.ProcessId} ({route.ProcessName}) because clearing during {reason} did not restore Default.",
                 TimeSpan.FromMinutes(5));
-            return ManagedRouteClearOutcome.StillOwned;
+            return outcome;
         }
 
         Log.WriteThrottled(
@@ -3082,7 +3176,7 @@ internal sealed class RoutingEngine : IDisposable
             $"Forgot managed ownership for PID {route.ProcessId} ({route.ProcessName}) because Windows now reports a different explicit endpoint after {reason}.",
             TimeSpan.FromMinutes(5));
         ForgetManagedRoute(route.ProcessId);
-        return ManagedRouteClearOutcome.OwnershipLost;
+        return outcome;
     }
 
     private void ForgetManagedRoute(int processId)
@@ -3093,6 +3187,11 @@ internal sealed class RoutingEngine : IDisposable
 
     private static string DescribePersistedEndpoint(PersistedEndpoint endpoint, List<AudioEndpoint> endpoints)
     {
+        if (endpoint.Status == PersistedEndpointStatus.Unavailable)
+        {
+            return "an unavailable endpoint";
+        }
+
         if (!endpoint.HasExplicitEndpoint)
         {
             return "Default";
@@ -3168,15 +3267,39 @@ internal sealed class RoutingEngine : IDisposable
             TimeSpan.FromSeconds(30));
     }
 
-    private enum ManagedRouteClearOutcome
+    private ManagedRoute? TryRebindDormantManagedRoute(
+        ProcessRouteTarget target,
+        string targetExecutablePath,
+        PersistedEndpoint currentEndpoint)
     {
-        ClearedToDefault,
-        StillOwned,
-        OwnershipLost
+        foreach (var route in _state.Managed.Values.ToList())
+        {
+            if (!RouteOwnershipDecisions.CanRebindDormantRoute(
+                    route,
+                    target.ProcessId,
+                    targetExecutablePath,
+                    currentEndpoint,
+                    ManagedRouteProcessStillMatches(route)))
+            {
+                continue;
+            }
+
+            var reboundRoute = ManagedRoute.RebindTo(route, target, targetExecutablePath);
+            ForgetManagedRoute(route.ProcessId);
+            _state.Managed[target.ProcessId.ToString()] = reboundRoute;
+            Log.WriteThrottled(
+                $"managed-route-rebound-{route.ProcessId}-{target.ProcessId}-{route.EndpointId}",
+                $"Transferred managed route ownership from dormant PID {route.ProcessId} to PID {target.ProcessId} for {target.ProcessName}.",
+                TimeSpan.FromMinutes(5));
+            return reboundRoute;
+        }
+
+        return null;
     }
 
     private ManagedRoute? TryGetPowerResumeManagedRoute(
         ProcessRouteTarget target,
+        string targetExecutablePath,
         PersistedEndpoint currentEndpoint,
         List<AudioEndpoint> endpoints)
     {
@@ -3196,9 +3319,9 @@ internal sealed class RoutingEngine : IDisposable
             return null;
         }
 
-        if (!target.MatchesProcessIdentity(route))
+        if (!target.MatchesProcessIdentity(route) ||
+            !RouteOwnershipDecisions.CanClearManagedRoute(route, target.ProcessId, targetExecutablePath))
         {
-            _state.PowerResumeManaged.Remove(target.ProcessId.ToString());
             return null;
         }
 
@@ -3415,7 +3538,7 @@ internal sealed class RoutingEngine : IDisposable
                     .Select(process => process!.Value)
                     .DistinctBy(process => process.ProcessId)
                     .ToList()
-                : new List<(int ProcessId, string ProcessName, DateTimeOffset? StartUtc)>();
+                : new List<(int ProcessId, string ProcessName, DateTimeOffset? StartUtc, string? ExecutablePath)>();
 
             foreach (var hintWindow in routeWindows)
             {
@@ -3529,7 +3652,7 @@ internal sealed class RoutingEngine : IDisposable
         return match;
     }
 
-    private static (int ProcessId, string ProcessName, DateTimeOffset? StartUtc)? GetProcessInfo(int processId)
+    private static (int ProcessId, string ProcessName, DateTimeOffset? StartUtc, string? ExecutablePath)? GetProcessInfo(int processId)
     {
         try
         {
@@ -3547,7 +3670,17 @@ internal sealed class RoutingEngine : IDisposable
                 start = null;
             }
 
-            return (processId, name, start);
+            string? executablePath = null;
+            try
+            {
+                executablePath = RouteOwnershipDecisions.NormalizeExecutablePath(process.MainModule?.FileName);
+            }
+            catch
+            {
+                executablePath = null;
+            }
+
+            return (processId, name, start, executablePath);
         }
         catch
         {
@@ -3557,7 +3690,7 @@ internal sealed class RoutingEngine : IDisposable
 
     private static bool MatchesProcessIdentity(
         ManagedRoute route,
-        (int ProcessId, string ProcessName, DateTimeOffset? StartUtc) process)
+        (int ProcessId, string ProcessName, DateTimeOffset? StartUtc, string? ExecutablePath) process)
     {
         if (route.ProcessId != process.ProcessId ||
             !route.ProcessName.Equals(process.ProcessName, StringComparison.OrdinalIgnoreCase))
@@ -3565,9 +3698,14 @@ internal sealed class RoutingEngine : IDisposable
             return false;
         }
 
-        return route.ProcessStartUtcTicks is null ||
-               process.StartUtc is null ||
-               route.ProcessStartUtcTicks.Value == process.StartUtc.Value.UtcTicks;
+        if (route.ProcessStartUtcTicks is not null &&
+            (process.StartUtc is null || route.ProcessStartUtcTicks.Value != process.StartUtc.Value.UtcTicks))
+        {
+            return false;
+        }
+
+        return route.ExecutablePath is null ||
+               RouteOwnershipDecisions.CanClearManagedRoute(route, process.ProcessId, process.ExecutablePath);
     }
 
     private void AddRouteTarget(
@@ -3856,21 +3994,162 @@ internal sealed class ManagedRoute
     public int ProcessId { get; set; }
     public string ProcessName { get; set; } = "";
     public long? ProcessStartUtcTicks { get; set; }
+    public string? ExecutablePath { get; set; }
     public string EndpointId { get; set; } = "";
     public string EndpointName { get; set; } = "";
     public DateTimeOffset LastSetUtc { get; set; }
 
-    public static ManagedRoute FromTarget(ProcessRouteTarget target)
+    public static ManagedRoute FromTarget(ProcessRouteTarget target, string executablePath)
     {
         return new ManagedRoute
         {
             ProcessId = target.ProcessId,
             ProcessName = target.ProcessName,
             ProcessStartUtcTicks = target.ProcessStartUtc?.UtcTicks,
+            ExecutablePath = RouteOwnershipDecisions.NormalizeExecutablePath(executablePath),
             EndpointId = target.Endpoint?.Id ?? "",
             EndpointName = target.Endpoint?.Name ?? "",
             LastSetUtc = DateTimeOffset.UtcNow
         };
+    }
+
+    public static ManagedRoute RebindTo(
+        ManagedRoute dormantRoute,
+        ProcessRouteTarget target,
+        string executablePath)
+    {
+        return new ManagedRoute
+        {
+            ProcessId = target.ProcessId,
+            ProcessName = target.ProcessName,
+            ProcessStartUtcTicks = target.ProcessStartUtc?.UtcTicks,
+            ExecutablePath = RouteOwnershipDecisions.NormalizeExecutablePath(executablePath),
+            EndpointId = dormantRoute.EndpointId,
+            EndpointName = dormantRoute.EndpointName,
+            LastSetUtc = dormantRoute.LastSetUtc
+        };
+    }
+}
+
+internal enum ManagedRouteClearOutcome
+{
+    ClearedToDefault,
+    StillOwned,
+    OwnershipLost,
+    ReadbackUnavailable,
+    IdentityUnverified
+}
+
+internal enum ManagedRouteIdentityStatus
+{
+    Match,
+    Mismatch,
+    Unavailable
+}
+
+internal static class RouteOwnershipDecisions
+{
+    public static bool CanClearManagedRoute(
+        ManagedRoute route,
+        int currentProcessId,
+        string? currentExecutablePath)
+    {
+        return EvaluateProcessIdentity(route, currentProcessId, currentExecutablePath) ==
+               ManagedRouteIdentityStatus.Match;
+    }
+
+    public static ManagedRouteIdentityStatus EvaluateProcessIdentity(
+        ManagedRoute route,
+        int currentProcessId,
+        string? currentExecutablePath)
+    {
+        if (route.ProcessId != currentProcessId)
+        {
+            return ManagedRouteIdentityStatus.Mismatch;
+        }
+
+        var ownedPath = NormalizeExecutablePath(route.ExecutablePath);
+        var currentPath = NormalizeExecutablePath(currentExecutablePath);
+        if (ownedPath is null || currentPath is null)
+        {
+            return ManagedRouteIdentityStatus.Unavailable;
+        }
+
+        return ownedPath.Equals(currentPath, StringComparison.OrdinalIgnoreCase)
+            ? ManagedRouteIdentityStatus.Match
+            : ManagedRouteIdentityStatus.Mismatch;
+    }
+
+    public static bool CanRebindDormantRoute(
+        ManagedRoute route,
+        int newProcessId,
+        string? newExecutablePath,
+        PersistedEndpoint currentEndpoint,
+        bool ownedProcessStillMatches)
+    {
+        if (route.ProcessId == newProcessId ||
+            ownedProcessStillMatches ||
+            !currentEndpoint.HasExplicitEndpoint ||
+            !string.Equals(route.EndpointId.Trim(), currentEndpoint.EndpointId?.Trim(), StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var ownedPath = NormalizeExecutablePath(route.ExecutablePath);
+        var newPath = NormalizeExecutablePath(newExecutablePath);
+        return ownedPath is not null &&
+               newPath is not null &&
+               ownedPath.Equals(newPath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool ShouldClaimAfterSet(
+        bool writeSucceeded,
+        string requestedEndpointId,
+        PersistedEndpoint readback)
+    {
+        // Windows can apply some roles while reporting aggregate failure, so
+        // matching readback is authoritative for ownership.
+        _ = writeSucceeded;
+        return readback.HasExplicitEndpoint &&
+               string.Equals(readback.EndpointId?.Trim(), requestedEndpointId.Trim(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static ManagedRouteClearOutcome EvaluateClearReadback(
+        PersistedEndpoint readback,
+        string ownedEndpointId)
+    {
+        if (readback.Status == PersistedEndpointStatus.Unavailable)
+        {
+            return ManagedRouteClearOutcome.ReadbackUnavailable;
+        }
+
+        if (readback.IsDefault)
+        {
+            return ManagedRouteClearOutcome.ClearedToDefault;
+        }
+
+        return string.Equals(readback.EndpointId?.Trim(), ownedEndpointId.Trim(), StringComparison.OrdinalIgnoreCase)
+            ? ManagedRouteClearOutcome.StillOwned
+            : ManagedRouteClearOutcome.OwnershipLost;
+    }
+
+    public static string? NormalizeExecutablePath(string? executablePath)
+    {
+        if (string.IsNullOrWhiteSpace(executablePath))
+        {
+            return null;
+        }
+
+        try
+        {
+            return Path.GetFullPath(executablePath.Trim())
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
     }
 }
 
@@ -3957,14 +4236,33 @@ internal static class StateStore
 
     public static void Save(RouterState state)
     {
+        Save(Paths.StateFile, state);
+    }
+
+    internal static void Save(string path, RouterState state)
+    {
         state = Normalize(state);
-        AtomicFile.WriteAllText(Paths.StateFile, JsonSerializer.Serialize(state, JsonOptions));
+        var serializedState = JsonSerializer.Serialize(state, JsonOptions);
+        var serializedBytes = Encoding.UTF8.GetPreamble()
+            .Concat(Encoding.UTF8.GetBytes(serializedState))
+            .ToArray();
+        if (File.Exists(path) && File.ReadAllBytes(path).AsSpan().SequenceEqual(serializedBytes))
+        {
+            return;
+        }
+
+        AtomicFile.WriteAllText(path, serializedState);
     }
 
     private static RouterState Normalize(RouterState state)
     {
         state.Managed ??= new Dictionary<string, ManagedRoute>(StringComparer.OrdinalIgnoreCase);
         state.PowerResumeManaged ??= new Dictionary<string, ManagedRoute>(StringComparer.OrdinalIgnoreCase);
+        foreach (var route in state.Managed.Values.Concat(state.PowerResumeManaged.Values))
+        {
+            route.ExecutablePath = RouteOwnershipDecisions.NormalizeExecutablePath(route.ExecutablePath);
+        }
+
         return state;
     }
 }
@@ -4207,12 +4505,15 @@ internal static class CommandLineDiagnostics
             }
 
             var persisted = policy.GetPersistedEndpoint(processId);
-            var endpointName = persisted.HasExplicitEndpoint
-                ? endpoints.FirstOrDefault(endpoint =>
-                    endpoint.Id.Equals(persisted.EndpointId, StringComparison.OrdinalIgnoreCase))?.Name
-                  ?? persisted.EndpointId
-                  ?? "<unknown>"
-                : "Default";
+            var endpointName = persisted.Status switch
+            {
+                PersistedEndpointStatus.Default => "Default",
+                PersistedEndpointStatus.Unavailable => "Unavailable",
+                _ => endpoints.FirstOrDefault(endpoint =>
+                         endpoint.Id.Equals(persisted.EndpointId, StringComparison.OrdinalIgnoreCase))?.Name
+                     ?? persisted.EndpointId
+                     ?? "<unknown>"
+            };
             var activeEndpointNames = string.Join(
                 ", ",
                 sessionGroup
@@ -4989,6 +5290,11 @@ internal sealed class AppAudioPolicy : IDisposable
         _policy = TryCreateWinRtFactory() ?? TryCreateComFactory();
     }
 
+    internal AppAudioPolicy(IAudioPolicyConfigFactory policy)
+    {
+        _policy = policy;
+    }
+
     public PersistedEndpoint GetPersistedEndpoint(int processId)
     {
         if (_policy is null)
@@ -4996,20 +5302,44 @@ internal sealed class AppAudioPolicy : IDisposable
             return PersistedEndpoint.Unavailable;
         }
 
+        var roleReadFailed = false;
+        string? explicitEndpointId = null;
+        var conflictingExplicitEndpoints = false;
         foreach (var role in ManagedRoles())
         {
             var hResult = _policy.GetPersistedDefaultAudioEndpoint((uint)processId, EDataFlow.eRender, role, out var endpoint);
-            if (hResult == 0)
+            if (hResult != 0)
             {
-                if (!string.IsNullOrWhiteSpace(endpoint) &&
-                    !endpoint.Equals("DefaultRenderDevice", StringComparison.OrdinalIgnoreCase))
+                roleReadFailed = true;
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(endpoint) &&
+                !endpoint.Equals("DefaultRenderDevice", StringComparison.OrdinalIgnoreCase))
+            {
+                var roleEndpointId = UnpackDeviceId(endpoint);
+                if (explicitEndpointId is null)
                 {
-                    return new PersistedEndpoint(true, UnpackDeviceId(endpoint));
+                    explicitEndpointId = roleEndpointId;
+                }
+                else if (!explicitEndpointId.Equals(roleEndpointId, StringComparison.OrdinalIgnoreCase))
+                {
+                    conflictingExplicitEndpoints = true;
                 }
             }
         }
 
-        return PersistedEndpoint.Default;
+        if (explicitEndpointId is not null && !conflictingExplicitEndpoints)
+        {
+            return PersistedEndpoint.Explicit(explicitEndpointId);
+        }
+
+        if (conflictingExplicitEndpoints)
+        {
+            return PersistedEndpoint.Unavailable;
+        }
+
+        return roleReadFailed ? PersistedEndpoint.Unavailable : PersistedEndpoint.Default;
     }
 
     public bool SetPersistedEndpoint(int processId, string endpointId)
@@ -5398,10 +5728,25 @@ internal sealed class AudioPolicyConfigFactoryDownlevel : IAudioPolicyConfigFact
     }
 }
 
-internal sealed record PersistedEndpoint(bool HasExplicitEndpoint, string? EndpointId)
+internal enum PersistedEndpointStatus
 {
-    public static PersistedEndpoint Default { get; } = new(false, null);
-    public static PersistedEndpoint Unavailable { get; } = new(false, null);
+    Default,
+    Explicit,
+    Unavailable
+}
+
+internal sealed record PersistedEndpoint(PersistedEndpointStatus Status, string? EndpointId)
+{
+    public static PersistedEndpoint Default { get; } = new(PersistedEndpointStatus.Default, null);
+    public static PersistedEndpoint Unavailable { get; } = new(PersistedEndpointStatus.Unavailable, null);
+
+    public bool IsDefault => Status == PersistedEndpointStatus.Default;
+    public bool HasExplicitEndpoint => Status == PersistedEndpointStatus.Explicit;
+
+    public static PersistedEndpoint Explicit(string endpointId)
+    {
+        return new PersistedEndpoint(PersistedEndpointStatus.Explicit, endpointId);
+    }
 }
 
 internal static class WindowInspector
