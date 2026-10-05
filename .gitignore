@@ -5,6 +5,8 @@ app/
 build/
 dist/
 packages/
+.worktrees/
+.superpowers/
 
 # Generated installer payload
 installer-src/Resources/payload.zip
