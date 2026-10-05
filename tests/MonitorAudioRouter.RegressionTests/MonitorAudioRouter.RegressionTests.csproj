@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsTestProject>true</IsTestProject>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <AssemblyName>MonitorAudioRouter.RegressionTests</AssemblyName>
+    <RootNamespace>MonitorAudioRouter.RegressionTests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\MonitorAudioRouter.csproj" />
+    <ProjectReference Include="..\..\installer-src\MonitorAudioRouterSetup.csproj" />
+  </ItemGroup>
+</Project>

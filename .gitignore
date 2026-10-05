@@ -1,6 +1,7 @@
-# Build outputs
+# Build and test outputs
 bin/
 obj/
+tests/.appdata/
 app/
 build/
 dist/
