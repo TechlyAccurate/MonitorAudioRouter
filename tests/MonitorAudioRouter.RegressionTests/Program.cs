@@ -24,6 +24,8 @@ internal static class Program
         runner.Add("Terminal rejection waits for disconnect callback completion", TerminalRejectionWaitsForDisconnectCallbackCompletion);
         runner.Add("Admitted disconnect waits for callback completion during shutdown", AdmittedDisconnectWaitsForCallbackCompletionDuringShutdown);
         runner.Add("Scheduled cleanup waits for an overlapping terminal callback", ScheduledCleanupWaitsForOverlappingTerminalCallback);
+        runner.Add("Shutdown cleanup claim rejects a later terminal callback", ShutdownCleanupClaimRejectsLaterTerminalCallback);
+        runner.Add("Stale cleanup claim rejects a later terminal callback", StaleCleanupClaimRejectsLaterTerminalCallback);
         runner.Add("All absent role values produce Default", AllAbsentRoleValuesProduceDefault);
         runner.Add("Any untrustworthy role query produces Unavailable unless a consistent explicit endpoint is proven", UntrustworthyRoleQueryProducesUnavailableWithoutExplicitEndpoint);
         runner.Add("An explicit endpoint produces Explicit with its ID", ExplicitEndpointProducesExplicitWithItsId);
@@ -532,6 +534,96 @@ internal static class Program
         manager.Dispose();
 
         RegressionAssert.Equal(1, disposalCount, "Overlapping callbacks and shutdown must dispose exactly once.");
+    }
+
+    private static void ShutdownCleanupClaimRejectsLaterTerminalCallback()
+    {
+        using var cleanupClaimed = new ManualResetEventSlim();
+        using var allowDisposal = new ManualResetEventSlim();
+        var session = new object();
+        var callbackBodyCount = 0;
+        var disposalCount = 0;
+        var manager = new global::MonitorAudioRouter.DeferredSubscriptionManager<object>(
+            scheduleCleanup: _ => throw new InvalidOperationException("Shutdown cleanup should not schedule deferred work."),
+            disposeItem: item =>
+            {
+                RegressionAssert.True(ReferenceEquals(session, item), "Only the admitted session should be disposed.");
+                cleanupClaimed.Set();
+                allowDisposal.Wait();
+                Interlocked.Increment(ref disposalCount);
+            });
+        RegressionAssert.True(manager.TryTakeOwnership(session), "The connected session should be admitted before shutdown.");
+        var eventsClient = new global::MonitorAudioRouter.AudioSessionEventsClient(
+            _ => { },
+            () => manager.RunTerminalCallback(session, () => Interlocked.Increment(ref callbackBodyCount)));
+        var cleanupTask = Task.Run(manager.Dispose);
+
+        try
+        {
+            RegressionAssert.True(cleanupClaimed.Wait(TimeSpan.FromSeconds(5)), "Shutdown should claim cleanup before disposal.");
+            eventsClient.OnSessionDisconnected(global::MonitorAudioRouter.AudioSessionDisconnectReason.DeviceRemoval);
+            RegressionAssert.Equal(0, callbackBodyCount, "A callback must not start after shutdown commits disposal.");
+        }
+        finally
+        {
+            allowDisposal.Set();
+            cleanupTask.GetAwaiter().GetResult();
+        }
+
+        manager.Dispose();
+        RegressionAssert.Equal(1, disposalCount, "Repeated shutdown must not dispose the claimed session twice.");
+    }
+
+    private static void StaleCleanupClaimRejectsLaterTerminalCallback()
+    {
+        var scheduledCleanup = new Queue<Action>();
+        using var cleanupClaimed = new ManualResetEventSlim();
+        using var allowDisposal = new ManualResetEventSlim();
+        var session = new object();
+        var callbackBodyCount = 0;
+        var disposalCount = 0;
+        var manager = new global::MonitorAudioRouter.DeferredSubscriptionManager<object>(
+            scheduleCleanup: action => scheduledCleanup.Enqueue(action),
+            disposeItem: item =>
+            {
+                RegressionAssert.True(ReferenceEquals(session, item), "Only the terminal session should be disposed.");
+                cleanupClaimed.Set();
+                allowDisposal.Wait();
+                Interlocked.Increment(ref disposalCount);
+            });
+        RegressionAssert.True(manager.TryTakeOwnership(session), "The connected session should be admitted before disconnect.");
+        var callbackNumber = 0;
+        var eventsClient = new global::MonitorAudioRouter.AudioSessionEventsClient(
+            _ => { },
+            () => manager.RunTerminalCallback(session, () =>
+            {
+                if (Interlocked.Increment(ref callbackNumber) == 1)
+                {
+                    manager.QueueForDisposal(session);
+                    return;
+                }
+
+                Interlocked.Increment(ref callbackBodyCount);
+            }));
+        eventsClient.OnSessionDisconnected(global::MonitorAudioRouter.AudioSessionDisconnectReason.DeviceRemoval);
+        RegressionAssert.Equal(1, scheduledCleanup.Count, "The disconnect should post one cleanup action.");
+        var staleCleanup = scheduledCleanup.Dequeue();
+        var cleanupTask = Task.Run(staleCleanup);
+
+        try
+        {
+            RegressionAssert.True(cleanupClaimed.Wait(TimeSpan.FromSeconds(5)), "The queued action should claim cleanup before disposal.");
+            eventsClient.OnSessionDisconnected(global::MonitorAudioRouter.AudioSessionDisconnectReason.DeviceRemoval);
+            RegressionAssert.Equal(0, callbackBodyCount, "A callback must not start after queued cleanup commits disposal.");
+        }
+        finally
+        {
+            allowDisposal.Set();
+            cleanupTask.GetAwaiter().GetResult();
+        }
+
+        manager.Dispose();
+        RegressionAssert.Equal(1, disposalCount, "Queued cleanup and shutdown must dispose the claimed session exactly once.");
     }
 
     private static void AllAbsentRoleValuesProduceDefault()

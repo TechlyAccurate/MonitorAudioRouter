@@ -3,6 +3,7 @@ using System.Drawing;
 using System.IO.Pipes;
 using System.Media;
 using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Principal;
@@ -5397,14 +5398,21 @@ internal sealed class DeferredDisposalQueue<T> where T : class
 
 internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : class
 {
+    private sealed class SubscriptionState
+    {
+        public bool IsTerminal;
+        public int CallbackCount;
+        public bool DisposalRequested;
+        public bool DisposalCommitted;
+    }
+
     private readonly object _lockObject = new();
     // Active items are the synchronously disposable subset of manager-owned items.
     // Terminal callback entry removes an item from that subset until deferred cleanup owns disposal.
     private readonly HashSet<T> _owned = new();
     private readonly HashSet<T> _active = new();
-    private readonly HashSet<T> _terminal = new();
-    private readonly Dictionary<T, int> _callbackCounts = new();
-    private readonly HashSet<T> _disposalRequested = new();
+    // Keep disposal commitment visible to late callbacks without retaining disposed COM wrappers.
+    private readonly ConditionalWeakTable<T, SubscriptionState> _states = new();
     private readonly DeferredDisposalQueue<T> _pending = new();
     private readonly Action<Action> _scheduleCleanup;
     private readonly Action<T> _disposeItem;
@@ -5421,7 +5429,13 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
         var scheduleCleanup = false;
         lock (_lockObject)
         {
-            var isTerminal = _terminal.Contains(item) || _disposalRequested.Contains(item);
+            var state = GetStateLocked(item);
+            if (state.DisposalCommitted)
+            {
+                return false;
+            }
+
+            var isTerminal = state.IsTerminal || state.DisposalRequested;
             if (_disposed && !isTerminal)
             {
                 return false;
@@ -5430,8 +5444,8 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
             _owned.Add(item);
             if (isTerminal)
             {
-                scheduleCleanup = !_callbackCounts.ContainsKey(item)
-                    && _disposalRequested.Contains(item)
+                scheduleCleanup = state.CallbackCount == 0
+                    && state.DisposalRequested
                     && _pending.Enqueue(item);
             }
             else
@@ -5450,11 +5464,9 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
 
     public void RunTerminalCallback(T item, Action callback)
     {
-        lock (_lockObject)
+        if (!TryBeginTerminalCallback(item))
         {
-            _terminal.Add(item);
-            _active.Remove(item);
-            _callbackCounts[item] = _callbackCounts.GetValueOrDefault(item) + 1;
+            return;
         }
 
         try
@@ -5467,20 +5479,33 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
         }
     }
 
+    private bool TryBeginTerminalCallback(T item)
+    {
+        lock (_lockObject)
+        {
+            var state = GetStateLocked(item);
+            if (state.DisposalCommitted)
+            {
+                return false;
+            }
+
+            state.IsTerminal = true;
+            _active.Remove(item);
+            state.CallbackCount++;
+            return true;
+        }
+    }
+
     private void CompleteTerminalCallback(T item)
     {
         var scheduleCleanup = false;
         lock (_lockObject)
         {
-            var callbackCount = _callbackCounts[item] - 1;
-            if (callbackCount == 0)
+            var state = GetStateLocked(item);
+            state.CallbackCount--;
+            if (state.CallbackCount == 0)
             {
-                _callbackCounts.Remove(item);
-                scheduleCleanup = _disposalRequested.Contains(item) && _pending.Enqueue(item);
-            }
-            else
-            {
-                _callbackCounts[item] = callbackCount;
+                scheduleCleanup = state.DisposalRequested && _pending.Enqueue(item);
             }
         }
 
@@ -5495,9 +5520,15 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
         var scheduleCleanup = false;
         lock (_lockObject)
         {
+            var state = GetStateLocked(item);
+            if (state.DisposalCommitted)
+            {
+                return;
+            }
+
             // Preserve requests from callbacks that overlap shutdown or admission.
-            _disposalRequested.Add(item);
-            scheduleCleanup = !_callbackCounts.ContainsKey(item) && _pending.Enqueue(item);
+            state.DisposalRequested = true;
+            scheduleCleanup = state.CallbackCount == 0 && _pending.Enqueue(item);
         }
 
         if (scheduleCleanup)
@@ -5510,31 +5541,40 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
     {
         _pending.Drain(item =>
         {
-            var removed = false;
+            var disposalCommitted = false;
             lock (_lockObject)
             {
-                if (!_callbackCounts.ContainsKey(item))
-                {
-                    removed = _owned.Remove(item);
-                    if (removed)
-                    {
-                        _active.Remove(item);
-                        _terminal.Remove(item);
-                        _disposalRequested.Remove(item);
-                    }
-                }
+                disposalCommitted = TryCommitDisposalLocked(item);
             }
 
-            if (removed)
+            if (disposalCommitted)
             {
                 _disposeItem(item);
             }
         });
     }
 
+    private bool TryCommitDisposalLocked(T item)
+    {
+        var state = GetStateLocked(item);
+        if (!_owned.Contains(item) || state.CallbackCount != 0)
+        {
+            return false;
+        }
+
+        _owned.Remove(item);
+        _active.Remove(item);
+        state.DisposalRequested = false;
+        state.DisposalCommitted = true;
+        return true;
+    }
+
+    private SubscriptionState GetStateLocked(T item) =>
+        _states.GetValue(item, static _ => new SubscriptionState());
+
     public void Dispose()
     {
-        T[] active;
+        var disposalCommitted = new List<T>();
         lock (_lockObject)
         {
             if (_disposed)
@@ -5543,17 +5583,16 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
             }
 
             _disposed = true;
-            active = _active.ToArray();
-            _active.Clear();
-            foreach (var item in active)
+            foreach (var item in _active.ToArray())
             {
-                _owned.Remove(item);
-                _terminal.Remove(item);
-                _disposalRequested.Remove(item);
+                if (TryCommitDisposalLocked(item))
+                {
+                    disposalCommitted.Add(item);
+                }
             }
         }
 
-        foreach (var item in active)
+        foreach (var item in disposalCommitted)
         {
             _disposeItem(item);
         }
