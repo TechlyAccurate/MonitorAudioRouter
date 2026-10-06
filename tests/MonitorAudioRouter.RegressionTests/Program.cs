@@ -24,6 +24,15 @@ internal static class Program
         runner.Add("Interactive installer choices override persisted choices", InteractiveInstallerChoicesOverridePersistedChoices);
         runner.Add("Installed executable matching requires a normalized full path", InstalledExecutableMatchingRequiresNormalizedFullPath);
         runner.Add("Installer process discovery queries only installed executable names", InstallerProcessDiscoveryQueriesOnlyInstalledNames);
+        runner.Add("Installer waits through a native host relaunch before replacement", InstallerWaitsThroughNativeHostRelaunchBeforeReplacement);
+        runner.Add("Failed update restarts a tray app stopped by the installer", FailedUpdateRestartsStoppedTrayApp);
+        runner.Add("Failed update preserves an intentionally stopped tray app", FailedUpdatePreservesIntentionallyStoppedTrayApp);
+        runner.Add("Installer ignores a process operation race after exit", InstallerIgnoresProcessOperationRaceAfterExit);
+        runner.Add("Installer preserves a process operation failure while active", InstallerPreservesProcessOperationFailureWhileActive);
+        runner.Add("Native host manifest gate restores prior files after failure", NativeHostManifestGateRestoresPriorFilesAfterFailure);
+        runner.Add("Native host manifest gate preserves replacement files after commit", NativeHostManifestGatePreservesReplacementFilesAfterCommit);
+        runner.Add("Native host manifest gate accepts an absent manifest directory", NativeHostManifestGateAcceptsAbsentManifestDirectory);
+        runner.Add("Native host manifest gate attempts every restore and reports failures", NativeHostManifestGateAttemptsEveryRestoreAndReportsFailures);
         runner.Add("Changed registry values are retained during uninstall", ChangedRegistryValuesAreRetainedDuringUninstall);
         runner.Add("Unchanged installer registry values restore their predecessor", UnchangedInstallerRegistryValuesRestoreTheirPredecessor);
         runner.Add("Unchanged new installer registry values are deleted", UnchangedNewInstallerRegistryValuesAreDeleted);
@@ -459,6 +468,185 @@ internal static class Program
             string.Join('|', queriedNames),
             "Process discovery must query only the two installed executable names.");
         RegressionAssert.Equal(2, candidates.Length, "Both exact-name candidate sets should be returned.");
+    }
+
+    private static void InstallerWaitsThroughNativeHostRelaunchBeforeReplacement()
+    {
+        var processCounts = new Queue<int>([1, 0, 1, 0, 0, 0]);
+        var currentTime = new DateTimeOffset(2026, 10, 6, 11, 16, 0, TimeSpan.Zero);
+        var stopPasses = 0;
+
+        global::MonitorAudioRouter.Setup.InstallerProcessQuiescence.WaitUntilStable(
+            stopInstalledProcesses: () =>
+            {
+                stopPasses++;
+                return processCounts.Count > 0 ? processCounts.Dequeue() : 0;
+            },
+            getCurrentTime: () => currentTime,
+            wait: duration => currentTime += duration,
+            quietPeriod: TimeSpan.FromMilliseconds(200),
+            timeout: TimeSpan.FromSeconds(2),
+            pollInterval: TimeSpan.FromMilliseconds(100));
+
+        RegressionAssert.Equal(
+            6,
+            stopPasses,
+            "A process that relaunches during the quiet period must reset the stability timer.");
+    }
+
+    private static void FailedUpdateRestartsStoppedTrayApp()
+    {
+        var startedPaths = new List<string>();
+        const string installedAppPath = @"C:\Program Files\Monitor Audio Router\MonitorAudioRouter.exe";
+
+        var restarted = global::MonitorAudioRouter.Setup.InstallerFailureRecovery.TryRestartStoppedApp(
+            appWasStopped: true,
+            installedAppPath,
+            fileExists: _ => true,
+            startApp: path => startedPaths.Add(path),
+            writeLog: _ => { });
+
+        RegressionAssert.True(restarted, "Failure recovery should report that it restarted the stopped tray app.");
+        RegressionAssert.Equal(installedAppPath, startedPaths.Single(), "Failure recovery must restart the installed tray executable.");
+    }
+
+    private static void FailedUpdatePreservesIntentionallyStoppedTrayApp()
+    {
+        var startCount = 0;
+
+        var restarted = global::MonitorAudioRouter.Setup.InstallerFailureRecovery.TryRestartStoppedApp(
+            appWasStopped: false,
+            installedAppPath: @"C:\Program Files\Monitor Audio Router\MonitorAudioRouter.exe",
+            fileExists: _ => true,
+            startApp: _ => startCount++,
+            writeLog: _ => { });
+
+        RegressionAssert.True(!restarted, "Failure recovery must not restart a tray app that setup did not stop.");
+        RegressionAssert.Equal(0, startCount, "An intentionally stopped tray app must remain stopped after setup fails.");
+    }
+
+    private static void InstallerIgnoresProcessOperationRaceAfterExit()
+    {
+        var processHasExited = false;
+
+        var completed = global::MonitorAudioRouter.Setup.InstallerProcessRace.TryExecuteWhileActive(
+            hasExited: () => processHasExited,
+            operation: () =>
+            {
+                processHasExited = true;
+                throw new InvalidOperationException("The process exited before the operation completed.");
+            });
+
+        RegressionAssert.True(!completed, "An operation that loses a process-exit race should be treated as already complete.");
+    }
+
+    private static void InstallerPreservesProcessOperationFailureWhileActive()
+    {
+        RegressionAssert.Throws<UnauthorizedAccessException>(() =>
+            global::MonitorAudioRouter.Setup.InstallerProcessRace.TryExecuteWhileActive(
+                hasExited: () => false,
+                operation: () => throw new UnauthorizedAccessException("Access denied.")));
+    }
+
+    private static void NativeHostManifestGateRestoresPriorFilesAfterFailure()
+    {
+        var temporaryDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "MonitorAudioRouter.RegressionTests",
+            Guid.NewGuid().ToString("N"));
+        var chromiumManifest = Path.Combine(temporaryDirectory, "chromium.json");
+        var firefoxManifest = Path.Combine(temporaryDirectory, "firefox.json");
+        Directory.CreateDirectory(temporaryDirectory);
+        File.WriteAllText(chromiumManifest, "prior-chromium", Encoding.UTF8);
+        File.WriteAllText(firefoxManifest, "prior-firefox", Encoding.UTF8);
+
+        try
+        {
+            using (global::MonitorAudioRouter.Setup.NativeMessagingManifestGate.Block(
+                       [chromiumManifest, firefoxManifest]))
+            {
+                RegressionAssert.True(!File.Exists(chromiumManifest), "The Chromium manifest must be unavailable while installation is in progress.");
+                RegressionAssert.True(!File.Exists(firefoxManifest), "The Firefox manifest must be unavailable while installation is in progress.");
+            }
+
+            RegressionAssert.Equal("prior-chromium", File.ReadAllText(chromiumManifest, Encoding.UTF8), "Failure must restore the prior Chromium manifest.");
+            RegressionAssert.Equal("prior-firefox", File.ReadAllText(firefoxManifest, Encoding.UTF8), "Failure must restore the prior Firefox manifest.");
+        }
+        finally
+        {
+            Directory.Delete(temporaryDirectory, recursive: true);
+        }
+    }
+
+    private static void NativeHostManifestGatePreservesReplacementFilesAfterCommit()
+    {
+        var temporaryDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "MonitorAudioRouter.RegressionTests",
+            Guid.NewGuid().ToString("N"));
+        var manifestPath = Path.Combine(temporaryDirectory, "firefox.json");
+        Directory.CreateDirectory(temporaryDirectory);
+        File.WriteAllText(manifestPath, "prior", Encoding.UTF8);
+
+        try
+        {
+            using (var gate = global::MonitorAudioRouter.Setup.NativeMessagingManifestGate.Block([manifestPath]))
+            {
+                File.WriteAllText(manifestPath, "replacement", Encoding.UTF8);
+                gate.Commit();
+            }
+
+            RegressionAssert.Equal("replacement", File.ReadAllText(manifestPath, Encoding.UTF8), "Commit must preserve the replacement manifest.");
+        }
+        finally
+        {
+            Directory.Delete(temporaryDirectory, recursive: true);
+        }
+    }
+
+    private static void NativeHostManifestGateAcceptsAbsentManifestDirectory()
+    {
+        var temporaryDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "MonitorAudioRouter.RegressionTests",
+            Guid.NewGuid().ToString("N"));
+        var absentManifest = Path.Combine(temporaryDirectory, "native-hosts", "firefox.json");
+
+        using var gate = global::MonitorAudioRouter.Setup.NativeMessagingManifestGate.Block([absentManifest]);
+        gate.Commit();
+
+        RegressionAssert.True(!Directory.Exists(temporaryDirectory), "Blocking an absent manifest must not create its parent directory.");
+    }
+
+    private static void NativeHostManifestGateAttemptsEveryRestoreAndReportsFailures()
+    {
+        var temporaryDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "MonitorAudioRouter.RegressionTests",
+            Guid.NewGuid().ToString("N"));
+        var chromiumManifest = Path.Combine(temporaryDirectory, "chromium.json");
+        var firefoxManifest = Path.Combine(temporaryDirectory, "firefox.json");
+        var restoreFailures = new List<Exception>();
+        Directory.CreateDirectory(temporaryDirectory);
+        File.WriteAllText(chromiumManifest, "prior-chromium", Encoding.UTF8);
+        File.WriteAllText(firefoxManifest, "prior-firefox", Encoding.UTF8);
+
+        try
+        {
+            var gate = global::MonitorAudioRouter.Setup.NativeMessagingManifestGate.Block(
+                [chromiumManifest, firefoxManifest],
+                restoreFailures.Add);
+            Directory.CreateDirectory(chromiumManifest);
+
+            gate.Dispose();
+
+            RegressionAssert.Equal(1, restoreFailures.Count, "A failed restore should be reported once without escaping Dispose.");
+            RegressionAssert.Equal("prior-firefox", File.ReadAllText(firefoxManifest, Encoding.UTF8), "A later manifest must still be restored after an earlier restore fails.");
+        }
+        finally
+        {
+            Directory.Delete(temporaryDirectory, recursive: true);
+        }
     }
 
     private static void ChangedRegistryValuesAreRetainedDuringUninstall()

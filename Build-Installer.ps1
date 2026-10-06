@@ -13,7 +13,7 @@ $payloadZip = Join-Path $resourcesDir "payload.zip"
 $distDir = Join-Path $root "dist"
 $payloadStage = Join-Path ([IO.Path]::GetTempPath()) ("MonitorAudioRouterPayload-" + [Guid]::NewGuid().ToString("N"))
 $publishProperties = @("-p:DebugType=none", "-p:DebugSymbols=false")
-$releaseVersion = "0.1.15"
+$releaseVersion = "0.1.16"
 
 . (Join-Path $root "Build-Archive.ps1")
 

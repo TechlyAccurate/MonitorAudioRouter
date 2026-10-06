@@ -227,8 +227,8 @@ function Test-ReleasePackages {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
 
     $failures = New-Object System.Collections.Generic.List[string]
-    $desktopVersion = "0.1.15"
-    $desktopFileVersion = "0.1.15.0"
+    $desktopVersion = "0.1.16"
+    $desktopFileVersion = "0.1.16.0"
     $extensionVersion = "0.1.6"
     $chromeExtensionId = "jnjminkakfohjeffdpeamngcnfneckog"
     $firefoxExtensionId = "monitor-audio-router@example.local"

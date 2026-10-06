@@ -13,7 +13,7 @@ using MonitorAudioRouter.UpdateSupport;
 
 const string AppName = "Monitor Audio Router";
 const string AppId = "MonitorAudioRouter";
-const string AppVersion = "0.1.15";
+const string AppVersion = "0.1.16";
 const string HostName = "com.monitoraudiorouter.router";
 const string ChromeWebStoreListingUrl = "https://chromewebstore.google.com/detail/jnjminkakfohjeffdpeamngcnfneckog";
 const string FirefoxAddOnsListingUrl = "https://addons.mozilla.org/en-US/firefox/addon/monitor-audio-router-bridge/";
@@ -52,6 +52,7 @@ if (options.UpdateToLatestDuringInstall && TryLaunchNewerInstaller(options, prev
     return;
 }
 
+var priorInstallationWasInterrupted = false;
 try
 {
     var tempDir = Path.Combine(Path.GetTempPath(), AppId + "-" + Guid.NewGuid().ToString("N"));
@@ -69,8 +70,12 @@ try
         WriteInstallerLog($"Staging and validating replacement at {stagedInstallDir}.");
         StageInstallation(tempDir, installDir, stagedInstallDir);
         ValidateStagedInstallation(stagedInstallDir);
+        using var nativeMessagingManifestGate = NativeMessagingManifestGate.Block(
+            GetNativeMessagingManifestPaths(installDir)
+                .Concat(GetNativeMessagingManifestPaths(stagedInstallDir)),
+            exception => WriteInstallerLog($"Native messaging manifest restore failed: {exception}"));
         WriteInstallerLog($"Stopping existing app processes before installing to {installDir}.");
-        StopExistingApp(installDir);
+        StopExistingApp(installDir, () => priorInstallationWasInterrupted = true);
         WriteInstallerLog("Replacing application files transactionally.");
         var browserExtensionDeployment = InstallerOrchestration.Execute(
             stagedInstallDir,
@@ -79,8 +84,6 @@ try
             stateTransaction =>
             {
                 var registryOwnership = new RegistryOwnershipRecorder(previousInstallInfo?.RegistryValues);
-                WriteInstallerLog("Writing native messaging manifests.");
-                WriteNativeMessagingManifests(installDir, options);
                 WriteInstallerLog("Registering native messaging hosts.");
                 RegisterNativeMessagingHosts(installDir, registryOwnership, stateTransaction);
                 WriteInstallerLog("Registering browser extension deployment policies.");
@@ -97,6 +100,12 @@ try
                     previousInstallInfo?.RequiresLegacyBrowserCleanup == true,
                     previousInstallInfo);
                 return deployment;
+            },
+            beforeCommit: () =>
+            {
+                WriteInstallerLog("Writing native messaging manifests.");
+                WriteNativeMessagingManifests(installDir, options);
+                nativeMessagingManifestGate.Commit();
             });
         WriteInstallerLog("Install registry state written.");
 
@@ -126,6 +135,12 @@ catch (Exception exception)
     Console.Error.WriteLine("Install failed:");
     Console.Error.WriteLine(exception);
     WriteInstallerLog($"Setup failed: {exception}");
+    InstallerFailureRecovery.TryRestartStoppedApp(
+        priorInstallationWasInterrupted,
+        Path.Combine(installDir, "MonitorAudioRouter.exe"),
+        File.Exists,
+        StartAppForUser,
+        WriteInstallerLog);
     if (!HasSwitch(args, "/quiet"))
     {
         MessageBox.Show(
@@ -146,14 +161,28 @@ static void ExtractPayload(string tempDir)
     archive.ExtractToDirectory(tempDir, overwriteFiles: true);
 }
 
-static void StopExistingApp(string installDir)
+static void StopExistingApp(string installDir, Action trayAppStopped)
 {
+    StopInstalledProcesses(installDir, trayAppStopped);
+    ClearManagedRoutes(installDir);
+    InstallerProcessQuiescence.WaitUntilStable(
+        stopInstalledProcesses: () => StopInstalledProcesses(installDir, trayAppStopped),
+        getCurrentTime: () => DateTimeOffset.UtcNow,
+        wait: Thread.Sleep,
+        quietPeriod: TimeSpan.FromMilliseconds(750),
+        timeout: TimeSpan.FromSeconds(10),
+        pollInterval: TimeSpan.FromMilliseconds(100));
+}
+
+static int StopInstalledProcesses(string installDir, Action trayAppStopped)
+{
+    var trayAppPath = Path.Combine(installDir, "MonitorAudioRouter.exe");
     var expectedPaths = new[]
     {
-        Path.Combine(installDir, "MonitorAudioRouter.exe"),
+        trayAppPath,
         Path.Combine(installDir, "MonitorAudioRouterNativeHost.exe")
     };
-    var installedProcesses = new List<Process>();
+    var installedProcesses = new List<(Process Process, string ExecutablePath, bool IsTrayApp)>();
     var candidates = InstallDecisions.EnumerateInstalledProcessCandidates(Process.GetProcessesByName);
     foreach (var process in candidates)
     {
@@ -165,7 +194,16 @@ static void StopExistingApp(string installDir)
                 continue;
             }
 
-            var executablePath = process.MainModule?.FileName;
+            string? executablePath = null;
+            var processIsActive = InstallerProcessRace.TryExecuteWhileActive(
+                hasExited: () => process.HasExited,
+                operation: () => executablePath = process.MainModule?.FileName);
+            if (!processIsActive)
+            {
+                process.Dispose();
+                continue;
+            }
+
             if (executablePath is null ||
                 !expectedPaths.Any(expected => InstallDecisions.IsExactExecutablePath(executablePath, expected)))
             {
@@ -173,7 +211,10 @@ static void StopExistingApp(string installDir)
                 continue;
             }
 
-            installedProcesses.Add(process);
+            installedProcesses.Add((
+                process,
+                executablePath,
+                InstallDecisions.IsExactExecutablePath(executablePath, trayAppPath)));
         }
         catch (Exception exception)
         {
@@ -181,7 +222,7 @@ static void StopExistingApp(string installDir)
             process.Dispose();
             foreach (var installedProcess in installedProcesses)
             {
-                installedProcess.Dispose();
+                installedProcess.Process.Dispose();
             }
 
             throw new InvalidOperationException(
@@ -192,37 +233,49 @@ static void StopExistingApp(string installDir)
 
     try
     {
-        foreach (var process in installedProcesses)
+        foreach (var installedProcess in installedProcesses)
         {
-            WriteInstallerLog($"Stopping installed executable {process.MainModule?.FileName} PID {process.Id}.");
-            process.Kill(entireProcessTree: false);
+            WriteInstallerLog(
+                $"Stopping installed executable {installedProcess.ExecutablePath} PID {installedProcess.Process.Id}.");
+            var processWasStopped = InstallerProcessRace.TryExecuteWhileActive(
+                hasExited: () => installedProcess.Process.HasExited,
+                operation: () => installedProcess.Process.Kill(entireProcessTree: false));
+            if (processWasStopped)
+            {
+                if (installedProcess.IsTrayApp)
+                {
+                    trayAppStopped();
+                }
+            }
         }
 
         var deadline = DateTime.UtcNow.AddSeconds(10);
-        foreach (var process in installedProcesses)
+        foreach (var installedProcess in installedProcesses)
         {
             var remaining = deadline - DateTime.UtcNow;
             if (remaining > TimeSpan.Zero)
             {
-                process.WaitForExit((int)Math.Min(remaining.TotalMilliseconds, int.MaxValue));
+                installedProcess.Process.WaitForExit(
+                    (int)Math.Min(remaining.TotalMilliseconds, int.MaxValue));
             }
 
-            if (!process.HasExited)
+            if (!installedProcess.Process.HasExited)
             {
                 throw new InvalidOperationException(
-                    $"Installed process PID {process.Id} did not exit within the shutdown timeout.");
+                    $"Installed process PID {installedProcess.Process.Id} did not exit within the shutdown timeout.");
             }
         }
+
+        // Any verified process activity resets the quiet window, even if it exits before Kill.
+        return installedProcesses.Count;
     }
     finally
     {
         foreach (var process in installedProcesses)
         {
-            process.Dispose();
+            process.Process.Dispose();
         }
     }
-
-    ClearManagedRoutes(installDir);
 }
 
 static void ClearManagedRoutes(string installDir)
@@ -367,6 +420,16 @@ static void WriteNativeMessagingManifests(string installDir, InstallerOptions op
     File.WriteAllText(
         Path.Combine(hostDir, "firefox-com.monitoraudiorouter.router.json"),
         JsonSerializer.Serialize(firefoxManifest, serializerOptions));
+}
+
+static IReadOnlyList<string> GetNativeMessagingManifestPaths(string installDir)
+{
+    var hostDirectory = Path.Combine(installDir, "native-hosts");
+    return
+    [
+        Path.Combine(hostDirectory, "chromium-com.monitoraudiorouter.router.json"),
+        Path.Combine(hostDirectory, "firefox-com.monitoraudiorouter.router.json")
+    ];
 }
 
 static void RegisterNativeMessagingHosts(
