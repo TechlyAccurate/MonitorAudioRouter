@@ -13,7 +13,9 @@ $payloadZip = Join-Path $resourcesDir "payload.zip"
 $distDir = Join-Path $root "dist"
 $payloadStage = Join-Path ([IO.Path]::GetTempPath()) ("MonitorAudioRouterPayload-" + [Guid]::NewGuid().ToString("N"))
 $publishProperties = @("-p:DebugType=none", "-p:DebugSymbols=false")
-$releaseVersion = "0.1.14"
+$releaseVersion = "0.1.15"
+
+. (Join-Path $root "Build-Archive.ps1")
 
 function Assert-NativeSuccess([string]$Action) {
     if ($LASTEXITCODE -ne 0) {
@@ -95,7 +97,7 @@ try {
 
     Copy-Item -LiteralPath (Join-Path $root "installer-src\Uninstall-MonitorAudioRouter.ps1") -Destination (Join-Path $payloadStage "Uninstall-MonitorAudioRouter.ps1") -Force
 
-    Compress-Archive -Path (Join-Path $payloadStage "*") -DestinationPath $payloadZip -Force
+    New-DeterministicArchive $payloadStage $payloadZip
 }
 finally {
     Remove-Item -LiteralPath $payloadStage -Recurse -Force -ErrorAction SilentlyContinue
@@ -134,7 +136,7 @@ try {
         }
     }
 
-    Compress-Archive -Path (Join-Path $releaseStage "*") -DestinationPath $releaseZip -Force
+    New-DeterministicArchive $releaseStage $releaseZip
 }
 finally {
     Remove-Item -LiteralPath $releaseStage -Recurse -Force -ErrorAction SilentlyContinue

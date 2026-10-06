@@ -60,6 +60,12 @@ The most important safety rule is ownership:
 - Installs the tray app, native host manifests, browser extension policy entries,
   Start Menu shortcut, and autostart setting.
 
+`Build-Archive.ps1`
+
+- Shared PowerShell 5.1-compatible archive writer.
+- Gives every ZIP/XPI entry an ordinal path order, forward-slash name, and fixed
+  timestamp so unchanged inputs produce unchanged archives.
+
 ## Runtime flow
 
 ### Startup
@@ -100,10 +106,19 @@ The hint payload says:
 - browser window bounds;
 - audible tab titles;
 - active tab title;
-- optional process IDs when the browser exposes them.
+- optional process IDs when the browser exposes them;
+- a random source-instance ID, increasing sequence number, and send timestamp.
 
 `BrowserHintStore` keeps hints briefly. Old hints expire quickly so stale browser
-state does not keep routing forever.
+state does not keep routing forever. For ordered extension messages, it rejects a
+sequence older than the latest accepted message from that source instance. A
+restarted extension receives a new source ID and may start again at sequence one.
+Legacy messages remain accepted during extension rollout, and per-source state is
+pruned and capped.
+
+The native host accepts one bounded message and forwards it over a local named
+pipe. The tray app applies byte, character, and read-time limits before parsing;
+partial, oversized, or timed-out frames never update hint state.
 
 The routing engine reconciles those hints with native Windows windows. This
 matters because browser-reported bounds can be stale or affected by DPI changes.
@@ -157,6 +172,7 @@ It tracks routes like:
 process ID
 process name
 process start time
+executable path
 endpoint ID
 endpoint name
 last set time
@@ -164,7 +180,9 @@ last set time
 
 Process start time protects against PID reuse. Windows can recycle a PID after a
 process exits, so the app should not assume that a new process with the same PID
-is the same app instance.
+is the same app instance. Executable path is the durable identity check used when
+a matching app restarts under a new PID. If identity cannot be read, the app
+preserves dormant ownership without rebinding or clearing another process.
 
 ### Sleep and wake
 
@@ -190,6 +208,31 @@ The app clears routes when:
 Clearing is verified by readback. If Windows still reports the old endpoint, the
 app keeps ownership and retries later.
 
+Disabling routing clears managed routes before replacing the active engine. A
+failed or throwing cleanup leaves the old engine active instead of reporting a
+disabled state while owned routes remain. Audio-session callbacks use explicit
+cleanup claims so shutdown, disconnect, and stale-session paths cannot dispose
+the same subscription concurrently.
+
+### Installer and updates
+
+The installer reads the existing install record before applying defaults, so an
+upgrade preserves the selected browser, autostart, private-browsing, and update
+options. It stops only known product executables whose normalized paths are under
+the recorded install directory, and it does not kill an entire process tree.
+
+Installation is transactional. File replacements and registry writes record the
+prior state, then commit only after the payload, shortcuts, browser settings, and
+install record succeed. On failure, rollback runs in reverse order. It restores
+or removes a value only when the current value still equals the value written by
+that install attempt; concurrent external changes are retained. Ownership carried
+through an upgrade keeps the original predecessor so a later uninstall restores
+the state that existed before Monitor Audio Router first took ownership.
+
+The updater accepts release metadata only from the expected HTTPS GitHub hosts,
+downloads into a checked local directory, verifies the matching SHA-256 entry,
+and launches the installer only after the checksum succeeds.
+
 ## Important invariants
 
 - Do not route when `_settings.Enabled` is false.
@@ -199,8 +242,26 @@ app keeps ownership and retries later.
   as active audio sessions.
 - Do not forget a managed non-default route merely because a browser is paused,
   ambiguous, or waking after sleep.
+- Do not apply an older ordered browser snapshot after a newer snapshot from the
+  same source instance.
 - Do not claim ownership unless set/readback confirms the endpoint.
 - Do not mark a route cleared unless clear/readback confirms `Default`.
+- Do not roll back an installer-owned value or file after another actor changed
+  it.
+
+## Packaging flow
+
+`Build-Store-Packages.ps1` validates that every Chromium store transform has
+exactly one source match before replacing anything. The store manifest removes
+the development key and optional process permission, and the store background
+removes process-permission code. Both browser packages are checked against an
+explicit file allowlist before archiving.
+
+`Build-Installer.ps1` publishes the tray app and native host, builds the store
+packages, stages the installer payload, publishes the setup executable, and
+stages the GitHub release assets. Store ZIP/XPI files, `payload.zip`, and the
+GitHub release ZIP all use `New-DeterministicArchive`; public filenames and
+package layout remain stable.
 
 ## Where to change things
 

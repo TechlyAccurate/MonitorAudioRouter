@@ -19,6 +19,7 @@ The browser extensions are optional, but recommended when routing browser audio.
 - Leaves manual Windows Volume Mixer assignments alone.
 - Ignores common VR audio processes by default.
 - Keeps the last correct browser route while media is paused.
+- Ignores stale browser-extension updates after a newer window state arrives.
 - Runs from the system tray and can start automatically with Windows.
 
 The tray menu provides route configuration, enable/disable, `Scan now`, autostart, and access to the log.
@@ -28,6 +29,8 @@ The tray menu provides route configuration, enable/disable, `Scan now`, autostar
 Run `MonitorAudioRouterSetup.exe` as administrator.
 
 The installer adds the tray app, browser communication helper, Start Menu shortcut, and current-user autostart. It also attempts to deploy the published browser extensions through supported browser policy registry entries.
+
+Re-running the installer keeps the existing install choices unless you change them.
 
 If browser extension policy deployment is skipped or fails for a browser, the installer opens that browser's extension store page so the user can install the companion extension manually.
 

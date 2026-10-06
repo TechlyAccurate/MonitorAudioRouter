@@ -14,7 +14,7 @@ using MonitorAudioRouter.Setup;
 
 const string AppName = "Monitor Audio Router";
 const string AppId = "MonitorAudioRouter";
-const string AppVersion = "0.1.14";
+const string AppVersion = "0.1.15";
 const string HostName = "com.monitoraudiorouter.router";
 const string DefaultChromeExtensionId = "jnjminkakfohjeffdpeamngcnfneckog";
 const string DefaultEdgeExtensionId = "";
