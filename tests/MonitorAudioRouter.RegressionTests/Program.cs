@@ -16,8 +16,10 @@ internal static class Program
         runner.Add("Missing configuration returns first-run defaults", MissingConfigurationReturnsFirstRunDefaults);
         runner.Add("Malformed configuration fails disabled without an autostart decision", MalformedConfigurationFailsDisabledWithoutAutostartDecision);
         runner.Add("Disabling reload clears managed routes before engine disposal", DisablingReloadClearsRoutesBeforeEngineDisposal);
-        runner.Add("Unchanged tray state reuses its menu and icon", UnchangedTrayStateReusesMenuAndIcon);
-        runner.Add("Disconnected session cleanup runs once after its callback", DisconnectedSessionCleanupRunsOnceAfterCallback);
+        runner.Add("Unsuccessful disabling cleanup retains the old engine", UnsuccessfulDisablingCleanupRetainsOldEngine);
+        runner.Add("Throwing disabling cleanup retains the old engine", ThrowingDisablingCleanupRetainsOldEngine);
+        runner.Add("Tray resource owner reuses menu and disposes replaced icons", TrayResourceOwnerReusesMenuAndDisposesReplacedIcons);
+        runner.Add("Disconnected session cleanup is deferred and idempotent", DisconnectedSessionCleanupIsDeferredAndIdempotent);
         runner.Add("All absent role values produce Default", AllAbsentRoleValuesProduceDefault);
         runner.Add("Any untrustworthy role query produces Unavailable unless a consistent explicit endpoint is proven", UntrustworthyRoleQueryProducesUnavailableWithoutExplicitEndpoint);
         runner.Add("An explicit endpoint produces Explicit with its ID", ExplicitEndpointProducesExplicitWithItsId);
@@ -162,50 +164,150 @@ internal static class Program
     {
         var events = new List<string>();
 
-        global::MonitorAudioRouter.TrayLifecycleDecisions.ApplyEngineReload(
+        var result = global::MonitorAudioRouter.TrayLifecycleDecisions.ApplyEngineReload(
             wasEnabled: true,
             isEnabled: false,
-            clearManagedRoutes: () => events.Add("clear"),
+            clearManagedRoutes: () =>
+            {
+                events.Add("clear");
+                return new global::MonitorAudioRouter.ScanResult(true, "cleared", 1, 1, 0);
+            },
             disposeEngine: () => events.Add("dispose"),
             createEngine: () => events.Add("create"));
 
+        RegressionAssert.True(result.Applied, "A successful cleanup should permit the disabling reload.");
         RegressionAssert.Equal(
             "clear,dispose,create",
             string.Join(',', events),
             "A disabling reload must clear verifiably owned routes before disposing the engine.");
     }
 
-    private static void UnchangedTrayStateReusesMenuAndIcon()
+    private static void UnsuccessfulDisablingCleanupRetainsOldEngine()
     {
-        var decision = global::MonitorAudioRouter.TrayLifecycleDecisions.PlanTrayRefresh(
-            displayedEnabled: true,
-            nextEnabled: true);
+        var events = new List<string>();
 
-        RegressionAssert.True(!decision.ReplaceMenu, "Refresh should always update the existing context menu in place.");
-        RegressionAssert.True(!decision.ReplaceIcon, "An unchanged enabled state should retain the existing tray icon.");
+        var result = global::MonitorAudioRouter.TrayLifecycleDecisions.ApplyEngineReload(
+            wasEnabled: true,
+            isEnabled: false,
+            clearManagedRoutes: () =>
+            {
+                events.Add("clear");
+                return new global::MonitorAudioRouter.ScanResult(false, "one route remains explicit", 1, 0, 0);
+            },
+            disposeEngine: () => events.Add("dispose"),
+            createEngine: () => events.Add("create"));
+
+        RegressionAssert.True(!result.Applied, "An unsuccessful cleanup must reject the disabling reload.");
+        RegressionAssert.Equal("clear", string.Join(',', events), "The old engine must remain active after cleanup fails.");
+        RegressionAssert.Contains(
+            "one route remains explicit",
+            result.ErrorMessage ?? string.Empty,
+            "The rejected reload should surface the cleanup failure.");
     }
 
-    private static void DisconnectedSessionCleanupRunsOnceAfterCallback()
+    private static void ThrowingDisablingCleanupRetainsOldEngine()
     {
-        var queue = new global::MonitorAudioRouter.DeferredDisposalQueue<object>();
-        var session = new object();
-        var callbackActive = true;
-        var disposalCount = 0;
+        var events = new List<string>();
 
-        queue.Enqueue(session);
-        queue.Enqueue(session);
-        RegressionAssert.Equal(0, disposalCount, "Enqueueing during the callback must not dispose the session reentrantly.");
+        var result = global::MonitorAudioRouter.TrayLifecycleDecisions.ApplyEngineReload(
+            wasEnabled: true,
+            isEnabled: false,
+            clearManagedRoutes: () =>
+            {
+                events.Add("clear");
+                throw new InvalidOperationException("state persistence failed");
+            },
+            disposeEngine: () => events.Add("dispose"),
+            createEngine: () => events.Add("create"));
 
+        RegressionAssert.True(!result.Applied, "A throwing cleanup must reject the disabling reload.");
+        RegressionAssert.Equal("clear", string.Join(',', events), "A cleanup exception must leave the old engine active.");
+        RegressionAssert.Contains(
+            "state persistence failed",
+            result.ErrorMessage ?? string.Empty,
+            "The rejected reload should surface the cleanup exception.");
+    }
+
+    private static void TrayResourceOwnerReusesMenuAndDisposesReplacedIcons()
+    {
+        var menuCreateCount = 0;
+        var menuDisposeCount = 0;
+        var iconCreateCount = 0;
+        var disposedIcons = new List<object>();
+        var attachedIcons = new List<object>();
+        var menuUpdateCount = 0;
+        var menu = new object();
+
+        var resources = new global::MonitorAudioRouter.TrayResourceLifecycle<object, object>(
+            initialEnabled: true,
+            createMenu: () =>
+            {
+                menuCreateCount++;
+                return menu;
+            },
+            createIcon: _ =>
+            {
+                iconCreateCount++;
+                return new object();
+            },
+            disposeMenu: _ => menuDisposeCount++,
+            disposeIcon: icon => disposedIcons.Add(icon));
+
+        var initialIcon = resources.Icon;
+        resources.Refresh(true, _ => menuUpdateCount++, icon => attachedIcons.Add(icon));
+        resources.Refresh(false, _ => menuUpdateCount++, icon => attachedIcons.Add(icon));
+        var disabledIcon = resources.Icon;
+        resources.Dispose();
+
+        RegressionAssert.Equal(1, menuCreateCount, "The context menu and its handlers should be created once.");
+        RegressionAssert.True(ReferenceEquals(menu, resources.Menu), "Refresh should retain the original context menu.");
+        RegressionAssert.Equal(2, iconCreateCount, "Only an enabled-state change should allocate a replacement icon.");
+        RegressionAssert.Equal(2, menuUpdateCount, "Each refresh should update the retained menu in place.");
+        RegressionAssert.Equal(1, attachedIcons.Count, "Only the replacement icon should be attached during refresh.");
+        RegressionAssert.True(ReferenceEquals(disabledIcon, attachedIcons[0]), "Refresh should attach the new icon instance.");
+        RegressionAssert.Equal(2, disposedIcons.Count, "The superseded and current icons should each be disposed once.");
+        RegressionAssert.True(ReferenceEquals(initialIcon, disposedIcons[0]), "The enabled icon should be disposed when replaced.");
+        RegressionAssert.True(ReferenceEquals(disabledIcon, disposedIcons[1]), "The current icon should be disposed at shutdown.");
+        RegressionAssert.Equal(1, menuDisposeCount, "The retained menu should be disposed once at shutdown.");
+    }
+
+    private static void DisconnectedSessionCleanupIsDeferredAndIdempotent()
+    {
+        var scheduledCleanup = new Queue<Action>();
+        var disposalCounts = new Dictionary<object, int>();
+        var callbackActive = false;
+        var manager = new global::MonitorAudioRouter.DeferredSubscriptionManager<object>(
+            scheduleCleanup: action => scheduledCleanup.Enqueue(action),
+            disposeItem: item =>
+            {
+                RegressionAssert.True(!callbackActive, "Manager-owned disposal must run after the callback returns.");
+                disposalCounts[item] = disposalCounts.GetValueOrDefault(item) + 1;
+            });
+        var disconnectedSession = new object();
+        RegressionAssert.True(manager.TryAdd(disconnectedSession), "The active session should be tracked.");
+        var eventsClient = new global::MonitorAudioRouter.AudioSessionEventsClient(
+            _ => { },
+            () => manager.QueueForDisposal(disconnectedSession));
+
+        callbackActive = true;
+        eventsClient.OnSessionDisconnected(global::MonitorAudioRouter.AudioSessionDisconnectReason.DeviceRemoval);
+        eventsClient.OnSessionDisconnected(global::MonitorAudioRouter.AudioSessionDisconnectReason.DeviceRemoval);
         callbackActive = false;
-        queue.Drain(item =>
-        {
-            RegressionAssert.True(!callbackActive, "Manager-owned cleanup must run after the callback returns.");
-            RegressionAssert.True(ReferenceEquals(session, item), "Cleanup should receive the disconnected session.");
-            disposalCount++;
-        });
-        queue.Drain(_ => disposalCount++);
 
-        RegressionAssert.Equal(1, disposalCount, "A disconnected session should be removed and disposed exactly once.");
+        RegressionAssert.Equal(0, disposalCounts.Count, "The disconnect callback should only enqueue cleanup.");
+        RegressionAssert.Equal(1, scheduledCleanup.Count, "Duplicate disconnect callbacks should share one cleanup request.");
+        scheduledCleanup.Dequeue()();
+        RegressionAssert.Equal(1, disposalCounts[disconnectedSession], "Deferred cleanup should dispose the session once.");
+
+        var shutdownSession = new object();
+        RegressionAssert.True(manager.TryAdd(shutdownSession), "A second active session should be tracked.");
+        manager.QueueForDisposal(shutdownSession);
+        RegressionAssert.Equal(1, scheduledCleanup.Count, "The disconnect should schedule cleanup without a routing scan.");
+        manager.Dispose();
+        scheduledCleanup.Dequeue()();
+
+        RegressionAssert.Equal(1, disposalCounts[shutdownSession], "Shutdown racing queued cleanup must not double-dispose.");
+        RegressionAssert.Equal(1, disposalCounts[disconnectedSession], "Previously drained sessions must remain single-disposed.");
     }
 
     private static void AllAbsentRoleValuesProduceDefault()

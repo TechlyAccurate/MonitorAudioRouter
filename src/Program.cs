@@ -503,7 +503,7 @@ internal sealed class AboutForm : Form
 internal sealed class RouterTrayContext : ApplicationContext
 {
     private readonly NotifyIcon _notifyIcon;
-    private readonly ContextMenuStrip _contextMenu;
+    private readonly TrayResourceLifecycle<ContextMenuStrip, Icon> _trayResources;
     private readonly ToolStripMenuItem _enabledMenuItem;
     private readonly ToolStripMenuItem _autostartMenuItem;
     private readonly Control _dispatcher;
@@ -515,7 +515,6 @@ internal sealed class RouterTrayContext : ApplicationContext
     private readonly AudioEventWatcher _audioEventWatcher;
     private RoutingEngine _engine;
     private RouterSettings _settings;
-    private bool _displayedEnabled;
     private bool _scanRunning;
     private string _lastStatus = "Starting";
 
@@ -545,14 +544,18 @@ internal sealed class RouterTrayContext : ApplicationContext
             CheckOnClick = false
         };
         _autostartMenuItem.Click += (_, _) => ToggleAutostart();
-        _contextMenu = BuildMenu();
-        _displayedEnabled = _settings.Enabled;
+        _trayResources = new TrayResourceLifecycle<ContextMenuStrip, Icon>(
+            _settings.Enabled,
+            BuildMenu,
+            TrayIconFactory.Create,
+            menu => menu.Dispose(),
+            icon => icon.Dispose());
         _notifyIcon = new NotifyIcon
         {
-            Icon = TrayIconFactory.Create(_settings.Enabled),
+            Icon = _trayResources.Icon,
             Text = BuildTooltip(),
             Visible = true,
-            ContextMenuStrip = _contextMenu
+            ContextMenuStrip = _trayResources.Menu
         };
         RefreshTray();
 
@@ -568,7 +571,12 @@ internal sealed class RouterTrayContext : ApplicationContext
             _engine.HoldManagedRoutes(TimeSpan.FromSeconds(20), reason);
             _scanScheduler.RequestBurst(reason);
         });
-        _audioEventWatcher = new AudioEventWatcher(reason => _scanScheduler.RequestBurst(reason));
+        _audioEventWatcher = new AudioEventWatcher(
+            reason => _scanScheduler.RequestBurst(reason),
+            cleanup =>
+            {
+                _dispatcher.BeginInvoke(cleanup);
+            });
 
         _hintServer.Start();
         _windowEventWatcher.Start();
@@ -671,27 +679,36 @@ internal sealed class RouterTrayContext : ApplicationContext
         }
     }
 
-    private void ReloadConfig()
+    private bool ReloadConfig()
     {
         var settingsLoad = SettingsStore.Load();
         var oldEngine = _engine;
         var wasEnabled = _settings.Enabled;
+        var reloadResult = TrayLifecycleDecisions.ApplyEngineReload(
+            wasEnabled,
+            settingsLoad.Settings.Enabled,
+            clearManagedRoutes: oldEngine.ClearManagedRoutes,
+            disposeEngine: oldEngine.Dispose,
+            createEngine: () => _engine = new RoutingEngine(settingsLoad.Settings));
+        if (!reloadResult.Applied)
+        {
+            _lastStatus = reloadResult.ErrorMessage ?? "Config reload failed";
+            Log.Write($"Config reload rejected: {_lastStatus}");
+            RefreshTray();
+            MessageBox.Show(
+                _lastStatus,
+                "Could not reload config",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return false;
+        }
+
         _settings = settingsLoad.Settings;
         if (TrayLifecycleDecisions.ShouldApplyAutostart(settingsLoad))
         {
             ApplyAutostartSetting();
         }
 
-        TrayLifecycleDecisions.ApplyEngineReload(
-            wasEnabled,
-            _settings.Enabled,
-            clearManagedRoutes: () =>
-            {
-                var result = oldEngine.ClearManagedRoutes();
-                _lastStatus = result.ToString();
-            },
-            disposeEngine: oldEngine.Dispose,
-            createEngine: () => _engine = new RoutingEngine(_settings));
         _scanScheduler.SetPassiveInterval(Math.Max(500, _settings.PollMilliseconds));
         _audioEventWatcher.RefreshSubscriptions("config reload");
         _lastStatus = settingsLoad.Status == SettingsLoadStatus.Invalid
@@ -708,6 +725,8 @@ internal sealed class RouterTrayContext : ApplicationContext
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
         }
+
+        return settingsLoad.Status != SettingsLoadStatus.Invalid;
     }
 
     private void ConfigureRoutes()
@@ -727,7 +746,11 @@ internal sealed class RouterTrayContext : ApplicationContext
             }
 
             SettingsStore.Save(form.Settings);
-            ReloadConfig();
+            if (!ReloadConfig())
+            {
+                return;
+            }
+
             _lastStatus = "Routes saved";
             RefreshTray();
             _scanScheduler.RequestBurst("routes saved");
@@ -755,7 +778,6 @@ internal sealed class RouterTrayContext : ApplicationContext
 
     private void Scan(string reason, bool force = false)
     {
-        _audioEventWatcher.DrainDisconnectedSessions();
         if (_scanRunning || (!_settings.Enabled && !force))
         {
             return;
@@ -776,17 +798,14 @@ internal sealed class RouterTrayContext : ApplicationContext
 
     private void RefreshTray()
     {
-        var decision = TrayLifecycleDecisions.PlanTrayRefresh(_displayedEnabled, _settings.Enabled);
-        if (decision.ReplaceIcon)
-        {
-            var oldIcon = _notifyIcon.Icon;
-            _notifyIcon.Icon = TrayIconFactory.Create(_settings.Enabled);
-            _displayedEnabled = _settings.Enabled;
-            oldIcon?.Dispose();
-        }
-
-        _enabledMenuItem.Checked = _settings.Enabled;
-        _autostartMenuItem.Checked = _settings.AutostartEnabled;
+        _trayResources.Refresh(
+            _settings.Enabled,
+            _ =>
+            {
+                _enabledMenuItem.Checked = _settings.Enabled;
+                _autostartMenuItem.Checked = _settings.AutostartEnabled;
+            },
+            icon => _notifyIcon.Icon = icon);
         _notifyIcon.Text = BuildTooltip();
     }
 
@@ -820,11 +839,9 @@ internal sealed class RouterTrayContext : ApplicationContext
         RestoreManagedRoutesForExit();
         _notifyIcon.Visible = false;
         _notifyIcon.ContextMenuStrip = null;
-        var icon = _notifyIcon.Icon;
         _notifyIcon.Icon = null;
         _notifyIcon.Dispose();
-        icon?.Dispose();
-        _contextMenu.Dispose();
+        _trayResources.Dispose();
         _dispatcher.Dispose();
         _engine.Dispose();
         base.ExitThreadCore();
@@ -844,7 +861,81 @@ internal sealed class RouterTrayContext : ApplicationContext
     }
 }
 
-internal sealed record TrayRefreshDecision(bool ReplaceMenu, bool ReplaceIcon);
+internal sealed class TrayResourceLifecycle<TMenu, TIcon> : IDisposable
+    where TMenu : class
+    where TIcon : class
+{
+    private readonly Func<bool, TIcon> _createIcon;
+    private readonly Action<TMenu> _disposeMenu;
+    private readonly Action<TIcon> _disposeIcon;
+    private bool _displayedEnabled;
+    private bool _disposed;
+
+    public TMenu Menu { get; }
+    public TIcon Icon { get; private set; }
+
+    public TrayResourceLifecycle(
+        bool initialEnabled,
+        Func<TMenu> createMenu,
+        Func<bool, TIcon> createIcon,
+        Action<TMenu> disposeMenu,
+        Action<TIcon> disposeIcon)
+    {
+        _displayedEnabled = initialEnabled;
+        _createIcon = createIcon;
+        _disposeMenu = disposeMenu;
+        _disposeIcon = disposeIcon;
+        Menu = createMenu();
+        Icon = createIcon(initialEnabled);
+    }
+
+    public void Refresh(bool enabled, Action<TMenu> updateMenu, Action<TIcon> attachIcon)
+    {
+        updateMenu(Menu);
+        if (enabled == _displayedEnabled)
+        {
+            return;
+        }
+
+        var replacement = _createIcon(enabled);
+        try
+        {
+            attachIcon(replacement);
+        }
+        catch
+        {
+            _disposeIcon(replacement);
+            throw;
+        }
+
+        var superseded = Icon;
+        Icon = replacement;
+        _displayedEnabled = enabled;
+        _disposeIcon(superseded);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        _disposeIcon(Icon);
+        _disposeMenu(Menu);
+    }
+}
+
+internal sealed record EngineReloadResult(bool Applied, string? ErrorMessage)
+{
+    public static EngineReloadResult Success { get; } = new(true, null);
+
+    public static EngineReloadResult Failure(string errorMessage)
+    {
+        return new EngineReloadResult(false, errorMessage);
+    }
+}
 
 internal static class TrayLifecycleDecisions
 {
@@ -853,25 +944,36 @@ internal static class TrayLifecycleDecisions
         return settingsLoad.Status != SettingsLoadStatus.Invalid;
     }
 
-    public static TrayRefreshDecision PlanTrayRefresh(bool displayedEnabled, bool nextEnabled)
-    {
-        return new TrayRefreshDecision(ReplaceMenu: false, ReplaceIcon: displayedEnabled != nextEnabled);
-    }
-
-    public static void ApplyEngineReload(
+    public static EngineReloadResult ApplyEngineReload(
         bool wasEnabled,
         bool isEnabled,
-        Action clearManagedRoutes,
+        Func<ScanResult> clearManagedRoutes,
         Action disposeEngine,
         Action createEngine)
     {
         if (wasEnabled && !isEnabled)
         {
-            clearManagedRoutes();
+            ScanResult cleanupResult;
+            try
+            {
+                cleanupResult = clearManagedRoutes();
+            }
+            catch (Exception exception)
+            {
+                return EngineReloadResult.Failure(
+                    $"Could not disable routing because managed-route cleanup failed: {exception.Message}");
+            }
+
+            if (!cleanupResult.Success)
+            {
+                return EngineReloadResult.Failure(
+                    $"Could not disable routing because managed-route cleanup was unsuccessful: {cleanupResult}");
+            }
         }
 
         disposeEngine();
         createEngine();
+        return EngineReloadResult.Success;
     }
 }
 
@@ -5264,6 +5366,14 @@ internal sealed class DeferredDisposalQueue<T> where T : class
         }
     }
 
+    public bool Contains(T item)
+    {
+        lock (_lockObject)
+        {
+            return _queued.Contains(item);
+        }
+    }
+
     public void Drain(Action<T> dispose)
     {
         while (true)
@@ -5285,18 +5395,108 @@ internal sealed class DeferredDisposalQueue<T> where T : class
     }
 }
 
+internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : class
+{
+    private readonly object _lockObject = new();
+    private readonly List<T> _active = new();
+    private readonly DeferredDisposalQueue<T> _pending = new();
+    private readonly Action<Action> _scheduleCleanup;
+    private readonly Action<T> _disposeItem;
+    private bool _disposed;
+
+    public DeferredSubscriptionManager(Action<Action> scheduleCleanup, Action<T> disposeItem)
+    {
+        _scheduleCleanup = scheduleCleanup;
+        _disposeItem = disposeItem;
+    }
+
+    public bool TryAdd(T item)
+    {
+        lock (_lockObject)
+        {
+            if (_disposed || _pending.Contains(item))
+            {
+                return false;
+            }
+
+            _active.Add(item);
+            return true;
+        }
+    }
+
+    public void QueueForDisposal(T item)
+    {
+        var scheduleCleanup = false;
+        lock (_lockObject)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            scheduleCleanup = _pending.Enqueue(item);
+        }
+
+        if (scheduleCleanup)
+        {
+            _scheduleCleanup(DrainPending);
+        }
+    }
+
+    private void DrainPending()
+    {
+        _pending.Drain(item =>
+        {
+            var removed = false;
+            lock (_lockObject)
+            {
+                removed = _active.Remove(item);
+            }
+
+            if (removed)
+            {
+                _disposeItem(item);
+            }
+        });
+    }
+
+    public void Dispose()
+    {
+        T[] active;
+        lock (_lockObject)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            active = _active.ToArray();
+            _active.Clear();
+        }
+
+        _pending.Drain(_ => { });
+        foreach (var item in active)
+        {
+            _disposeItem(item);
+        }
+    }
+}
+
 internal sealed class AudioEventWatcher : IDisposable
 {
     private readonly Action<string> _requestBurst;
+    private readonly Action<Action> _scheduleSessionCleanup;
     private readonly object _lockObject = new();
     private IMMDeviceEnumerator? _enumerator;
     private AudioEndpointNotificationClient? _endpointClient;
     private readonly List<AudioSessionDeviceSubscription> _sessionSubscriptions = new();
     private bool _disposed;
 
-    public AudioEventWatcher(Action<string> requestBurst)
+    public AudioEventWatcher(Action<string> requestBurst, Action<Action> scheduleSessionCleanup)
     {
         _requestBurst = requestBurst;
+        _scheduleSessionCleanup = scheduleSessionCleanup;
     }
 
     public void Start()
@@ -5363,7 +5563,10 @@ internal sealed class AudioEventWatcher : IDisposable
 
                     try
                     {
-                        var subscription = AudioSessionDeviceSubscription.TryCreate(device, OnAudioSessionEvent);
+                        var subscription = AudioSessionDeviceSubscription.TryCreate(
+                            device,
+                            OnAudioSessionEvent,
+                            _scheduleSessionCleanup);
                         device = null!;
                         if (subscription is not null)
                         {
@@ -5399,22 +5602,6 @@ internal sealed class AudioEventWatcher : IDisposable
     {
         _requestBurst(reason);
         RefreshSubscriptions(reason);
-    }
-
-    public void DrainDisconnectedSessions()
-    {
-        lock (_lockObject)
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            foreach (var subscription in _sessionSubscriptions)
-            {
-                subscription.DrainDisconnectedControls();
-            }
-        }
     }
 
     private void OnAudioSessionEvent(string reason)
@@ -5456,19 +5643,27 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
     private readonly IAudioSessionManager2 _manager;
     private readonly AudioSessionNotificationClient _sessionNotification;
     private readonly Action<string> _requestBurst;
-    private readonly object _controlsLock = new();
-    private readonly List<AudioSessionControlSubscription> _controls = new();
-    private readonly DeferredDisposalQueue<AudioSessionControlSubscription> _disconnectedControls = new();
+    private readonly object _lifecycleLock = new();
+    private readonly DeferredSubscriptionManager<AudioSessionControlSubscription> _controls;
     private bool _disposed;
 
-    private AudioSessionDeviceSubscription(IAudioSessionManager2 manager, Action<string> requestBurst)
+    private AudioSessionDeviceSubscription(
+        IAudioSessionManager2 manager,
+        Action<string> requestBurst,
+        Action<Action> scheduleCleanup)
     {
         _manager = manager;
         _requestBurst = requestBurst;
         _sessionNotification = new AudioSessionNotificationClient(RegisterNewSession);
+        _controls = new DeferredSubscriptionManager<AudioSessionControlSubscription>(
+            scheduleCleanup,
+            control => control.Dispose());
     }
 
-    public static AudioSessionDeviceSubscription? TryCreate(IMMDevice device, Action<string> requestBurst)
+    public static AudioSessionDeviceSubscription? TryCreate(
+        IMMDevice device,
+        Action<string> requestBurst,
+        Action<Action> scheduleCleanup)
     {
         var interfaceId = typeof(IAudioSessionManager2).GUID;
         var managerPtr = IntPtr.Zero;
@@ -5488,7 +5683,7 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
                 return null;
             }
 
-            var subscription = new AudioSessionDeviceSubscription(manager, requestBurst);
+            var subscription = new AudioSessionDeviceSubscription(manager, requestBurst, scheduleCleanup);
             manager = null;
             subscription.RegisterExistingSessions(sessionEnumerator);
             hResult = subscription._manager.RegisterSessionNotification(subscription._sessionNotification);
@@ -5556,7 +5751,7 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
 
     private void RegisterSession(IAudioSessionControl2 control, bool requestInitialScan)
     {
-        lock (_controlsLock)
+        lock (_lifecycleLock)
         {
             if (_disposed)
             {
@@ -5574,20 +5769,7 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
             if (subscription is not null)
             {
                 control = null!;
-                var disposeSubscription = false;
-                lock (_controlsLock)
-                {
-                    if (_disposed || subscription.IsDisconnected)
-                    {
-                        disposeSubscription = true;
-                    }
-                    else
-                    {
-                        _controls.Add(subscription);
-                    }
-                }
-
-                if (disposeSubscription)
+                if (!_controls.TryAdd(subscription))
                 {
                     subscription.Dispose();
                 }
@@ -5609,35 +5791,18 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
 
     private void QueueDisconnectedControl(AudioSessionControlSubscription control)
     {
-        if (!control.MarkDisconnected() || !_disconnectedControls.Enqueue(control))
+        if (!control.MarkDisconnected())
         {
             return;
         }
 
+        _controls.QueueForDisposal(control);
         _requestBurst("audio session disconnected");
-    }
-
-    public void DrainDisconnectedControls()
-    {
-        _disconnectedControls.Drain(control =>
-        {
-            var removed = false;
-            lock (_controlsLock)
-            {
-                removed = _controls.Remove(control);
-            }
-
-            if (removed)
-            {
-                control.Dispose();
-            }
-        });
     }
 
     public void Dispose()
     {
-        AudioSessionControlSubscription[] controls;
-        lock (_controlsLock)
+        lock (_lifecycleLock)
         {
             if (_disposed)
             {
@@ -5645,16 +5810,10 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
             }
 
             _disposed = true;
-            controls = _controls.ToArray();
-            _controls.Clear();
         }
 
         _ = _manager.UnregisterSessionNotification(_sessionNotification);
-        _disconnectedControls.Drain(_ => { });
-        foreach (var control in controls)
-        {
-            control.Dispose();
-        }
+        _controls.Dispose();
 
         if (Marshal.IsComObject(_manager))
         {
