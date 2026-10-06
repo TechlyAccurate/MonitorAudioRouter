@@ -5398,8 +5398,12 @@ internal sealed class DeferredDisposalQueue<T> where T : class
 internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : class
 {
     private readonly object _lockObject = new();
-    private readonly List<T> _active = new();
-    private readonly HashSet<T> _deferred = new();
+    // Active items are the synchronously disposable subset of manager-owned items.
+    // Terminal callback entry removes an item from that subset until deferred cleanup owns disposal.
+    private readonly HashSet<T> _owned = new();
+    private readonly HashSet<T> _active = new();
+    private readonly HashSet<T> _terminal = new();
+    private readonly Dictionary<T, int> _callbackCounts = new();
     private readonly HashSet<T> _disposalRequested = new();
     private readonly DeferredDisposalQueue<T> _pending = new();
     private readonly Action<Action> _scheduleCleanup;
@@ -5412,21 +5416,23 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
         _disposeItem = disposeItem;
     }
 
-    public bool TryTakeOwnership(T item, Func<T, bool> isTerminal)
+    public bool TryTakeOwnership(T item)
     {
         var scheduleCleanup = false;
         lock (_lockObject)
         {
-            var disposalRequested = _disposalRequested.Contains(item);
-            if (isTerminal(item) || disposalRequested)
-            {
-                // A terminal item may still be inside its callback; wait for its queued cleanup.
-                _deferred.Add(item);
-                scheduleCleanup = disposalRequested && _pending.Enqueue(item);
-            }
-            else if (_disposed)
+            var isTerminal = _terminal.Contains(item) || _disposalRequested.Contains(item);
+            if (_disposed && !isTerminal)
             {
                 return false;
+            }
+
+            _owned.Add(item);
+            if (isTerminal)
+            {
+                scheduleCleanup = !_callbackCounts.ContainsKey(item)
+                    && _disposalRequested.Contains(item)
+                    && _pending.Enqueue(item);
             }
             else
             {
@@ -5442,6 +5448,48 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
         return true;
     }
 
+    public void RunTerminalCallback(T item, Action callback)
+    {
+        lock (_lockObject)
+        {
+            _terminal.Add(item);
+            _active.Remove(item);
+            _callbackCounts[item] = _callbackCounts.GetValueOrDefault(item) + 1;
+        }
+
+        try
+        {
+            callback();
+        }
+        finally
+        {
+            CompleteTerminalCallback(item);
+        }
+    }
+
+    private void CompleteTerminalCallback(T item)
+    {
+        var scheduleCleanup = false;
+        lock (_lockObject)
+        {
+            var callbackCount = _callbackCounts[item] - 1;
+            if (callbackCount == 0)
+            {
+                _callbackCounts.Remove(item);
+                scheduleCleanup = _disposalRequested.Contains(item) && _pending.Enqueue(item);
+            }
+            else
+            {
+                _callbackCounts[item] = callbackCount;
+            }
+        }
+
+        if (scheduleCleanup)
+        {
+            _scheduleCleanup(DrainPending);
+        }
+    }
+
     public void QueueForDisposal(T item)
     {
         var scheduleCleanup = false;
@@ -5449,7 +5497,7 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
         {
             // Preserve requests from callbacks that overlap shutdown or admission.
             _disposalRequested.Add(item);
-            scheduleCleanup = _pending.Enqueue(item);
+            scheduleCleanup = !_callbackCounts.ContainsKey(item) && _pending.Enqueue(item);
         }
 
         if (scheduleCleanup)
@@ -5465,10 +5513,15 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
             var removed = false;
             lock (_lockObject)
             {
-                removed = _active.Remove(item) || _deferred.Remove(item);
-                if (removed)
+                if (!_callbackCounts.ContainsKey(item))
                 {
-                    _disposalRequested.Remove(item);
+                    removed = _owned.Remove(item);
+                    if (removed)
+                    {
+                        _active.Remove(item);
+                        _terminal.Remove(item);
+                        _disposalRequested.Remove(item);
+                    }
                 }
             }
 
@@ -5494,6 +5547,8 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
             _active.Clear();
             foreach (var item in active)
             {
+                _owned.Remove(item);
+                _terminal.Remove(item);
                 _disposalRequested.Remove(item);
             }
         }
@@ -5787,11 +5842,13 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
             var subscription = AudioSessionControlSubscription.TryCreate(
                 control,
                 _requestBurst,
-                QueueDisconnectedControl);
+                disconnectedControl => _controls.RunTerminalCallback(
+                    disconnectedControl,
+                    () => QueueDisconnectedControl(disconnectedControl)));
             if (subscription is not null)
             {
                 control = null!;
-                if (!_controls.TryTakeOwnership(subscription, controlSubscription => controlSubscription.IsDisconnected))
+                if (!_controls.TryTakeOwnership(subscription))
                 {
                     subscription.Dispose();
                 }
@@ -5850,8 +5907,6 @@ internal sealed class AudioSessionControlSubscription : IDisposable
     private readonly AudioSessionEventsClient _events;
     private int _disconnected;
     private bool _disposed;
-
-    public bool IsDisconnected => Volatile.Read(ref _disconnected) != 0;
 
     private AudioSessionControlSubscription(IAudioSessionControl2 control, AudioSessionEventsClient eventsClient)
     {
