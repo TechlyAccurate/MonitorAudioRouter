@@ -49,7 +49,7 @@ internal static class Program
         if (args.Any(argument => argument.Equals("--scan-once", StringComparison.OrdinalIgnoreCase)))
         {
             NativeConsole.AttachToParent();
-            var settings = SettingsStore.Load();
+            var settings = SettingsStore.Load().Settings;
             using var engine = new RoutingEngine(settings);
             var result = engine.Scan();
             Console.WriteLine(result);
@@ -59,7 +59,7 @@ internal static class Program
         if (args.Any(argument => argument.Equals("--clear-managed-routes", StringComparison.OrdinalIgnoreCase)))
         {
             NativeConsole.AttachToParent();
-            var settings = SettingsStore.Load();
+            var settings = SettingsStore.Load().Settings;
             using var engine = new RoutingEngine(settings);
             var result = engine.ClearManagedRoutes();
             Console.WriteLine(result);
@@ -503,6 +503,9 @@ internal sealed class AboutForm : Form
 internal sealed class RouterTrayContext : ApplicationContext
 {
     private readonly NotifyIcon _notifyIcon;
+    private readonly ContextMenuStrip _contextMenu;
+    private readonly ToolStripMenuItem _enabledMenuItem;
+    private readonly ToolStripMenuItem _autostartMenuItem;
     private readonly Control _dispatcher;
     private readonly ScanScheduler _scanScheduler;
     private readonly BrowserHintServer _hintServer;
@@ -512,23 +515,46 @@ internal sealed class RouterTrayContext : ApplicationContext
     private readonly AudioEventWatcher _audioEventWatcher;
     private RoutingEngine _engine;
     private RouterSettings _settings;
+    private bool _displayedEnabled;
     private bool _scanRunning;
     private string _lastStatus = "Starting";
 
     public RouterTrayContext()
     {
-        _settings = SettingsStore.Load();
+        var settingsLoad = SettingsStore.Load();
+        _settings = settingsLoad.Settings;
         _engine = new RoutingEngine(_settings);
-        ApplyAutostartSetting();
+        if (TrayLifecycleDecisions.ShouldApplyAutostart(settingsLoad))
+        {
+            ApplyAutostartSetting();
+        }
+        else
+        {
+            _lastStatus = settingsLoad.ErrorMessage ?? "Configuration is invalid";
+        }
+
         _dispatcher = new Control();
         _dispatcher.CreateControl();
+        _enabledMenuItem = new ToolStripMenuItem("Enabled")
+        {
+            CheckOnClick = false
+        };
+        _enabledMenuItem.Click += (_, _) => ToggleEnabled();
+        _autostartMenuItem = new ToolStripMenuItem("Autostart")
+        {
+            CheckOnClick = false
+        };
+        _autostartMenuItem.Click += (_, _) => ToggleAutostart();
+        _contextMenu = BuildMenu();
+        _displayedEnabled = _settings.Enabled;
         _notifyIcon = new NotifyIcon
         {
             Icon = TrayIconFactory.Create(_settings.Enabled),
             Text = BuildTooltip(),
             Visible = true,
-            ContextMenuStrip = BuildMenu()
+            ContextMenuStrip = _contextMenu
         };
+        RefreshTray();
 
         _scanScheduler = new ScanScheduler(
             _dispatcher,
@@ -550,25 +576,20 @@ internal sealed class RouterTrayContext : ApplicationContext
         _powerEventWatcher.Start();
         _audioEventWatcher.Start();
         _scanScheduler.Start();
+
+        if (settingsLoad.Status == SettingsLoadStatus.Invalid)
+        {
+            MessageBox.Show(
+                settingsLoad.ErrorMessage,
+                "Could not load config",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
     }
 
     private ContextMenuStrip BuildMenu()
     {
         var menu = new ContextMenuStrip();
-        var enabledItem = new ToolStripMenuItem("Enabled")
-        {
-            Checked = _settings.Enabled,
-            CheckOnClick = false
-        };
-        enabledItem.Click += (_, _) => ToggleEnabled();
-
-        var autostartItem = new ToolStripMenuItem("Autostart")
-        {
-            Checked = _settings.AutostartEnabled,
-            CheckOnClick = false
-        };
-        autostartItem.Click += (_, _) => ToggleAutostart();
-
         var scanItem = new ToolStripMenuItem("Scan now");
         scanItem.Click += (_, _) => Scan("manual", force: true);
 
@@ -587,8 +608,8 @@ internal sealed class RouterTrayContext : ApplicationContext
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (_, _) => ExitThread();
 
-        menu.Items.Add(enabledItem);
-        menu.Items.Add(autostartItem);
+        menu.Items.Add(_enabledMenuItem);
+        menu.Items.Add(_autostartMenuItem);
         menu.Items.Add(scanItem);
         menu.Items.Add(reloadItem);
         menu.Items.Add(configureRoutesItem);
@@ -652,22 +673,54 @@ internal sealed class RouterTrayContext : ApplicationContext
 
     private void ReloadConfig()
     {
-        _settings = SettingsStore.Load();
-        ApplyAutostartSetting();
-        _engine.Dispose();
-        _engine = new RoutingEngine(_settings);
+        var settingsLoad = SettingsStore.Load();
+        var oldEngine = _engine;
+        var wasEnabled = _settings.Enabled;
+        _settings = settingsLoad.Settings;
+        if (TrayLifecycleDecisions.ShouldApplyAutostart(settingsLoad))
+        {
+            ApplyAutostartSetting();
+        }
+
+        TrayLifecycleDecisions.ApplyEngineReload(
+            wasEnabled,
+            _settings.Enabled,
+            clearManagedRoutes: () =>
+            {
+                var result = oldEngine.ClearManagedRoutes();
+                _lastStatus = result.ToString();
+            },
+            disposeEngine: oldEngine.Dispose,
+            createEngine: () => _engine = new RoutingEngine(_settings));
         _scanScheduler.SetPassiveInterval(Math.Max(500, _settings.PollMilliseconds));
         _audioEventWatcher.RefreshSubscriptions("config reload");
-        _lastStatus = "Config reloaded";
+        _lastStatus = settingsLoad.Status == SettingsLoadStatus.Invalid
+            ? settingsLoad.ErrorMessage ?? "Configuration is invalid"
+            : "Config reloaded";
         RefreshTray();
         _scanScheduler.RequestBurst("config reload");
+
+        if (settingsLoad.Status == SettingsLoadStatus.Invalid)
+        {
+            MessageBox.Show(
+                settingsLoad.ErrorMessage,
+                "Could not load config",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
     }
 
     private void ConfigureRoutes()
     {
         try
         {
-            using var form = new RouteConfigForm(SettingsStore.Load());
+            var settingsLoad = SettingsStore.Load();
+            if (settingsLoad.Status == SettingsLoadStatus.Invalid)
+            {
+                throw new InvalidOperationException(settingsLoad.ErrorMessage);
+            }
+
+            using var form = new RouteConfigForm(settingsLoad.Settings);
             if (form.ShowDialog() != DialogResult.OK)
             {
                 return;
@@ -702,6 +755,7 @@ internal sealed class RouterTrayContext : ApplicationContext
 
     private void Scan(string reason, bool force = false)
     {
+        _audioEventWatcher.DrainDisconnectedSessions();
         if (_scanRunning || (!_settings.Enabled && !force))
         {
             return;
@@ -722,11 +776,18 @@ internal sealed class RouterTrayContext : ApplicationContext
 
     private void RefreshTray()
     {
-        var oldIcon = _notifyIcon.Icon;
-        _notifyIcon.Icon = TrayIconFactory.Create(_settings.Enabled);
-        oldIcon?.Dispose();
+        var decision = TrayLifecycleDecisions.PlanTrayRefresh(_displayedEnabled, _settings.Enabled);
+        if (decision.ReplaceIcon)
+        {
+            var oldIcon = _notifyIcon.Icon;
+            _notifyIcon.Icon = TrayIconFactory.Create(_settings.Enabled);
+            _displayedEnabled = _settings.Enabled;
+            oldIcon?.Dispose();
+        }
+
+        _enabledMenuItem.Checked = _settings.Enabled;
+        _autostartMenuItem.Checked = _settings.AutostartEnabled;
         _notifyIcon.Text = BuildTooltip();
-        _notifyIcon.ContextMenuStrip = BuildMenu();
     }
 
     private string BuildTooltip()
@@ -758,7 +819,12 @@ internal sealed class RouterTrayContext : ApplicationContext
         _hintServer.Dispose();
         RestoreManagedRoutesForExit();
         _notifyIcon.Visible = false;
+        _notifyIcon.ContextMenuStrip = null;
+        var icon = _notifyIcon.Icon;
+        _notifyIcon.Icon = null;
         _notifyIcon.Dispose();
+        icon?.Dispose();
+        _contextMenu.Dispose();
         _dispatcher.Dispose();
         _engine.Dispose();
         base.ExitThreadCore();
@@ -775,6 +841,37 @@ internal sealed class RouterTrayContext : ApplicationContext
         {
             Log.Write($"Exit cleanup failed: {exception}");
         }
+    }
+}
+
+internal sealed record TrayRefreshDecision(bool ReplaceMenu, bool ReplaceIcon);
+
+internal static class TrayLifecycleDecisions
+{
+    public static bool ShouldApplyAutostart(SettingsLoadResult settingsLoad)
+    {
+        return settingsLoad.Status != SettingsLoadStatus.Invalid;
+    }
+
+    public static TrayRefreshDecision PlanTrayRefresh(bool displayedEnabled, bool nextEnabled)
+    {
+        return new TrayRefreshDecision(ReplaceMenu: false, ReplaceIcon: displayedEnabled != nextEnabled);
+    }
+
+    public static void ApplyEngineReload(
+        bool wasEnabled,
+        bool isEnabled,
+        Action clearManagedRoutes,
+        Action disposeEngine,
+        Action createEngine)
+    {
+        if (wasEnabled && !isEnabled)
+        {
+            clearManagedRoutes();
+        }
+
+        disposeEngine();
+        createEngine();
     }
 }
 
@@ -1305,7 +1402,13 @@ internal static class AppUpdater
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
 
-            var installerArgs = SettingsStore.Load().AutostartEnabled
+            var settingsLoad = SettingsStore.Load();
+            if (settingsLoad.Status == SettingsLoadStatus.Invalid)
+            {
+                throw new InvalidOperationException(settingsLoad.ErrorMessage);
+            }
+
+            var installerArgs = settingsLoad.Settings.AutostartEnabled
                 ? "/nobrowsersetup /nooptions /noupdatetolatest /autostart"
                 : "/nobrowsersetup /nooptions /noupdatetolatest /noautostart";
             Process.Start(new ProcessStartInfo(setupPath, installerArgs)
@@ -4366,6 +4469,18 @@ internal sealed class RouterSettings
     };
 }
 
+internal enum SettingsLoadStatus
+{
+    Valid,
+    Missing,
+    Invalid
+}
+
+internal sealed record SettingsLoadResult(
+    RouterSettings Settings,
+    SettingsLoadStatus Status,
+    string? ErrorMessage);
+
 internal sealed class MonitorRoute
 {
     public string? MonitorDeviceNameContains { get; set; }
@@ -4772,17 +4887,35 @@ internal static class SettingsStore
         Save(new RouterSettings());
     }
 
-    public static RouterSettings Load()
+    public static SettingsLoadResult Load()
     {
+        return Load(Paths.ConfigFile);
+    }
+
+    internal static SettingsLoadResult Load(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return new SettingsLoadResult(new RouterSettings(), SettingsLoadStatus.Missing, null);
+        }
+
         try
         {
-            var json = File.ReadAllText(Paths.ConfigFile);
-            return JsonSerializer.Deserialize<RouterSettings>(json, JsonOptions) ?? new RouterSettings();
+            var json = File.ReadAllText(path);
+            var settings = JsonSerializer.Deserialize<RouterSettings>(json, JsonOptions)
+                           ?? throw new JsonException("Configuration must contain a JSON object.");
+            return new SettingsLoadResult(settings, SettingsLoadStatus.Valid, null);
         }
         catch (Exception exception)
         {
             Log.Write($"Could not load config: {exception}");
-            return new RouterSettings();
+            var settings = new RouterSettings
+            {
+                Enabled = false
+            };
+            var errorMessage =
+                $"Could not load the configuration. Routing is disabled and autostart was not changed. {exception.Message}";
+            return new SettingsLoadResult(settings, SettingsLoadStatus.Invalid, errorMessage);
         }
     }
 
@@ -5111,6 +5244,47 @@ internal static class CommandLineDiagnostics
     }
 }
 
+internal sealed class DeferredDisposalQueue<T> where T : class
+{
+    private readonly object _lockObject = new();
+    private readonly Queue<T> _pending = new();
+    private readonly HashSet<T> _queued = new();
+
+    public bool Enqueue(T item)
+    {
+        lock (_lockObject)
+        {
+            if (!_queued.Add(item))
+            {
+                return false;
+            }
+
+            _pending.Enqueue(item);
+            return true;
+        }
+    }
+
+    public void Drain(Action<T> dispose)
+    {
+        while (true)
+        {
+            T item;
+            lock (_lockObject)
+            {
+                if (_pending.Count == 0)
+                {
+                    return;
+                }
+
+                item = _pending.Dequeue();
+                _queued.Remove(item);
+            }
+
+            dispose(item);
+        }
+    }
+}
+
 internal sealed class AudioEventWatcher : IDisposable
 {
     private readonly Action<string> _requestBurst;
@@ -5227,6 +5401,22 @@ internal sealed class AudioEventWatcher : IDisposable
         RefreshSubscriptions(reason);
     }
 
+    public void DrainDisconnectedSessions()
+    {
+        lock (_lockObject)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            foreach (var subscription in _sessionSubscriptions)
+            {
+                subscription.DrainDisconnectedControls();
+            }
+        }
+    }
+
     private void OnAudioSessionEvent(string reason)
     {
         _requestBurst(reason);
@@ -5266,7 +5456,9 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
     private readonly IAudioSessionManager2 _manager;
     private readonly AudioSessionNotificationClient _sessionNotification;
     private readonly Action<string> _requestBurst;
+    private readonly object _controlsLock = new();
     private readonly List<AudioSessionControlSubscription> _controls = new();
+    private readonly DeferredDisposalQueue<AudioSessionControlSubscription> _disconnectedControls = new();
     private bool _disposed;
 
     private AudioSessionDeviceSubscription(IAudioSessionManager2 manager, Action<string> requestBurst)
@@ -5364,19 +5556,41 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
 
     private void RegisterSession(IAudioSessionControl2 control, bool requestInitialScan)
     {
-        if (_disposed)
+        lock (_controlsLock)
         {
-            ComInterop.FinalRelease(control);
-            return;
+            if (_disposed)
+            {
+                ComInterop.FinalRelease(control);
+                return;
+            }
         }
 
         try
         {
-            var subscription = AudioSessionControlSubscription.TryCreate(control, _requestBurst);
+            var subscription = AudioSessionControlSubscription.TryCreate(
+                control,
+                _requestBurst,
+                QueueDisconnectedControl);
             if (subscription is not null)
             {
                 control = null!;
-                _controls.Add(subscription);
+                var disposeSubscription = false;
+                lock (_controlsLock)
+                {
+                    if (_disposed || subscription.IsDisconnected)
+                    {
+                        disposeSubscription = true;
+                    }
+                    else
+                    {
+                        _controls.Add(subscription);
+                    }
+                }
+
+                if (disposeSubscription)
+                {
+                    subscription.Dispose();
+                }
             }
         }
         finally
@@ -5393,21 +5607,55 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
         }
     }
 
-    public void Dispose()
+    private void QueueDisconnectedControl(AudioSessionControlSubscription control)
     {
-        if (_disposed)
+        if (!control.MarkDisconnected() || !_disconnectedControls.Enqueue(control))
         {
             return;
         }
 
-        _disposed = true;
+        _requestBurst("audio session disconnected");
+    }
+
+    public void DrainDisconnectedControls()
+    {
+        _disconnectedControls.Drain(control =>
+        {
+            var removed = false;
+            lock (_controlsLock)
+            {
+                removed = _controls.Remove(control);
+            }
+
+            if (removed)
+            {
+                control.Dispose();
+            }
+        });
+    }
+
+    public void Dispose()
+    {
+        AudioSessionControlSubscription[] controls;
+        lock (_controlsLock)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            controls = _controls.ToArray();
+            _controls.Clear();
+        }
+
         _ = _manager.UnregisterSessionNotification(_sessionNotification);
-        foreach (var control in _controls)
+        _disconnectedControls.Drain(_ => { });
+        foreach (var control in controls)
         {
             control.Dispose();
         }
 
-        _controls.Clear();
         if (Marshal.IsComObject(_manager))
         {
             ComInterop.FinalRelease(_manager);
@@ -5419,7 +5667,10 @@ internal sealed class AudioSessionControlSubscription : IDisposable
 {
     private readonly IAudioSessionControl2 _control;
     private readonly AudioSessionEventsClient _events;
+    private int _disconnected;
     private bool _disposed;
+
+    public bool IsDisconnected => Volatile.Read(ref _disconnected) != 0;
 
     private AudioSessionControlSubscription(IAudioSessionControl2 control, AudioSessionEventsClient eventsClient)
     {
@@ -5427,9 +5678,21 @@ internal sealed class AudioSessionControlSubscription : IDisposable
         _events = eventsClient;
     }
 
-    public static AudioSessionControlSubscription? TryCreate(IAudioSessionControl2 control, Action<string> requestBurst)
+    public static AudioSessionControlSubscription? TryCreate(
+        IAudioSessionControl2 control,
+        Action<string> requestBurst,
+        Action<AudioSessionControlSubscription> onDisconnected)
     {
-        var eventsClient = new AudioSessionEventsClient(requestBurst);
+        AudioSessionControlSubscription? subscription = null;
+        var eventsClient = new AudioSessionEventsClient(requestBurst, () =>
+        {
+            var disconnectedSubscription = Volatile.Read(ref subscription);
+            if (disconnectedSubscription is not null)
+            {
+                onDisconnected(disconnectedSubscription);
+            }
+        });
+        subscription = new AudioSessionControlSubscription(control, eventsClient);
         var hResult = control.RegisterAudioSessionNotification(eventsClient);
         if (hResult != 0)
         {
@@ -5445,7 +5708,12 @@ internal sealed class AudioSessionControlSubscription : IDisposable
             requestBurst("audio session active");
         }
 
-        return new AudioSessionControlSubscription(control, eventsClient);
+        return subscription;
+    }
+
+    public bool MarkDisconnected()
+    {
+        return Interlocked.Exchange(ref _disconnected, 1) == 0;
     }
 
     public void Dispose()
@@ -5533,10 +5801,12 @@ internal sealed class AudioSessionNotificationClient : IAudioSessionNotification
 internal sealed class AudioSessionEventsClient : IAudioSessionEvents
 {
     private readonly Action<string> _requestBurst;
+    private readonly Action _onDisconnected;
 
-    public AudioSessionEventsClient(Action<string> requestBurst)
+    public AudioSessionEventsClient(Action<string> requestBurst, Action onDisconnected)
     {
         _requestBurst = requestBurst;
+        _onDisconnected = onDisconnected;
     }
 
     public int OnDisplayNameChanged(string newDisplayName, IntPtr eventContext) => 0;
@@ -5559,7 +5829,11 @@ internal sealed class AudioSessionEventsClient : IAudioSessionEvents
         return 0;
     }
 
-    public int OnSessionDisconnected(AudioSessionDisconnectReason disconnectReason) => 0;
+    public int OnSessionDisconnected(AudioSessionDisconnectReason disconnectReason)
+    {
+        _onDisconnected();
+        return 0;
+    }
 }
 
 internal static class ComInterop

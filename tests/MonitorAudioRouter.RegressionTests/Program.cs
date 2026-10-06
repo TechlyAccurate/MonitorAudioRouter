@@ -13,6 +13,11 @@ internal static class Program
         runner.Add("Regression runner reports passing and failing checks", RegressionRunnerReportsPassAndFail);
         runner.Add("Tray application assembly loads through its project reference", TrayAssemblyLoadsThroughProjectReference);
         runner.Add("Installer assembly loads through its project reference", InstallerAssemblyLoadsThroughProjectReference);
+        runner.Add("Missing configuration returns first-run defaults", MissingConfigurationReturnsFirstRunDefaults);
+        runner.Add("Malformed configuration fails disabled without an autostart decision", MalformedConfigurationFailsDisabledWithoutAutostartDecision);
+        runner.Add("Disabling reload clears managed routes before engine disposal", DisablingReloadClearsRoutesBeforeEngineDisposal);
+        runner.Add("Unchanged tray state reuses its menu and icon", UnchangedTrayStateReusesMenuAndIcon);
+        runner.Add("Disconnected session cleanup runs once after its callback", DisconnectedSessionCleanupRunsOnceAfterCallback);
         runner.Add("All absent role values produce Default", AllAbsentRoleValuesProduceDefault);
         runner.Add("Any untrustworthy role query produces Unavailable unless a consistent explicit endpoint is proven", UntrustworthyRoleQueryProducesUnavailableWithoutExplicitEndpoint);
         runner.Add("An explicit endpoint produces Explicit with its ID", ExplicitEndpointProducesExplicitWithItsId);
@@ -86,6 +91,121 @@ internal static class Program
 
         RegressionAssert.Equal("MonitorAudioRouterSetup", assembly.GetName().Name, "The installer assembly name should be preserved.");
         RegressionAssert.True(!assembly.IsDynamic, "The installer assembly should load from a compiled project reference.");
+    }
+
+    private static void MissingConfigurationReturnsFirstRunDefaults()
+    {
+        var temporaryDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "MonitorAudioRouter.RegressionTests",
+            Guid.NewGuid().ToString("N"));
+        var configPath = Path.Combine(temporaryDirectory, "missing.json");
+
+        try
+        {
+            var result = global::MonitorAudioRouter.SettingsStore.Load(configPath);
+
+            RegressionAssert.Equal(
+                global::MonitorAudioRouter.SettingsLoadStatus.Missing,
+                result.Status,
+                "An absent configuration should be represented as a normal first-run state.");
+            RegressionAssert.True(result.Settings.Enabled, "First-run routing should retain the enabled default.");
+            RegressionAssert.True(result.Settings.AutostartEnabled, "First-run autostart should retain the enabled default.");
+            RegressionAssert.True(result.ErrorMessage is null, "A missing first-run configuration should not report an error.");
+        }
+        finally
+        {
+            if (Directory.Exists(temporaryDirectory))
+            {
+                Directory.Delete(temporaryDirectory, recursive: true);
+            }
+        }
+    }
+
+    private static void MalformedConfigurationFailsDisabledWithoutAutostartDecision()
+    {
+        var temporaryDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "MonitorAudioRouter.RegressionTests",
+            Guid.NewGuid().ToString("N"));
+        var configPath = Path.Combine(temporaryDirectory, "malformed.json");
+
+        try
+        {
+            Directory.CreateDirectory(temporaryDirectory);
+            File.WriteAllText(configPath, "{ not valid json", Encoding.UTF8);
+
+            var result = global::MonitorAudioRouter.SettingsStore.Load(configPath);
+
+            RegressionAssert.Equal(
+                global::MonitorAudioRouter.SettingsLoadStatus.Invalid,
+                result.Status,
+                "Malformed configuration should be distinguishable from a missing first-run file.");
+            RegressionAssert.True(!result.Settings.Enabled, "Malformed configuration must fail with routing disabled.");
+            RegressionAssert.True(
+                !string.IsNullOrWhiteSpace(result.ErrorMessage),
+                "Malformed configuration should retain an actionable error for the tray UI.");
+            RegressionAssert.True(
+                !global::MonitorAudioRouter.TrayLifecycleDecisions.ShouldApplyAutostart(result),
+                "Malformed configuration must leave the current autostart registration untouched.");
+        }
+        finally
+        {
+            if (Directory.Exists(temporaryDirectory))
+            {
+                Directory.Delete(temporaryDirectory, recursive: true);
+            }
+        }
+    }
+
+    private static void DisablingReloadClearsRoutesBeforeEngineDisposal()
+    {
+        var events = new List<string>();
+
+        global::MonitorAudioRouter.TrayLifecycleDecisions.ApplyEngineReload(
+            wasEnabled: true,
+            isEnabled: false,
+            clearManagedRoutes: () => events.Add("clear"),
+            disposeEngine: () => events.Add("dispose"),
+            createEngine: () => events.Add("create"));
+
+        RegressionAssert.Equal(
+            "clear,dispose,create",
+            string.Join(',', events),
+            "A disabling reload must clear verifiably owned routes before disposing the engine.");
+    }
+
+    private static void UnchangedTrayStateReusesMenuAndIcon()
+    {
+        var decision = global::MonitorAudioRouter.TrayLifecycleDecisions.PlanTrayRefresh(
+            displayedEnabled: true,
+            nextEnabled: true);
+
+        RegressionAssert.True(!decision.ReplaceMenu, "Refresh should always update the existing context menu in place.");
+        RegressionAssert.True(!decision.ReplaceIcon, "An unchanged enabled state should retain the existing tray icon.");
+    }
+
+    private static void DisconnectedSessionCleanupRunsOnceAfterCallback()
+    {
+        var queue = new global::MonitorAudioRouter.DeferredDisposalQueue<object>();
+        var session = new object();
+        var callbackActive = true;
+        var disposalCount = 0;
+
+        queue.Enqueue(session);
+        queue.Enqueue(session);
+        RegressionAssert.Equal(0, disposalCount, "Enqueueing during the callback must not dispose the session reentrantly.");
+
+        callbackActive = false;
+        queue.Drain(item =>
+        {
+            RegressionAssert.True(!callbackActive, "Manager-owned cleanup must run after the callback returns.");
+            RegressionAssert.True(ReferenceEquals(session, item), "Cleanup should receive the disconnected session.");
+            disposalCount++;
+        });
+        queue.Drain(_ => disposalCount++);
+
+        RegressionAssert.Equal(1, disposalCount, "A disconnected session should be removed and disposed exactly once.");
     }
 
     private static void AllAbsentRoleValuesProduceDefault()
