@@ -5410,11 +5410,11 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
         _disposeItem = disposeItem;
     }
 
-    public bool TryAdd(T item)
+    public bool TryAdd(T item, Func<T, bool> isTerminal)
     {
         lock (_lockObject)
         {
-            if (_disposed || _pending.Contains(item))
+            if (_disposed || isTerminal(item) || _pending.Contains(item))
             {
                 return false;
             }
@@ -5769,7 +5769,7 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
             if (subscription is not null)
             {
                 control = null!;
-                if (!_controls.TryAdd(subscription))
+                if (!_controls.TryAdd(subscription, controlSubscription => controlSubscription.IsDisconnected))
                 {
                     subscription.Dispose();
                 }

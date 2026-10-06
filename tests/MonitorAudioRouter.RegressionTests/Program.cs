@@ -20,6 +20,7 @@ internal static class Program
         runner.Add("Throwing disabling cleanup retains the old engine", ThrowingDisablingCleanupRetainsOldEngine);
         runner.Add("Tray resource owner reuses menu and disposes replaced icons", TrayResourceOwnerReusesMenuAndDisposesReplacedIcons);
         runner.Add("Disconnected session cleanup is deferred and idempotent", DisconnectedSessionCleanupIsDeferredAndIdempotent);
+        runner.Add("Pre-admission disconnect cleanup rejects and disposes once", PreAdmissionDisconnectCleanupRejectsAndDisposesOnce);
         runner.Add("All absent role values produce Default", AllAbsentRoleValuesProduceDefault);
         runner.Add("Any untrustworthy role query produces Unavailable unless a consistent explicit endpoint is proven", UntrustworthyRoleQueryProducesUnavailableWithoutExplicitEndpoint);
         runner.Add("An explicit endpoint produces Explicit with its ID", ExplicitEndpointProducesExplicitWithItsId);
@@ -284,7 +285,7 @@ internal static class Program
                 disposalCounts[item] = disposalCounts.GetValueOrDefault(item) + 1;
             });
         var disconnectedSession = new object();
-        RegressionAssert.True(manager.TryAdd(disconnectedSession), "The active session should be tracked.");
+        RegressionAssert.True(manager.TryAdd(disconnectedSession, _ => false), "The active session should be tracked.");
         var eventsClient = new global::MonitorAudioRouter.AudioSessionEventsClient(
             _ => { },
             () => manager.QueueForDisposal(disconnectedSession));
@@ -300,7 +301,7 @@ internal static class Program
         RegressionAssert.Equal(1, disposalCounts[disconnectedSession], "Deferred cleanup should dispose the session once.");
 
         var shutdownSession = new object();
-        RegressionAssert.True(manager.TryAdd(shutdownSession), "A second active session should be tracked.");
+        RegressionAssert.True(manager.TryAdd(shutdownSession, _ => false), "A second active session should be tracked.");
         manager.QueueForDisposal(shutdownSession);
         RegressionAssert.Equal(1, scheduledCleanup.Count, "The disconnect should schedule cleanup without a routing scan.");
         manager.Dispose();
@@ -308,6 +309,47 @@ internal static class Program
 
         RegressionAssert.Equal(1, disposalCounts[shutdownSession], "Shutdown racing queued cleanup must not double-dispose.");
         RegressionAssert.Equal(1, disposalCounts[disconnectedSession], "Previously drained sessions must remain single-disposed.");
+    }
+
+    private static void PreAdmissionDisconnectCleanupRejectsAndDisposesOnce()
+    {
+        var scheduledCleanup = new Queue<Action>();
+        var session = new object();
+        var disconnected = false;
+        var disposalCount = 0;
+
+        void DisposeSession(object item)
+        {
+            RegressionAssert.True(ReferenceEquals(session, item), "Only the disconnected session should be disposed.");
+            disposalCount++;
+        }
+
+        var manager = new global::MonitorAudioRouter.DeferredSubscriptionManager<object>(
+            scheduleCleanup: action => scheduledCleanup.Enqueue(action),
+            disposeItem: DisposeSession);
+        var eventsClient = new global::MonitorAudioRouter.AudioSessionEventsClient(
+            _ => { },
+            () =>
+            {
+                disconnected = true;
+                manager.QueueForDisposal(session);
+            });
+
+        eventsClient.OnSessionDisconnected(global::MonitorAudioRouter.AudioSessionDisconnectReason.DeviceRemoval);
+        RegressionAssert.Equal(1, scheduledCleanup.Count, "The disconnect should schedule manager-owned cleanup.");
+        scheduledCleanup.Dequeue()();
+        RegressionAssert.Equal(0, disposalCount, "Cleanup before admission should not dispose an unowned session.");
+
+        var admitted = manager.TryAdd(session, _ => disconnected);
+        if (!admitted)
+        {
+            DisposeSession(session);
+        }
+
+        manager.Dispose();
+
+        RegressionAssert.True(!admitted, "An already-disconnected session must be rejected during admission.");
+        RegressionAssert.Equal(1, disposalCount, "Rejection and shutdown must dispose the session exactly once.");
     }
 
     private static void AllAbsentRoleValuesProduceDefault()
