@@ -1,4 +1,5 @@
 using System.Text.Json;
+using MonitorAudioRouter.UpdateSupport;
 
 namespace MonitorAudioRouter.Setup;
 
@@ -68,30 +69,23 @@ internal sealed class InstallInfo
         };
     }
 
-    internal InstalledOptions ResolveOptions(InstalledOptions fallback) =>
-        new(
-            InstallBrowserExtensions ?? fallback.InstallBrowserExtensions,
-            Autostart ?? fallback.Autostart,
-            PrivateBrowsingEnabled,
-            ResolveValue(ChromeExtensionId, ChromeExtensionIds, fallback.ChromeExtensionId),
-            ChromeUpdateUrl ?? fallback.ChromeUpdateUrl,
-            ResolveValue(EdgeExtensionId, EdgeExtensionIds, fallback.EdgeExtensionId),
-            EdgeUpdateUrl ?? fallback.EdgeUpdateUrl,
-            ResolveValue(FirefoxExtensionId, FirefoxExtensionIds, fallback.FirefoxExtensionId),
-            FirefoxInstallUrl ?? fallback.FirefoxInstallUrl);
+    internal InstalledOptions ResolveOptions(InstalledOptions fallback)
+    {
+        var resolved = InstallChoiceContract.Resolve(Serialize(), ToPreservedChoices(fallback));
+        return new InstalledOptions(
+            resolved.InstallBrowserExtensions,
+            resolved.Autostart,
+            resolved.EnablePrivateBrowsing,
+            resolved.ChromeExtensionId,
+            resolved.ChromeUpdateUrl,
+            resolved.EdgeExtensionId,
+            resolved.EdgeUpdateUrl,
+            resolved.FirefoxExtensionId,
+            resolved.FirefoxInstallUrl);
+    }
 
     internal string Serialize() =>
         JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true });
-
-    private static string ResolveValue(string? currentValue, string[]? legacyValues, string fallback)
-    {
-        if (currentValue is not null)
-        {
-            return currentValue;
-        }
-
-        return legacyValues?.FirstOrDefault(HasText) ?? fallback;
-    }
 
     private static string[] MergeIds(IEnumerable<string>? previousIds, string currentId) =>
         (previousIds ?? [])
@@ -101,6 +95,18 @@ internal sealed class InstallInfo
         .ToArray();
 
     private static bool HasText(string value) => !string.IsNullOrWhiteSpace(value);
+
+    private static PreservedInstallChoices ToPreservedChoices(InstalledOptions options) =>
+        new(
+            options.InstallBrowserExtensions,
+            options.Autostart,
+            options.EnablePrivateBrowsing,
+            options.ChromeExtensionId,
+            options.ChromeUpdateUrl,
+            options.EdgeExtensionId,
+            options.EdgeUpdateUrl,
+            options.FirefoxExtensionId,
+            options.FirefoxInstallUrl);
 }
 
 internal sealed record RegistryValueSnapshot(bool Exists, string? Value, string? Kind);
@@ -257,37 +263,18 @@ internal static class InstallDecisions
 {
     private static readonly string[] InstalledProcessNames =
         ["MonitorAudioRouter", "MonitorAudioRouterNativeHost"];
-    private const string ReleaseApiHost = "api.github.com";
-    private const string ReleaseAssetHost = "github.com";
-    private const string RedirectedReleaseAssetHost = "release-assets.githubusercontent.com";
-    private const string ReleaseApiPath = "/repos/TechlyAccurate/MonitorAudioRouter/releases/latest";
-    private const string ReleaseAssetPathPrefix = "/TechlyAccurate/MonitorAudioRouter/releases/download/";
-
     internal static IReadOnlyList<string> BuildForwardedArguments(InstalledOptions options)
     {
-        var arguments = new List<string>
-        {
-            options.InstallBrowserExtensions ? "/browserextensions" : "/nobrowserextensions",
-            options.Autostart ? "/autostart" : "/noautostart"
-        };
-
-        if (options.EnablePrivateBrowsing)
-        {
-            arguments.Add("/enableprivatebrowsing");
-        }
-
-        AddOption(arguments, "ChromeExtensionId", options.ChromeExtensionId);
-        AddOption(arguments, "ChromeUpdateUrl", options.ChromeUpdateUrl);
-        AddOption(arguments, "EdgeExtensionId", options.EdgeExtensionId);
-        AddOption(arguments, "EdgeUpdateUrl", options.EdgeUpdateUrl);
-        AddOption(arguments, "FirefoxExtensionId", options.FirefoxExtensionId);
-        AddOption(arguments, "FirefoxInstallUrl", options.FirefoxInstallUrl);
-        return arguments;
-    }
-
-    private static void AddOption(List<string> arguments, string name, string value)
-    {
-        arguments.Add($"/{name}={value}");
+        return InstallChoiceContract.BuildForwardedArguments(new PreservedInstallChoices(
+            options.InstallBrowserExtensions,
+            options.Autostart,
+            options.EnablePrivateBrowsing,
+            options.ChromeExtensionId,
+            options.ChromeUpdateUrl,
+            options.EdgeExtensionId,
+            options.EdgeUpdateUrl,
+            options.FirefoxExtensionId,
+            options.FirefoxInstallUrl));
     }
 
     internal static bool IsExactExecutablePath(string candidatePath, string expectedPath)
@@ -323,50 +310,14 @@ internal static class InstallDecisions
             : new RegistryRemovalDecision(RegistryRemovalAction.Delete, null);
     }
 
-    internal static bool IsPathWithinRoot(string rootPath, string candidatePath)
-    {
-        try
-        {
-            var normalizedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(rootPath));
-            var normalizedCandidate = Path.GetFullPath(candidatePath);
-            var rootedPrefix = normalizedRoot + Path.DirectorySeparatorChar;
-            return normalizedCandidate.StartsWith(rootedPrefix, StringComparison.OrdinalIgnoreCase);
-        }
-        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
-        {
-            return false;
-        }
-    }
+    internal static bool IsPathWithinRoot(string rootPath, string candidatePath) =>
+        UpdatePackage.IsPathWithinRoot(rootPath, candidatePath);
 
-    internal static bool IsAllowedReleaseUri(string value, bool isApiRequest)
-    {
-        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
-            !uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
-            !uri.IsDefaultPort ||
-            !string.IsNullOrEmpty(uri.UserInfo) ||
-            !string.IsNullOrEmpty(uri.Fragment))
-        {
-            return false;
-        }
-
-        if (isApiRequest)
-        {
-            return uri.Host.Equals(ReleaseApiHost, StringComparison.OrdinalIgnoreCase) &&
-                   uri.AbsolutePath.Equals(ReleaseApiPath, StringComparison.Ordinal) &&
-                   string.IsNullOrEmpty(uri.Query);
-        }
-
-        if (uri.Host.Equals(ReleaseAssetHost, StringComparison.OrdinalIgnoreCase))
-        {
-            return uri.AbsolutePath.StartsWith(ReleaseAssetPathPrefix, StringComparison.Ordinal);
-        }
-
-        return uri.Host.Equals(RedirectedReleaseAssetHost, StringComparison.OrdinalIgnoreCase);
-    }
+    internal static bool IsAllowedReleaseUri(string value, bool isApiRequest) =>
+        UpdatePackage.IsAllowedReleaseUri(value, isApiRequest);
 
     internal static bool IsSafeUpdateDirectory(FileAttributes attributes) =>
-        attributes.HasFlag(FileAttributes.Directory) &&
-        !attributes.HasFlag(FileAttributes.ReparsePoint);
+        UpdatePackage.IsSafeUpdateDirectory(attributes);
 
     internal static bool CanLaunchVerifiedInstaller(
         string expectedHash,
@@ -374,17 +325,10 @@ internal static class InstallDecisions
         string immediatePreLaunchHash,
         bool updateDirectoryIsSafe)
     {
-        return updateDirectoryIsSafe &&
-               IsSha256(expectedHash) &&
-               string.Equals(expectedHash, downloadedHash, StringComparison.OrdinalIgnoreCase) &&
-               string.Equals(expectedHash, immediatePreLaunchHash, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsSha256(string value)
-    {
-        return value.Length == 64 && value.All(character =>
-            (character >= '0' && character <= '9') ||
-            (character >= 'a' && character <= 'f') ||
-            (character >= 'A' && character <= 'F'));
+        return UpdatePackage.CanLaunchVerifiedInstaller(
+            expectedHash,
+            downloadedHash,
+            immediatePreLaunchHash,
+            updateDirectoryIsSafe);
     }
 }

@@ -2,46 +2,50 @@ using System.Diagnostics;
 using System.IO.Compression;
 using System.Net.Http.Headers;
 using System.Reflection;
-using System.Security.AccessControl;
 using System.Security.Principal;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Windows.Forms;
 using Microsoft.Win32;
 using MonitorAudioRouter.Setup;
+using MonitorAudioRouter.UpdateSupport;
 
 const string AppName = "Monitor Audio Router";
 const string AppId = "MonitorAudioRouter";
 const string AppVersion = "0.1.15";
 const string HostName = "com.monitoraudiorouter.router";
-const string DefaultChromeExtensionId = "jnjminkakfohjeffdpeamngcnfneckog";
-const string DefaultEdgeExtensionId = "";
-const string DefaultFirefoxExtensionId = "monitor-audio-router@example.local";
-const string DefaultFirefoxInstallUrl = "https://addons.mozilla.org/firefox/downloads/latest/monitor-audio-router-bridge/latest.xpi";
 const string ChromeWebStoreListingUrl = "https://chromewebstore.google.com/detail/jnjminkakfohjeffdpeamngcnfneckog";
 const string FirefoxAddOnsListingUrl = "https://addons.mozilla.org/en-US/firefox/addon/monitor-audio-router-bridge/";
-const string ChromeWebStoreUpdateUrl = "https://clients2.google.com/service/update2/crx";
-const string EdgeAddOnsUpdateUrl = "https://edge.microsoft.com/extensionwebstorebase/v1/crx";
-const string LatestReleaseApiUrl = "https://api.github.com/repos/TechlyAccurate/MonitorAudioRouter/releases/latest";
 const string SetupAssetName = "MonitorAudioRouterSetup.exe";
 const string ChecksumsAssetName = "SHA256SUMS.txt";
 const string RunValueName = "Monitor Audio Router";
 
-var options = ApplyInteractiveOptions(ParseOptions(args));
+WriteInstallerLog($"Setup started. Version={AppVersion}; ProcessId={Environment.ProcessId}; Arguments={FormatArgumentsForLog(args)}");
+var installDir = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+    AppName);
+var previousInstallInfo = ReadInstallInfo(installDir);
+var commandLineOptions = InstallerOptionResolver.ResolvePrimaryOptions(
+    args,
+    installInfoJson: null,
+    legacyBrowserExtensionsInstalled: false,
+    legacyAutostartInstalled: false);
+var legacyBrowserExtensionsInstalled = previousInstallInfo is not null &&
+    HasInstalledBrowserPolicy(previousInstallInfo.ResolveOptions(ToInstalledOptions(commandLineOptions)));
+var legacyAutostartInstalled = previousInstallInfo is not null && HasInstalledAutostart();
+var options = InstallerOptionResolver.ResolvePrimaryOptions(
+    args,
+    previousInstallInfo?.Serialize(),
+    legacyBrowserExtensionsInstalled,
+    legacyAutostartInstalled);
+options = ApplyInteractiveOptions(options);
 if (options.Canceled)
 {
     Environment.ExitCode = 1223;
     return;
 }
 
-WriteInstallerLog($"Setup started. Version={AppVersion}; ProcessId={Environment.ProcessId}; Arguments={FormatArgumentsForLog(args)}");
-
-var installDir = Path.Combine(
-    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-    AppName);
-var previousInstallInfo = ReadInstallInfo(installDir);
 if (options.UpdateToLatestDuringInstall && TryLaunchNewerInstaller(options, previousInstallInfo))
 {
     WriteInstallerLog("Setup handed off to a newer published installer.");
@@ -811,24 +815,6 @@ static InstalledOptions ToInstalledOptions(InstallerOptions options) =>
         options.FirefoxExtensionId,
         options.FirefoxInstallUrl);
 
-static InstalledOptions ResolvePersistedOptionsForUpdate(
-    InstallerOptions options,
-    InstallInfo? previousInstallInfo)
-{
-    var currentOptions = ToInstalledOptions(options);
-    if (previousInstallInfo is null)
-    {
-        return currentOptions;
-    }
-
-    var legacyFallback = currentOptions with
-    {
-        InstallBrowserExtensions = HasInstalledBrowserPolicy(previousInstallInfo.ResolveOptions(currentOptions)),
-        Autostart = HasInstalledAutostart()
-    };
-    return previousInstallInfo.ResolveOptions(legacyFallback);
-}
-
 static bool HasInstalledAutostart()
 {
     var installDir = Path.Combine(
@@ -1351,11 +1337,15 @@ static bool TryLaunchNewerInstaller(
     InstallerOptions options,
     InstallInfo? previousInstallInfo)
 {
+    var updateRoot = Path.GetTempPath();
     string? updateDir = null;
     try
     {
         using var httpClient = CreateHttpClient();
-        var release = GetLatestReleaseAsync(httpClient).GetAwaiter().GetResult();
+        var release = UpdatePackage.GetLatestReleaseAsync(
+            httpClient,
+            SetupAssetName,
+            ChecksumsAssetName).GetAwaiter().GetResult();
         var latestVersion = ParseVersion(release.TagName);
         var installerVersion = ParseVersion(AppVersion);
         if (latestVersion is null ||
@@ -1365,22 +1355,30 @@ static bool TryLaunchNewerInstaller(
             return false;
         }
 
-        updateDir = CreateRestrictedUpdateDirectory();
+        updateDir = UpdatePackage.CreateRestrictedUpdateDirectory(updateRoot, AppId + "-latest-");
         var setupPath = Path.Combine(updateDir, SetupAssetName);
         var checksumsPath = Path.Combine(updateDir, ChecksumsAssetName);
         RequireChildPath(updateDir, setupPath, "downloaded installer");
         RequireChildPath(updateDir, checksumsPath, "downloaded checksum file");
 
-        DownloadFileAsync(httpClient, release.ChecksumsDownloadUrl, checksumsPath).GetAwaiter().GetResult();
-        DownloadFileAsync(httpClient, release.SetupDownloadUrl, setupPath).GetAwaiter().GetResult();
+        UpdatePackage.DownloadFileAsync(
+            httpClient,
+            release.ChecksumsDownloadUrl,
+            updateDir,
+            checksumsPath).GetAwaiter().GetResult();
+        UpdatePackage.DownloadFileAsync(
+            httpClient,
+            release.SetupDownloadUrl,
+            updateDir,
+            setupPath).GetAwaiter().GetResult();
 
-        var expectedHash = ReadExpectedHash(checksumsPath, SetupAssetName);
+        var expectedHash = UpdatePackage.ReadExpectedHash(checksumsPath, SetupAssetName);
         if (expectedHash is null)
         {
             throw new InvalidOperationException($"The latest release checksum file does not include {SetupAssetName}.");
         }
 
-        var actualHash = ComputeSha256(setupPath);
+        var actualHash = UpdatePackage.ComputeSha256(setupPath);
         if (!string.Equals(expectedHash, actualHash, StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException("The latest installer did not match the release checksum.");
@@ -1392,9 +1390,9 @@ static bool TryLaunchNewerInstaller(
             MessageBoxButtons.OK,
             MessageBoxIcon.Information);
 
-        ValidateUpdateDirectory(updateDir);
-        var immediatePreLaunchHash = ComputeSha256(setupPath);
-        if (!InstallDecisions.CanLaunchVerifiedInstaller(
+        UpdatePackage.ValidateInstallerPath(updateRoot, updateDir, setupPath);
+        var immediatePreLaunchHash = UpdatePackage.ComputeSha256(setupPath);
+        if (!UpdatePackage.CanLaunchVerifiedInstaller(
                 expectedHash,
                 actualHash,
                 immediatePreLaunchHash,
@@ -1403,7 +1401,7 @@ static bool TryLaunchNewerInstaller(
             throw new InvalidOperationException("The latest installer changed after download verification.");
         }
 
-        var persistedOptions = ResolvePersistedOptionsForUpdate(options, previousInstallInfo);
+        var persistedOptions = ToInstalledOptions(options);
         _ = Process.Start(new ProcessStartInfo(setupPath)
         {
             UseShellExecute = true,
@@ -1417,7 +1415,7 @@ static bool TryLaunchNewerInstaller(
     {
         if (updateDir is not null)
         {
-            TryDeleteDirectory(updateDir);
+            _ = UpdatePackage.TryDeleteRestrictedUpdateDirectory(updateRoot, updateDir);
         }
 
         MessageBox.Show(
@@ -1431,7 +1429,7 @@ static bool TryLaunchNewerInstaller(
     {
         if (updateDir is not null)
         {
-            TryDeleteDirectory(updateDir);
+            _ = UpdatePackage.TryDeleteRestrictedUpdateDirectory(updateRoot, updateDir);
         }
 
         MessageBox.Show(
@@ -1440,55 +1438,6 @@ static bool TryLaunchNewerInstaller(
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning);
         return false;
-    }
-}
-
-static string CreateRestrictedUpdateDirectory()
-{
-    var updateDir = Path.Combine(Path.GetTempPath(), AppId + "-latest-" + Guid.NewGuid().ToString("N"));
-    Directory.CreateDirectory(updateDir);
-
-    var currentUser = WindowsIdentity.GetCurrent().User
-        ?? throw new InvalidOperationException("The current Windows user SID is unavailable.");
-    var security = new DirectorySecurity();
-    security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-    security.SetOwner(currentUser);
-    var inheritance = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
-    security.AddAccessRule(new FileSystemAccessRule(
-        currentUser,
-        FileSystemRights.FullControl,
-        inheritance,
-        PropagationFlags.None,
-        AccessControlType.Allow));
-    security.AddAccessRule(new FileSystemAccessRule(
-        new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
-        FileSystemRights.FullControl,
-        inheritance,
-        PropagationFlags.None,
-        AccessControlType.Allow));
-    security.AddAccessRule(new FileSystemAccessRule(
-        new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
-        FileSystemRights.FullControl,
-        inheritance,
-        PropagationFlags.None,
-        AccessControlType.Allow));
-    FileSystemAclExtensions.SetAccessControl(new DirectoryInfo(updateDir), security);
-
-    ValidateUpdateDirectory(updateDir);
-    return updateDir;
-}
-
-static void ValidateUpdateDirectory(string updateDir)
-{
-    if (!InstallDecisions.IsPathWithinRoot(Path.GetTempPath(), updateDir))
-    {
-        throw new InvalidOperationException("The update directory is outside the system temporary directory.");
-    }
-
-    var attributes = File.GetAttributes(updateDir);
-    if (!InstallDecisions.IsSafeUpdateDirectory(attributes))
-    {
-        throw new InvalidOperationException("The update directory is a reparse point or is not a directory.");
     }
 }
 
@@ -1501,108 +1450,6 @@ static HttpClient CreateHttpClient()
     httpClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("MonitorAudioRouterSetup", "1.0"));
     httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
     return httpClient;
-}
-
-static async Task<ReleaseInfo> GetLatestReleaseAsync(HttpClient httpClient)
-{
-    if (!InstallDecisions.IsAllowedReleaseUri(LatestReleaseApiUrl, isApiRequest: true))
-    {
-        throw new InvalidOperationException("The configured release API URL is not trusted.");
-    }
-
-    using var response = await httpClient.GetAsync(LatestReleaseApiUrl);
-    response.EnsureSuccessStatusCode();
-    if (response.RequestMessage?.RequestUri is not Uri finalUri ||
-        !InstallDecisions.IsAllowedReleaseUri(finalUri.AbsoluteUri, isApiRequest: true))
-    {
-        throw new InvalidOperationException("The release API redirected to an untrusted URL.");
-    }
-
-    await using var stream = await response.Content.ReadAsStreamAsync();
-    using var document = await JsonDocument.ParseAsync(stream);
-    var root = document.RootElement;
-    var tagName = root.GetProperty("tag_name").GetString();
-    if (string.IsNullOrWhiteSpace(tagName))
-    {
-        throw new InvalidOperationException("GitHub did not return a release tag.");
-    }
-
-    var setupUrl = FindAssetDownloadUrl(root, SetupAssetName);
-    var checksumsUrl = FindAssetDownloadUrl(root, ChecksumsAssetName);
-    if (setupUrl is null || checksumsUrl is null)
-    {
-        throw new InvalidOperationException("The latest GitHub release is missing the installer or checksum asset.");
-    }
-
-    return new ReleaseInfo(tagName, setupUrl, checksumsUrl);
-}
-
-static string? FindAssetDownloadUrl(JsonElement releaseRoot, string assetName)
-{
-    if (!releaseRoot.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
-    {
-        return null;
-    }
-
-    foreach (var asset in assets.EnumerateArray())
-    {
-        var name = asset.TryGetProperty("name", out var nameProperty) ? nameProperty.GetString() : null;
-        if (!string.Equals(name, assetName, StringComparison.OrdinalIgnoreCase))
-        {
-            continue;
-        }
-
-        var url = asset.TryGetProperty("browser_download_url", out var urlProperty) ? urlProperty.GetString() : null;
-        return string.IsNullOrWhiteSpace(url) ? null : url;
-    }
-
-    return null;
-}
-
-static async Task DownloadFileAsync(HttpClient httpClient, string url, string destinationPath)
-{
-    if (!InstallDecisions.IsAllowedReleaseUri(url, isApiRequest: false))
-    {
-        throw new InvalidOperationException("A release asset URL is not trusted.");
-    }
-
-    var tempPath = destinationPath + ".download";
-    File.Delete(tempPath);
-    using var response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-    response.EnsureSuccessStatusCode();
-    if (response.RequestMessage?.RequestUri is not Uri finalUri ||
-        !InstallDecisions.IsAllowedReleaseUri(finalUri.AbsoluteUri, isApiRequest: false))
-    {
-        throw new InvalidOperationException("A release asset redirected to an untrusted URL.");
-    }
-
-    await using (var input = await response.Content.ReadAsStreamAsync())
-    await using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-    {
-        await input.CopyToAsync(output);
-    }
-
-    File.Move(tempPath, destinationPath, overwrite: true);
-}
-
-static string? ReadExpectedHash(string checksumsPath, string assetName)
-{
-    foreach (var line in File.ReadLines(checksumsPath))
-    {
-        var parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length >= 2 && string.Equals(parts[1], assetName, StringComparison.OrdinalIgnoreCase))
-        {
-            return parts[0];
-        }
-    }
-
-    return null;
-}
-
-static string ComputeSha256(string path)
-{
-    using var stream = File.OpenRead(path);
-    return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
 }
 
 static Version? ParseVersion(string? value)
@@ -1709,47 +1556,6 @@ static string QuoteArgument(string value)
     return builder.ToString();
 }
 
-static InstallerOptions ParseOptions(string[] args)
-{
-    var noOptions = HasSwitch(args, "/nooptions") || HasSwitch(args, "/quiet");
-    var hasExplicitBrowserExtensionChoice =
-        HasSwitch(args, "/browserextensions") ||
-        HasSwitch(args, "/nobrowserextensions");
-    var hasExplicitUpdateChoice =
-        HasSwitch(args, "/updatetolatest") ||
-        HasSwitch(args, "/update") ||
-        HasSwitch(args, "/noupdatetolatest") ||
-        HasSwitch(args, "/noupdate") ||
-        HasSwitch(args, "/noupdateduringinstall");
-    var hasExplicitAutostartChoice =
-        HasSwitch(args, "/autostart") ||
-        HasSwitch(args, "/noautostart");
-    var hasAnyExplicitInstallOption = hasExplicitBrowserExtensionChoice ||
-                                      hasExplicitUpdateChoice ||
-                                      hasExplicitAutostartChoice;
-
-    return new InstallerOptions(
-        Launch: !HasSwitch(args, "/nolaunch"),
-        OpenBrowserSetup: !HasSwitch(args, "/nobrowsersetup"),
-        ShowOptions: !noOptions && !hasAnyExplicitInstallOption,
-        Canceled: false,
-        InstallBrowserExtensions: HasSwitch(args, "/browserextensions") || !HasSwitch(args, "/nobrowserextensions"),
-        UpdateToLatestDuringInstall: HasSwitch(args, "/updatetolatest") ||
-                                     HasSwitch(args, "/update") ||
-                                     (!noOptions &&
-                                      !HasSwitch(args, "/noupdatetolatest") &&
-                                      !HasSwitch(args, "/noupdate") &&
-                                      !HasSwitch(args, "/noupdateduringinstall")),
-        Autostart: HasSwitch(args, "/autostart") || !HasSwitch(args, "/noautostart"),
-        EnablePrivateBrowsing: HasSwitch(args, "/enableprivatebrowsing") || HasSwitch(args, "/browserprivate"),
-        ChromeExtensionId: GetOptionValue(args, "ChromeExtensionId", DefaultChromeExtensionId),
-        ChromeUpdateUrl: GetOptionValue(args, "ChromeUpdateUrl", ChromeWebStoreUpdateUrl),
-        EdgeExtensionId: GetOptionValue(args, "EdgeExtensionId", DefaultEdgeExtensionId),
-        EdgeUpdateUrl: GetOptionValue(args, "EdgeUpdateUrl", EdgeAddOnsUpdateUrl),
-        FirefoxExtensionId: GetOptionValue(args, "FirefoxExtensionId", DefaultFirefoxExtensionId),
-        FirefoxInstallUrl: GetOptionValue(args, "FirefoxInstallUrl", DefaultFirefoxInstallUrl));
-}
-
 static InstallerOptions ApplyInteractiveOptions(InstallerOptions options)
 {
     if (!options.ShowOptions)
@@ -1769,13 +1575,12 @@ static InstallerOptions ApplyInteractiveOptions(InstallerOptions options)
             return;
         }
 
-        result = options with
-        {
-            InstallBrowserExtensions = form.InstallBrowserExtensions,
-            UpdateToLatestDuringInstall = form.UpdateToLatestDuringInstall,
-            Autostart = form.Autostart,
-            EnablePrivateBrowsing = form.EnablePrivateBrowsing
-        };
+        result = InstallerOptionResolver.ApplyInteractiveChoices(
+            options,
+            form.InstallBrowserExtensions,
+            form.UpdateToLatestDuringInstall,
+            form.Autostart,
+            form.EnablePrivateBrowsing);
     });
 
     thread.SetApartmentState(ApartmentState.STA);
@@ -1787,20 +1592,6 @@ static InstallerOptions ApplyInteractiveOptions(InstallerOptions options)
 static bool HasSwitch(string[] args, string switchName)
 {
     return args.Any(arg => arg.Equals(switchName, StringComparison.OrdinalIgnoreCase));
-}
-
-static string GetOptionValue(string[] args, string name, string fallback)
-{
-    foreach (var prefix in new[] { "/" + name + "=", "/" + name + ":" })
-    {
-        var match = args.FirstOrDefault(arg => arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
-        if (match is not null)
-        {
-            return match[prefix.Length..].Trim().Trim('"');
-        }
-    }
-
-    return fallback;
 }
 
 static bool HasPublishedValue(string? value)
@@ -1825,7 +1616,172 @@ sealed record InstallerOptions(
     string FirefoxExtensionId,
     string FirefoxInstallUrl);
 
-sealed record ReleaseInfo(string TagName, string SetupDownloadUrl, string ChecksumsDownloadUrl);
+internal static class InstallerOptionResolver
+{
+    internal static InstallerOptions ResolvePrimaryOptions(
+        string[] arguments,
+        string? installInfoJson,
+        bool legacyBrowserExtensionsInstalled,
+        bool legacyAutostartInstalled)
+    {
+        var parsed = Parse(arguments);
+        if (installInfoJson is null)
+        {
+            return parsed.Options;
+        }
+
+        var persisted = InstallInfo.Deserialize(installInfoJson).ResolveOptions(new InstalledOptions(
+            legacyBrowserExtensionsInstalled,
+            legacyAutostartInstalled,
+            parsed.Options.EnablePrivateBrowsing,
+            parsed.Options.ChromeExtensionId,
+            parsed.Options.ChromeUpdateUrl,
+            parsed.Options.EdgeExtensionId,
+            parsed.Options.EdgeUpdateUrl,
+            parsed.Options.FirefoxExtensionId,
+            parsed.Options.FirefoxInstallUrl));
+
+        return parsed.Options with
+        {
+            InstallBrowserExtensions = parsed.Overrides.InstallBrowserExtensions
+                ? parsed.Options.InstallBrowserExtensions
+                : persisted.InstallBrowserExtensions,
+            Autostart = parsed.Overrides.Autostart
+                ? parsed.Options.Autostart
+                : persisted.Autostart,
+            EnablePrivateBrowsing = parsed.Overrides.EnablePrivateBrowsing
+                ? parsed.Options.EnablePrivateBrowsing
+                : persisted.EnablePrivateBrowsing,
+            ChromeExtensionId = parsed.Overrides.ChromeExtensionId
+                ? parsed.Options.ChromeExtensionId
+                : persisted.ChromeExtensionId,
+            ChromeUpdateUrl = parsed.Overrides.ChromeUpdateUrl
+                ? parsed.Options.ChromeUpdateUrl
+                : persisted.ChromeUpdateUrl,
+            EdgeExtensionId = parsed.Overrides.EdgeExtensionId
+                ? parsed.Options.EdgeExtensionId
+                : persisted.EdgeExtensionId,
+            EdgeUpdateUrl = parsed.Overrides.EdgeUpdateUrl
+                ? parsed.Options.EdgeUpdateUrl
+                : persisted.EdgeUpdateUrl,
+            FirefoxExtensionId = parsed.Overrides.FirefoxExtensionId
+                ? parsed.Options.FirefoxExtensionId
+                : persisted.FirefoxExtensionId,
+            FirefoxInstallUrl = parsed.Overrides.FirefoxInstallUrl
+                ? parsed.Options.FirefoxInstallUrl
+                : persisted.FirefoxInstallUrl
+        };
+    }
+
+    internal static InstallerOptions ApplyInteractiveChoices(
+        InstallerOptions options,
+        bool installBrowserExtensions,
+        bool updateToLatestDuringInstall,
+        bool autostart,
+        bool enablePrivateBrowsing) =>
+        options with
+        {
+            InstallBrowserExtensions = installBrowserExtensions,
+            UpdateToLatestDuringInstall = updateToLatestDuringInstall,
+            Autostart = autostart,
+            EnablePrivateBrowsing = installBrowserExtensions && enablePrivateBrowsing
+        };
+
+    private static ParsedInstallerOptions Parse(string[] arguments)
+    {
+        var noOptions = HasSwitch(arguments, "/nooptions") || HasSwitch(arguments, "/quiet");
+        var hasExplicitBrowserExtensionChoice =
+            HasSwitch(arguments, "/browserextensions") ||
+            HasSwitch(arguments, "/nobrowserextensions");
+        var hasExplicitUpdateChoice =
+            HasSwitch(arguments, "/updatetolatest") ||
+            HasSwitch(arguments, "/update") ||
+            HasSwitch(arguments, "/noupdatetolatest") ||
+            HasSwitch(arguments, "/noupdate") ||
+            HasSwitch(arguments, "/noupdateduringinstall");
+        var hasExplicitAutostartChoice =
+            HasSwitch(arguments, "/autostart") ||
+            HasSwitch(arguments, "/noautostart");
+        var hasExplicitPrivateBrowsingChoice =
+            HasSwitch(arguments, "/enableprivatebrowsing") ||
+            HasSwitch(arguments, "/browserprivate") ||
+            HasSwitch(arguments, "/disableprivatebrowsing");
+        var hasAnyExplicitInstallOption = hasExplicitBrowserExtensionChoice ||
+                                          hasExplicitUpdateChoice ||
+                                          hasExplicitAutostartChoice;
+
+        var chromeExtensionId = GetOptionValue(arguments, "ChromeExtensionId", InstallChoiceDefaults.ChromeExtensionId);
+        var chromeUpdateUrl = GetOptionValue(arguments, "ChromeUpdateUrl", InstallChoiceDefaults.ChromeUpdateUrl);
+        var edgeExtensionId = GetOptionValue(arguments, "EdgeExtensionId", InstallChoiceDefaults.EdgeExtensionId);
+        var edgeUpdateUrl = GetOptionValue(arguments, "EdgeUpdateUrl", InstallChoiceDefaults.EdgeUpdateUrl);
+        var firefoxExtensionId = GetOptionValue(arguments, "FirefoxExtensionId", InstallChoiceDefaults.FirefoxExtensionId);
+        var firefoxInstallUrl = GetOptionValue(arguments, "FirefoxInstallUrl", InstallChoiceDefaults.FirefoxInstallUrl);
+
+        var options = new InstallerOptions(
+            Launch: !HasSwitch(arguments, "/nolaunch"),
+            OpenBrowserSetup: !HasSwitch(arguments, "/nobrowsersetup"),
+            ShowOptions: !noOptions && !hasAnyExplicitInstallOption,
+            Canceled: false,
+            InstallBrowserExtensions: HasSwitch(arguments, "/browserextensions") || !HasSwitch(arguments, "/nobrowserextensions"),
+            UpdateToLatestDuringInstall: HasSwitch(arguments, "/updatetolatest") ||
+                                         HasSwitch(arguments, "/update") ||
+                                         (!noOptions && !hasExplicitUpdateChoice),
+            Autostart: HasSwitch(arguments, "/autostart") || !HasSwitch(arguments, "/noautostart"),
+            EnablePrivateBrowsing: HasSwitch(arguments, "/enableprivatebrowsing") || HasSwitch(arguments, "/browserprivate"),
+            ChromeExtensionId: chromeExtensionId.Value,
+            ChromeUpdateUrl: chromeUpdateUrl.Value,
+            EdgeExtensionId: edgeExtensionId.Value,
+            EdgeUpdateUrl: edgeUpdateUrl.Value,
+            FirefoxExtensionId: firefoxExtensionId.Value,
+            FirefoxInstallUrl: firefoxInstallUrl.Value);
+        var overrides = new InstallerOptionOverrides(
+            hasExplicitBrowserExtensionChoice,
+            hasExplicitAutostartChoice,
+            hasExplicitPrivateBrowsingChoice,
+            chromeExtensionId.IsExplicit,
+            chromeUpdateUrl.IsExplicit,
+            edgeExtensionId.IsExplicit,
+            edgeUpdateUrl.IsExplicit,
+            firefoxExtensionId.IsExplicit,
+            firefoxInstallUrl.IsExplicit);
+        return new ParsedInstallerOptions(options, overrides);
+    }
+
+    private static OptionValue GetOptionValue(string[] arguments, string name, string fallback)
+    {
+        foreach (var prefix in new[] { "/" + name + "=", "/" + name + ":" })
+        {
+            var match = arguments.FirstOrDefault(argument =>
+                argument.StartsWith(prefix, StringComparison.OrdinalIgnoreCase));
+            if (match is not null)
+            {
+                return new OptionValue(match[prefix.Length..].Trim().Trim('"'), IsExplicit: true);
+            }
+        }
+
+        return new OptionValue(fallback, IsExplicit: false);
+    }
+
+    private static bool HasSwitch(string[] arguments, string switchName) =>
+        arguments.Any(argument => argument.Equals(switchName, StringComparison.OrdinalIgnoreCase));
+
+    private sealed record ParsedInstallerOptions(
+        InstallerOptions Options,
+        InstallerOptionOverrides Overrides);
+
+    private sealed record InstallerOptionOverrides(
+        bool InstallBrowserExtensions,
+        bool Autostart,
+        bool EnablePrivateBrowsing,
+        bool ChromeExtensionId,
+        bool ChromeUpdateUrl,
+        bool EdgeExtensionId,
+        bool EdgeUpdateUrl,
+        bool FirefoxExtensionId,
+        bool FirefoxInstallUrl);
+
+    private readonly record struct OptionValue(string Value, bool IsExplicit);
+}
 
 sealed class InstallOptionsForm : Form
 {

@@ -276,9 +276,10 @@ function Test-ReleasePackages {
     Assert-EqualPackageValue $failures "Firefox published extension ID" $firefoxExtensionId ([string]$firefoxSourceManifest.browser_specific_settings.gecko.id)
 
     $installerSource = Get-Content -LiteralPath (Join-Path $repositoryRoot "installer-src\Program.cs") -Raw
+    $updateSupportSource = Get-Content -LiteralPath (Join-Path $repositoryRoot "shared-src\UpdateSupport.cs") -Raw
     $installerVersionMatch = [regex]::Match($installerSource, 'const string AppVersion = "([^"]+)";')
-    $chromeIdMatch = [regex]::Match($installerSource, 'const string DefaultChromeExtensionId = "([^"]+)";')
-    $firefoxIdMatch = [regex]::Match($installerSource, 'const string DefaultFirefoxExtensionId = "([^"]+)";')
+    $chromeIdMatch = [regex]::Match($updateSupportSource, 'const string ChromeExtensionId = "([^"]+)";')
+    $firefoxIdMatch = [regex]::Match($updateSupportSource, 'const string FirefoxExtensionId = "([^"]+)";')
     Assert-EqualPackageValue $failures "Installer application version" $desktopVersion $installerVersionMatch.Groups[1].Value
     Assert-EqualPackageValue $failures "Installer Chrome extension ID" $chromeExtensionId $chromeIdMatch.Groups[1].Value
     Assert-EqualPackageValue $failures "Installer Firefox extension ID" $firefoxExtensionId $firefoxIdMatch.Groups[1].Value

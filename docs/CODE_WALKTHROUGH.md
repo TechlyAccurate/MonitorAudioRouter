@@ -217,9 +217,10 @@ the same subscription concurrently.
 ### Installer and updates
 
 The installer reads the existing install record before applying defaults, so an
-upgrade preserves the selected browser, autostart, private-browsing, and update
-options. It stops only known product executables whose normalized paths are under
-the recorded install directory, and it does not kill an entire process tree.
+upgrade preserves browser deployment, autostart, private browsing, extension
+IDs, and store URLs. It stops only known product executables whose normalized
+paths are under the recorded install directory, and it does not kill an entire
+process tree.
 
 Installation is transactional. File replacements and registry writes record the
 prior state, then commit only after the payload, shortcuts, browser settings, and
@@ -229,9 +230,12 @@ that install attempt; concurrent external changes are retained. Ownership carrie
 through an upgrade keeps the original predecessor so a later uninstall restores
 the state that existed before Monitor Audio Router first took ownership.
 
-The updater accepts release metadata only from the expected HTTPS GitHub hosts,
-downloads into a checked local directory, verifies the matching SHA-256 entry,
-and launches the installer only after the checksum succeeds.
+The tray and installer updaters share the same trust checks. They accept release
+metadata and final redirects only from the expected HTTPS GitHub hosts, download
+into a unique restricted non-reparse directory, and verify the matching SHA-256
+entry after download and again immediately before the explicit `runas` launch.
+The About path also forwards every recorded install choice from
+`install-info.json`.
 
 ## Important invariants
 

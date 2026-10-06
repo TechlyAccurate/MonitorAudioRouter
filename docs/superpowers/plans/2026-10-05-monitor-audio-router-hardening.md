@@ -1,7 +1,5 @@
 # Monitor Audio Router Hardening Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Ship Monitor Audio Router 0.1.15 and browser bridges 0.1.6 with stronger route ownership, ordered browser hints, bounded local IPC, safer lifecycle handling, and reliable upgrades without changing proven routing decisions.
 
 **Architecture:** Keep the existing event-driven router and its public contracts. Add small testable decision helpers around Windows audio policy, process identity, browser-message ordering, configuration loading, installer ownership, and archive generation; keep platform calls at the current boundaries and make failures conservative.
@@ -16,7 +14,7 @@
 - Desktop app, native host, and installer become `0.1.15`; both browser extensions become `0.1.6`.
 - Preserve Windows 10 and Windows 11 support and PowerShell 5.1 compatibility.
 - Add no runtime or package-manager dependency.
-- Follow `C:\Users\cmfus\Documents\Codex\2026-07-30\se\outputs\Universal-Code-Style-and-Review-Guide.md` in materially changed code.
+- Follow the Universal Code Style, Readability, and Review Guide in materially changed code.
 - Keep external configuration, registry, command-line, native-messaging, and store identifiers unchanged.
 - Do not broadly reorganize or reformat the large existing source files.
 - Do not publish any artifact unless the complete release validation passes.

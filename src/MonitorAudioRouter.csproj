@@ -14,5 +14,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Content Include="MonitorAudioRouter.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Compile Include="..\shared-src\UpdateSupport.cs" Link="UpdateSupport.cs" />
   </ItemGroup>
 </Project>

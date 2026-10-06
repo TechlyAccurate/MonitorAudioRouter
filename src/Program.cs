@@ -13,6 +13,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using MonitorAudioRouter.UpdateSupport;
 
 namespace MonitorAudioRouter;
 
@@ -1434,9 +1435,9 @@ internal sealed class RouteConfigForm : Form
 
 internal static class AppUpdater
 {
-    private const string LatestReleaseApiUrl = "https://api.github.com/repos/TechlyAccurate/MonitorAudioRouter/releases/latest";
     private const string SetupAssetName = "MonitorAudioRouterSetup.exe";
     private const string ChecksumsAssetName = "SHA256SUMS.txt";
+    private const string UpdateDirectoryPrefix = "MonitorAudioRouter-update-";
 
     public static string GetInstalledVersionText()
     {
@@ -1446,6 +1447,8 @@ internal static class AppUpdater
 
     public static async Task CheckAndInstallLatestAsync(IWin32Window owner)
     {
+        var updateRoot = Path.GetTempPath();
+        string? updateDirectory = null;
         try
         {
             using var httpClient = CreateHttpClient();
@@ -1477,21 +1480,20 @@ internal static class AppUpdater
                 return;
             }
 
-            var updateDir = Path.Combine(Paths.Root, "updates", SanitizePathPart(release.TagName));
-            Directory.CreateDirectory(updateDir);
-            var setupPath = Path.Combine(updateDir, SetupAssetName);
-            var checksumsPath = Path.Combine(updateDir, ChecksumsAssetName);
+            updateDirectory = CreateRestrictedUpdateDirectory(updateRoot);
+            var setupPath = Path.Combine(updateDirectory, SetupAssetName);
+            var checksumsPath = Path.Combine(updateDirectory, ChecksumsAssetName);
 
-            await DownloadFileAsync(httpClient, release.ChecksumsDownloadUrl, checksumsPath);
-            await DownloadFileAsync(httpClient, release.SetupDownloadUrl, setupPath);
+            await DownloadFileAsync(httpClient, release.ChecksumsDownloadUrl, updateDirectory, checksumsPath);
+            await DownloadFileAsync(httpClient, release.SetupDownloadUrl, updateDirectory, setupPath);
 
-            var expectedHash = ReadExpectedHash(checksumsPath, SetupAssetName);
+            var expectedHash = UpdatePackage.ReadExpectedHash(checksumsPath, SetupAssetName);
             if (expectedHash is null)
             {
                 throw new InvalidOperationException($"The release checksum file does not include {SetupAssetName}.");
             }
 
-            var actualHash = ComputeSha256(setupPath);
+            var actualHash = UpdatePackage.ComputeSha256(setupPath);
             if (!string.Equals(expectedHash, actualHash, StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException("The downloaded installer did not match the release checksum.");
@@ -1511,23 +1513,29 @@ internal static class AppUpdater
                 throw new InvalidOperationException(settingsLoad.ErrorMessage);
             }
 
-            var installerArgs = settingsLoad.Settings.AutostartEnabled
-                ? "/nobrowsersetup /nooptions /noupdatetolatest /autostart"
-                : "/nobrowsersetup /nooptions /noupdatetolatest /noautostart";
-            Process.Start(new ProcessStartInfo(setupPath, installerArgs)
-            {
-                UseShellExecute = true,
-                Verb = "runas",
-                WorkingDirectory = updateDir
-            });
+            var installInfoPath = Path.Combine(AppContext.BaseDirectory, "install-info.json");
+            var startInfo = CreateVerifiedInstallerStartInfo(
+                updateRoot,
+                updateDirectory,
+                setupPath,
+                expectedHash,
+                actualHash,
+                installInfoPath,
+                settingsLoad.Settings.AutostartEnabled);
+            var installerProcess = Process.Start(startInfo)
+                ?? throw new InvalidOperationException("The verified update installer did not start.");
+            _ = CleanupUpdateDirectoryAfterExitAsync(installerProcess, updateRoot, updateDirectory);
+            updateDirectory = null;
         }
         catch (System.ComponentModel.Win32Exception exception) when (exception.NativeErrorCode == 1223)
         {
+            TryDeleteUpdateDirectory(updateRoot, updateDirectory);
             Log.Write("App update canceled at the Windows permission prompt.");
             MessageBox.Show(owner, "The update was canceled.", "App update", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception exception)
         {
+            TryDeleteUpdateDirectory(updateRoot, updateDirectory);
             Log.Write($"App update failed: {exception}");
             MessageBox.Show(owner, exception.Message, "Could not update app", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
@@ -1544,84 +1552,141 @@ internal static class AppUpdater
         return httpClient;
     }
 
-    private static async Task<ReleaseInfo> GetLatestReleaseAsync(HttpClient httpClient)
+    internal static Task<UpdateReleaseInfo> GetLatestReleaseAsync(HttpClient httpClient) =>
+        UpdatePackage.GetLatestReleaseAsync(httpClient, SetupAssetName, ChecksumsAssetName);
+
+    internal static Task DownloadFileAsync(
+        HttpClient httpClient,
+        string url,
+        string updateDirectory,
+        string destinationPath) =>
+        UpdatePackage.DownloadFileAsync(httpClient, url, updateDirectory, destinationPath);
+
+    internal static string CreateRestrictedUpdateDirectory(string updateRoot) =>
+        UpdatePackage.CreateRestrictedUpdateDirectory(updateRoot, UpdateDirectoryPrefix);
+
+    internal static ProcessStartInfo CreateVerifiedInstallerStartInfo(
+        string updateRoot,
+        string updateDirectory,
+        string setupPath,
+        string expectedHash,
+        string downloadedHash,
+        string installInfoPath,
+        bool legacyAutostartEnabled)
     {
-        using var response = await httpClient.GetAsync(LatestReleaseApiUrl);
-        response.EnsureSuccessStatusCode();
-        await using var stream = await response.Content.ReadAsStreamAsync();
-        using var document = await JsonDocument.ParseAsync(stream);
-        var root = document.RootElement;
-        var tagName = root.GetProperty("tag_name").GetString();
-        if (string.IsNullOrWhiteSpace(tagName))
+        UpdatePackage.ValidateInstallerPath(updateRoot, updateDirectory, setupPath);
+        var immediatePreLaunchHash = UpdatePackage.ComputeSha256(setupPath);
+        if (!UpdatePackage.CanLaunchVerifiedInstaller(
+                expectedHash,
+                downloadedHash,
+                immediatePreLaunchHash,
+                updateDirectoryIsSafe: true))
         {
-            throw new InvalidOperationException("GitHub did not return a release tag.");
+            throw new InvalidOperationException("The update installer changed after download verification.");
         }
 
-        var setupUrl = FindAssetDownloadUrl(root, SetupAssetName);
-        var checksumsUrl = FindAssetDownloadUrl(root, ChecksumsAssetName);
-        if (setupUrl is null || checksumsUrl is null)
+        return new ProcessStartInfo(setupPath)
         {
-            throw new InvalidOperationException("The latest GitHub release is missing the installer or checksum asset.");
-        }
-
-        return new ReleaseInfo(tagName, setupUrl, checksumsUrl);
+            UseShellExecute = true,
+            Verb = "runas",
+            WorkingDirectory = updateDirectory,
+            Arguments = BuildInstallerArguments(installInfoPath, legacyAutostartEnabled)
+        };
     }
 
-    private static string? FindAssetDownloadUrl(JsonElement releaseRoot, string assetName)
+    private static string BuildInstallerArguments(string installInfoPath, bool legacyAutostartEnabled)
     {
-        if (!releaseRoot.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
+        var fallback = InstallChoiceDefaults.Create(legacyAutostartEnabled);
+        PreservedInstallChoices choices;
+        if (!File.Exists(installInfoPath))
         {
-            return null;
+            choices = fallback;
+        }
+        else
+        {
+            var installInfoJson = File.ReadAllText(installInfoPath);
+            var legacyBrowserExtensionsInstalled = InstallChoiceContract.HasLegacyBrowserIdentifiers(installInfoJson);
+            choices = InstallChoiceContract.Resolve(
+                installInfoJson,
+                fallback with { InstallBrowserExtensions = legacyBrowserExtensionsInstalled });
         }
 
-        foreach (var asset in assets.EnumerateArray())
+        var arguments = new List<string>
         {
-            var name = asset.TryGetProperty("name", out var nameProperty) ? nameProperty.GetString() : null;
-            if (!string.Equals(name, assetName, StringComparison.OrdinalIgnoreCase))
+            "/nobrowsersetup",
+            "/nooptions",
+            "/noupdatetolatest"
+        };
+        arguments.AddRange(InstallChoiceContract.BuildForwardedArguments(choices));
+        return string.Join(" ", arguments.Select(QuoteInstallerArgument));
+    }
+
+    private static string QuoteInstallerArgument(string value)
+    {
+        if (!value.Any(char.IsWhiteSpace) && !value.Contains('"'))
+        {
+            return value;
+        }
+
+        var builder = new StringBuilder("\"");
+        var backslashCount = 0;
+        foreach (var character in value)
+        {
+            if (character == '\\')
             {
+                backslashCount++;
                 continue;
             }
 
-            var url = asset.TryGetProperty("browser_download_url", out var urlProperty) ? urlProperty.GetString() : null;
-            return string.IsNullOrWhiteSpace(url) ? null : url;
-        }
-
-        return null;
-    }
-
-    private static async Task DownloadFileAsync(HttpClient httpClient, string url, string destinationPath)
-    {
-        var tempPath = destinationPath + ".download";
-        File.Delete(tempPath);
-        using var response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-        response.EnsureSuccessStatusCode();
-        await using (var input = await response.Content.ReadAsStreamAsync())
-        await using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-        {
-            await input.CopyToAsync(output);
-        }
-
-        File.Move(tempPath, destinationPath, overwrite: true);
-    }
-
-    private static string? ReadExpectedHash(string checksumsPath, string assetName)
-    {
-        foreach (var line in File.ReadLines(checksumsPath))
-        {
-            var parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length >= 2 && string.Equals(parts[1], assetName, StringComparison.OrdinalIgnoreCase))
+            if (character == '"')
             {
-                return parts[0];
+                builder.Append('\\', backslashCount * 2 + 1);
+                builder.Append('"');
+            }
+            else
+            {
+                builder.Append('\\', backslashCount);
+                builder.Append(character);
+            }
+
+            backslashCount = 0;
+        }
+
+        builder.Append('\\', backslashCount * 2);
+        builder.Append('"');
+        return builder.ToString();
+    }
+
+    private static async Task CleanupUpdateDirectoryAfterExitAsync(
+        Process installerProcess,
+        string updateRoot,
+        string updateDirectory)
+    {
+        try
+        {
+            await installerProcess.WaitForExitAsync();
+        }
+        catch (Exception exception)
+        {
+            Log.Write($"Could not wait for update installer cleanup: {exception.Message}");
+        }
+        finally
+        {
+            installerProcess.Dispose();
+            if (!UpdatePackage.TryDeleteRestrictedUpdateDirectory(updateRoot, updateDirectory))
+            {
+                Log.Write($"Update directory cleanup was deferred: {updateDirectory}");
             }
         }
-
-        return null;
     }
 
-    private static string ComputeSha256(string path)
+    private static void TryDeleteUpdateDirectory(string updateRoot, string? updateDirectory)
     {
-        using var stream = File.OpenRead(path);
-        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+        if (updateDirectory is not null &&
+            !UpdatePackage.TryDeleteRestrictedUpdateDirectory(updateRoot, updateDirectory))
+        {
+            Log.Write($"Update directory cleanup was deferred: {updateDirectory}");
+        }
     }
 
     private static Version? GetCurrentVersion()
@@ -1680,19 +1745,6 @@ internal static class AppUpdater
         return version.Build >= 0 ? $"{version.Major}.{version.Minor}.{version.Build}" : $"{version.Major}.{version.Minor}";
     }
 
-    private static string SanitizePathPart(string value)
-    {
-        var invalidPathCharacters = Path.GetInvalidFileNameChars();
-        var pathPartBuilder = new StringBuilder(value.Length);
-        foreach (var character in value)
-        {
-            pathPartBuilder.Append(invalidPathCharacters.Contains(character) ? '_' : character);
-        }
-
-        return pathPartBuilder.Length == 0 ? "latest" : pathPartBuilder.ToString();
-    }
-
-    private sealed record ReleaseInfo(string TagName, string SetupDownloadUrl, string ChecksumsDownloadUrl);
 }
 
 internal static class MonitorAudioAutoDetector

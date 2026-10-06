@@ -19,5 +19,6 @@
   </PropertyGroup>
   <ItemGroup>
     <EmbeddedResource Include="Resources\payload.zip" LogicalName="payload.zip" />
+    <Compile Include="..\shared-src\UpdateSupport.cs" Link="UpdateSupport.cs" />
   </ItemGroup>
 </Project>

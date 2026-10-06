@@ -8,9 +8,9 @@ Monitor Audio Router 0.1.15 ships with Chrome and Firefox companion extension 0.
 - Rejects stale browser snapshots and safely accepts a restarted extension as a new ordered source.
 - Bounds local browser messages by size and read time before updating route state.
 - Makes shutdown and audio-session cleanup single-owner operations.
-- Preserves existing installer choices during upgrades.
+- Preserves existing installer choices during About updates and ordinary reruns.
 - Rolls back only files and registry values that remain unchanged from the failed install attempt.
-- Verifies updater downloads against the release checksum before launch.
+- Restricts updater downloads to validated GitHub destinations and verifies the release checksum after download and immediately before launch.
 - Produces deterministic store, payload, and GitHub release archives.
 
 The installer remains unsigned, so Windows SmartScreen may show a warning.

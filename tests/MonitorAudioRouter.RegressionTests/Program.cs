@@ -16,6 +16,12 @@ internal static class Program
         runner.Add("Installer assembly loads through its project reference", InstallerAssemblyLoadsThroughProjectReference);
         runner.Add("Installer update arguments preserve every installed option", InstallerUpdateArgumentsPreserveEveryInstalledOption);
         runner.Add("Legacy install information remains readable", LegacyInstallInformationRemainsReadable);
+        runner.Add("Tray updater rejects an untrusted final redirect destination", TrayUpdaterRejectsUntrustedFinalRedirectDestination);
+        runner.Add("Tray updater creates unique restricted update directories", TrayUpdaterCreatesUniqueRestrictedUpdateDirectories);
+        runner.Add("Tray updater verifies the launch file and forwards persisted choices", TrayUpdaterVerifiesLaunchFileAndForwardsPersistedChoices);
+        runner.Add("Primary installer preserves persisted choices by default", PrimaryInstallerPreservesPersistedChoicesByDefault);
+        runner.Add("Explicit installer choices override persisted choices", ExplicitInstallerChoicesOverridePersistedChoices);
+        runner.Add("Interactive installer choices override persisted choices", InteractiveInstallerChoicesOverridePersistedChoices);
         runner.Add("Installed executable matching requires a normalized full path", InstalledExecutableMatchingRequiresNormalizedFullPath);
         runner.Add("Installer process discovery queries only installed executable names", InstallerProcessDiscoveryQueriesOnlyInstalledNames);
         runner.Add("Changed registry values are retained during uninstall", ChangedRegistryValuesAreRetainedDuringUninstall);
@@ -189,6 +195,236 @@ internal static class Program
         RegressionAssert.True(resolved.EnablePrivateBrowsing, "The legacy private browsing choice should be preserved.");
         RegressionAssert.True(!resolved.InstallBrowserExtensions, "Missing legacy choices should use the supplied fallback.");
         RegressionAssert.True(!resolved.Autostart, "Missing legacy autostart should use the supplied fallback.");
+    }
+
+    private static void TrayUpdaterRejectsUntrustedFinalRedirectDestination()
+    {
+        var updateRoot = Path.Combine(
+            Path.GetTempPath(),
+            "MonitorAudioRouter.RegressionTests",
+            Guid.NewGuid().ToString("N"));
+
+        try
+        {
+            Directory.CreateDirectory(updateRoot);
+            var updateDirectory = global::MonitorAudioRouter.AppUpdater.CreateRestrictedUpdateDirectory(updateRoot);
+            var destinationPath = Path.Combine(updateDirectory, "MonitorAudioRouterSetup.exe");
+            using var httpClient = new HttpClient(new FixedResponseHandler(request => new HttpResponseMessage
+            {
+                StatusCode = System.Net.HttpStatusCode.OK,
+                RequestMessage = new HttpRequestMessage(HttpMethod.Get, "https://downloads.example.test/installer.exe"),
+                Content = new ByteArrayContent([1, 2, 3])
+            }));
+
+            var exception = RegressionAssert.Throws<InvalidOperationException>(() =>
+                global::MonitorAudioRouter.AppUpdater.DownloadFileAsync(
+                    httpClient,
+                    "https://github.com/TechlyAccurate/MonitorAudioRouter/releases/download/v0.1.15/MonitorAudioRouterSetup.exe",
+                    updateDirectory,
+                    destinationPath).GetAwaiter().GetResult());
+            RegressionAssert.Contains("redirected to an untrusted URL", exception.Message, "The final response host must be validated.");
+            RegressionAssert.True(!File.Exists(destinationPath), "An untrusted redirect must not create the release asset.");
+        }
+        finally
+        {
+            if (Directory.Exists(updateRoot))
+            {
+                Directory.Delete(updateRoot, recursive: true);
+            }
+        }
+    }
+
+    private static void TrayUpdaterCreatesUniqueRestrictedUpdateDirectories()
+    {
+        var updateRoot = Path.Combine(
+            Path.GetTempPath(),
+            "MonitorAudioRouter.RegressionTests",
+            Guid.NewGuid().ToString("N"));
+
+        try
+        {
+            Directory.CreateDirectory(updateRoot);
+            var first = global::MonitorAudioRouter.AppUpdater.CreateRestrictedUpdateDirectory(updateRoot);
+            var second = global::MonitorAudioRouter.AppUpdater.CreateRestrictedUpdateDirectory(updateRoot);
+
+            RegressionAssert.True(!string.Equals(first, second, StringComparison.OrdinalIgnoreCase), "Each update must use a unique directory.");
+            RegressionAssert.True(Path.GetFullPath(first).StartsWith(Path.GetFullPath(updateRoot) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase), "The first update directory must stay inside its root.");
+            RegressionAssert.True(Path.GetFullPath(second).StartsWith(Path.GetFullPath(updateRoot) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase), "The second update directory must stay inside its root.");
+            RegressionAssert.True(!File.GetAttributes(first).HasFlag(FileAttributes.ReparsePoint), "The first update directory must not be a reparse point.");
+            RegressionAssert.True(!File.GetAttributes(second).HasFlag(FileAttributes.ReparsePoint), "The second update directory must not be a reparse point.");
+            RegressionAssert.True(
+                System.IO.FileSystemAclExtensions.GetAccessControl(new DirectoryInfo(first)).AreAccessRulesProtected,
+                "The update directory must not inherit a broader access control list.");
+        }
+        finally
+        {
+            if (Directory.Exists(updateRoot))
+            {
+                Directory.Delete(updateRoot, recursive: true);
+            }
+        }
+    }
+
+    private static void TrayUpdaterVerifiesLaunchFileAndForwardsPersistedChoices()
+    {
+        var updateRoot = Path.Combine(
+            Path.GetTempPath(),
+            "MonitorAudioRouter.RegressionTests",
+            Guid.NewGuid().ToString("N"));
+        var installInfoPath = Path.Combine(updateRoot, "install-info.json");
+
+        try
+        {
+            Directory.CreateDirectory(updateRoot);
+            var updateDirectory = global::MonitorAudioRouter.AppUpdater.CreateRestrictedUpdateDirectory(updateRoot);
+            var setupPath = Path.Combine(updateDirectory, "MonitorAudioRouterSetup.exe");
+            File.WriteAllText(setupPath, "verified installer");
+            var expectedHash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(setupPath))).ToLowerInvariant();
+            File.WriteAllText(installInfoPath, """
+                {
+                  "SchemaVersion": 2,
+                  "InstallBrowserExtensions": false,
+                  "Autostart": false,
+                  "PrivateBrowsingEnabled": true,
+                  "ChromeExtensionId": "custom-chrome",
+                  "ChromeUpdateUrl": "https://updates.example.test/chrome",
+                  "EdgeExtensionId": "custom-edge",
+                  "EdgeUpdateUrl": "https://updates.example.test/edge",
+                  "FirefoxExtensionId": "custom-firefox@example.test",
+                  "FirefoxInstallUrl": "https://updates.example.test/firefox.xpi"
+                }
+                """);
+
+            var startInfo = global::MonitorAudioRouter.AppUpdater.CreateVerifiedInstallerStartInfo(
+                updateRoot,
+                updateDirectory,
+                setupPath,
+                expectedHash,
+                expectedHash,
+                installInfoPath,
+                legacyAutostartEnabled: true);
+
+            RegressionAssert.Equal("runas", startInfo.Verb, "The verified installer must retain the explicit UAC launch.");
+            RegressionAssert.Contains("/nobrowserextensions", startInfo.Arguments, "The updater must preserve browser deployment opt-out.");
+            RegressionAssert.Contains("/noautostart", startInfo.Arguments, "The updater must preserve autostart opt-out.");
+            RegressionAssert.Contains("/enableprivatebrowsing", startInfo.Arguments, "The updater must preserve private browsing choice.");
+            RegressionAssert.Contains("/ChromeExtensionId=custom-chrome", startInfo.Arguments, "The updater must preserve the custom Chrome ID.");
+            RegressionAssert.Contains("/FirefoxInstallUrl=https://updates.example.test/firefox.xpi", startInfo.Arguments, "The updater must preserve the custom Firefox URL.");
+
+            File.WriteAllText(setupPath, "substituted installer");
+            RegressionAssert.Throws<InvalidOperationException>(() =>
+                global::MonitorAudioRouter.AppUpdater.CreateVerifiedInstallerStartInfo(
+                    updateRoot,
+                    updateDirectory,
+                    setupPath,
+                    expectedHash,
+                    expectedHash,
+                    installInfoPath,
+                    legacyAutostartEnabled: true));
+        }
+        finally
+        {
+            if (Directory.Exists(updateRoot))
+            {
+                Directory.Delete(updateRoot, recursive: true);
+            }
+        }
+    }
+
+    private static void PrimaryInstallerPreservesPersistedChoicesByDefault()
+    {
+        const string persistedJson = """
+            {
+              "SchemaVersion": 2,
+              "InstallBrowserExtensions": false,
+              "Autostart": false,
+              "PrivateBrowsingEnabled": true,
+              "ChromeExtensionId": "persisted-chrome",
+              "ChromeUpdateUrl": "https://updates.example.test/chrome",
+              "EdgeExtensionId": "persisted-edge",
+              "EdgeUpdateUrl": "https://updates.example.test/edge",
+              "FirefoxExtensionId": "persisted-firefox@example.test",
+              "FirefoxInstallUrl": "https://updates.example.test/firefox.xpi"
+            }
+            """;
+
+        var resolved = global::InstallerOptionResolver.ResolvePrimaryOptions(
+            [],
+            persistedJson,
+            legacyBrowserExtensionsInstalled: true,
+            legacyAutostartInstalled: true);
+
+        RegressionAssert.True(!resolved.InstallBrowserExtensions, "An ordinary rerun must preserve browser deployment opt-out.");
+        RegressionAssert.True(!resolved.Autostart, "An ordinary rerun must preserve autostart opt-out.");
+        RegressionAssert.True(resolved.EnablePrivateBrowsing, "An ordinary rerun must preserve the private browsing choice.");
+        RegressionAssert.Equal("persisted-chrome", resolved.ChromeExtensionId, "An ordinary rerun must preserve the custom Chrome ID.");
+        RegressionAssert.Equal("https://updates.example.test/firefox.xpi", resolved.FirefoxInstallUrl, "An ordinary rerun must preserve the custom Firefox URL.");
+    }
+
+    private static void ExplicitInstallerChoicesOverridePersistedChoices()
+    {
+        const string persistedJson = """
+            {
+              "SchemaVersion": 2,
+              "InstallBrowserExtensions": false,
+              "Autostart": false,
+              "PrivateBrowsingEnabled": true,
+              "ChromeExtensionId": "persisted-chrome",
+              "ChromeUpdateUrl": "https://updates.example.test/chrome",
+              "EdgeExtensionId": "persisted-edge",
+              "EdgeUpdateUrl": "https://updates.example.test/edge",
+              "FirefoxExtensionId": "persisted-firefox@example.test",
+              "FirefoxInstallUrl": "https://updates.example.test/firefox.xpi"
+            }
+            """;
+        string[] arguments =
+        [
+            "/browserextensions",
+            "/autostart",
+            "/disableprivatebrowsing",
+            "/ChromeExtensionId=explicit-chrome"
+        ];
+
+        var resolved = global::InstallerOptionResolver.ResolvePrimaryOptions(
+            arguments,
+            persistedJson,
+            legacyBrowserExtensionsInstalled: false,
+            legacyAutostartInstalled: false);
+
+        RegressionAssert.True(resolved.InstallBrowserExtensions, "An explicit browser deployment choice must override persisted opt-out.");
+        RegressionAssert.True(resolved.Autostart, "An explicit autostart choice must override persisted opt-out.");
+        RegressionAssert.True(!resolved.EnablePrivateBrowsing, "An explicit private browsing opt-out must override persisted opt-in.");
+        RegressionAssert.Equal("explicit-chrome", resolved.ChromeExtensionId, "An explicit Chrome ID must override the persisted ID.");
+        RegressionAssert.Equal("persisted-edge", resolved.EdgeExtensionId, "An unspecified Edge ID must remain persisted.");
+    }
+
+    private static void InteractiveInstallerChoicesOverridePersistedChoices()
+    {
+        const string persistedJson = """
+            {
+              "SchemaVersion": 2,
+              "InstallBrowserExtensions": true,
+              "Autostart": true,
+              "PrivateBrowsingEnabled": true
+            }
+            """;
+        var resolved = global::InstallerOptionResolver.ResolvePrimaryOptions(
+            [],
+            persistedJson,
+            legacyBrowserExtensionsInstalled: false,
+            legacyAutostartInstalled: false);
+
+        var interactive = global::InstallerOptionResolver.ApplyInteractiveChoices(
+            resolved,
+            installBrowserExtensions: false,
+            updateToLatestDuringInstall: false,
+            autostart: false,
+            enablePrivateBrowsing: false);
+
+        RegressionAssert.True(!interactive.InstallBrowserExtensions, "The GUI browser choice must override the persisted value.");
+        RegressionAssert.True(!interactive.UpdateToLatestDuringInstall, "The GUI update choice must override the parsed default.");
+        RegressionAssert.True(!interactive.Autostart, "The GUI autostart choice must override the persisted value.");
+        RegressionAssert.True(!interactive.EnablePrivateBrowsing, "The GUI private browsing choice must override the persisted value.");
     }
 
     private static void InstalledExecutableMatchingRequiresNormalizedFullPath()
@@ -2433,6 +2669,21 @@ internal static class RegressionAssert
 
         throw new RegressionAssertionException($"Expected {typeof(TException).Name} to be thrown.");
     }
+}
+
+internal sealed class FixedResponseHandler : HttpMessageHandler
+{
+    private readonly Func<HttpRequestMessage, HttpResponseMessage> createResponse;
+
+    internal FixedResponseHandler(Func<HttpRequestMessage, HttpResponseMessage> createResponse)
+    {
+        this.createResponse = createResponse;
+    }
+
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken) =>
+        Task.FromResult(createResponse(request));
 }
 
 internal sealed class PartialThenBlockingStream : Stream
