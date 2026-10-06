@@ -6,10 +6,14 @@
 // - send local hints to the tray app through native messaging.
 const NATIVE_HOST_NAME = "com.monitoraudiorouter.router";
 const SNAPSHOT_INTERVAL_MS = 1500;
+const sourceInstanceId = crypto.randomUUID();
 
 let nativeHostPort = null;
 let nativeHostReconnectTimer = null;
 let hasTriedProcessPermission = false;
+let snapshotRequested = false;
+let snapshotDrainPromise = null;
+let nextSnapshotSequence = 1;
 
 // Browser identity
 
@@ -213,16 +217,39 @@ async function collectAudibleWindows() {
 
 // Snapshot scheduling
 
-async function sendSnapshot() {
+function requestSnapshot() {
+  snapshotRequested = true;
+  if (snapshotDrainPromise === null) {
+    snapshotDrainPromise = drainSnapshotRequests();
+  }
+
+  return snapshotDrainPromise;
+}
+
+async function drainSnapshotRequests() {
   try {
-    postToNativeHost({
-      type: "audibleWindows",
-      browser: detectBrowserName(),
-      sentAt: Date.now(),
-      windows: await collectAudibleWindows()
-    });
-  } catch {
-    // The next scheduled pass will retry.
+    while (snapshotRequested) {
+      snapshotRequested = false;
+      try {
+        const windows = await collectAudibleWindows();
+        postToNativeHost({
+          type: "audibleWindows",
+          browser: detectBrowserName(),
+          sourceInstanceId,
+          sequence: nextSnapshotSequence,
+          sentAt: Date.now(),
+          windows
+        });
+        nextSnapshotSequence++;
+      } catch {
+        // A request that arrived during collection starts a fresh pass.
+      }
+    }
+  } finally {
+    snapshotDrainPromise = null;
+    if (snapshotRequested) {
+      requestSnapshot();
+    }
   }
 }
 
@@ -230,29 +257,29 @@ async function sendSnapshot() {
 
 function start() {
   connectNativeHost();
-  sendSnapshot();
-  setInterval(sendSnapshot, SNAPSHOT_INTERVAL_MS);
+  requestSnapshot();
+  setInterval(requestSnapshot, SNAPSHOT_INTERVAL_MS);
 
-  chrome.tabs.onUpdated.addListener(sendSnapshot);
-  chrome.tabs.onActivated.addListener(sendSnapshot);
-  chrome.tabs.onAttached.addListener(sendSnapshot);
-  chrome.tabs.onDetached.addListener(sendSnapshot);
-  chrome.tabs.onRemoved.addListener(sendSnapshot);
-  chrome.windows.onBoundsChanged.addListener(sendSnapshot);
-  chrome.windows.onRemoved.addListener(sendSnapshot);
+  chrome.tabs.onUpdated.addListener(requestSnapshot);
+  chrome.tabs.onActivated.addListener(requestSnapshot);
+  chrome.tabs.onAttached.addListener(requestSnapshot);
+  chrome.tabs.onDetached.addListener(requestSnapshot);
+  chrome.tabs.onRemoved.addListener(requestSnapshot);
+  chrome.windows.onBoundsChanged.addListener(requestSnapshot);
+  chrome.windows.onRemoved.addListener(requestSnapshot);
 
   chrome.action.onClicked.addListener(() => {
     // The unpacked developer build can request the optional processes
     // permission on click. Store packages strip this listener body and send
     // snapshots without asking.
     if (hasTriedProcessPermission || !chrome.permissions) {
-      sendSnapshot();
+      requestSnapshot();
       return;
     }
 
     hasTriedProcessPermission = true;
     chrome.permissions.request({ permissions: ["processes"] }, () => {
-      sendSnapshot();
+      requestSnapshot();
     });
   });
 }

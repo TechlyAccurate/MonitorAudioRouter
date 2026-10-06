@@ -9,6 +9,8 @@ internal static class Program
 {
     private const string PipeName = "MonitorAudioRouterHints";
     private const int TrayConnectTimeoutMs = 500;
+    private const int MaximumBrowserMessageBytes = 1024 * 1024;
+    private const int MaximumPipeMessageCharacters = (2 * MaximumBrowserMessageBytes) + 1024;
     private const string BrowserBridgeTokenFileName = "browser-bridge.token";
     private const string AppDataFolderName = "Monitor Audio Router";
     private static readonly TimeSpan InitialMessageTimeout = TimeSpan.FromSeconds(15);
@@ -52,7 +54,7 @@ internal static class Program
         }
 
         var length = BitConverter.ToInt32(lengthBytes, 0);
-        if (length <= 0 || length > 1024 * 1024)
+        if (length <= 0 || length > MaximumBrowserMessageBytes)
         {
             LogThrottled(
                 "native-host-rejected-length",
@@ -108,10 +110,20 @@ internal static class Program
     {
         try
         {
+            var envelope = BrowserBridgeSecurity.CreateEnvelope(json);
+            if (envelope.Length > MaximumPipeMessageCharacters)
+            {
+                LogThrottled(
+                    "native-host-rejected-envelope-length",
+                    $"Native host rejected pipe message length {envelope.Length}.",
+                    TimeSpan.FromMinutes(5));
+                return false;
+            }
+
             using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.Out);
             pipe.Connect(TrayConnectTimeoutMs);
             using var writer = new StreamWriter(pipe, new UTF8Encoding(false), 1024, leaveOpen: true) { AutoFlush = true };
-            writer.WriteLine(BrowserBridgeSecurity.CreateEnvelope(json));
+            writer.WriteLine(envelope);
             return true;
         }
         catch (TimeoutException)

@@ -71,7 +71,7 @@ $chromeBackground = $chromeBackground -replace '(?s)async function processIdsFor
 }
 
 async function collectAudibleWindows'
-$chromeBackground = $chromeBackground -replace '(?s)\r?\n  chrome\.action\.onClicked\.addListener\(\(\) => \{.*?\r?\n  \}\);\r?\n', "`n  chrome.action.onClicked.addListener(sendSnapshot);`n"
+$chromeBackground = $chromeBackground -replace '(?s)\r?\n  chrome\.action\.onClicked\.addListener\(\(\) => \{.*?\r?\n  \}\);\r?\n', "`n  chrome.action.onClicked.addListener(requestSnapshot);`n"
 $chromeBackground = $chromeBackground -replace "`r`n", "`n"
 [System.IO.File]::WriteAllText(
     (Join-Path $chromeBuild "background.js"),

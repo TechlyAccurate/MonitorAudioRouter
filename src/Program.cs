@@ -1836,6 +1836,8 @@ internal sealed class ScanScheduler : IDisposable
 internal sealed class BrowserHintServer : IDisposable
 {
     public const string PipeName = "MonitorAudioRouterHints";
+    private const int MaximumPipeMessageCharacters = (2 * 1024 * 1024) + 1024;
+    private static readonly TimeSpan PipeReadTimeout = TimeSpan.FromSeconds(5);
     private readonly Action<string> _requestBurst;
     private readonly CancellationTokenSource _cts = new();
     private Task? _task;
@@ -1862,31 +1864,32 @@ internal sealed class BrowserHintServer : IDisposable
                     PipeDirection.In,
                     4,
                     PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous);
+                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
                 await pipe.WaitForConnectionAsync(token);
                 using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
-                while (!token.IsCancellationRequested && pipe.IsConnected)
+                var line = await ReadBoundedLineAsync(
+                    reader,
+                    MaximumPipeMessageCharacters,
+                    PipeReadTimeout,
+                    token);
+                if (line is null)
                 {
-                    var line = await reader.ReadLineAsync(token);
-                    if (line is null)
-                    {
-                        break;
-                    }
+                    continue;
+                }
 
-                    var payload = BrowserBridgeSecurity.TryUnwrap(line);
-                    if (payload is null)
-                    {
-                        Log.WriteThrottled(
-                            "browser-hint-invalid-token",
-                            "Rejected browser hint: invalid native-host bridge token.",
-                            TimeSpan.FromMinutes(5));
-                        continue;
-                    }
+                var payload = BrowserBridgeSecurity.TryUnwrap(line);
+                if (payload is null)
+                {
+                    Log.WriteThrottled(
+                        "browser-hint-invalid-token",
+                        "Rejected browser hint: invalid native-host bridge token.",
+                        TimeSpan.FromMinutes(5));
+                    continue;
+                }
 
-                    if (BrowserHintStore.ApplyJson(payload))
-                    {
-                        requestBurst("browser hint");
-                    }
+                if (BrowserHintStore.ApplyJson(payload))
+                {
+                    requestBurst("browser hint");
                 }
             }
             catch (OperationCanceledException)
@@ -1898,6 +1901,75 @@ internal sealed class BrowserHintServer : IDisposable
                 Log.Write($"Browser hint server error: {exception.Message}");
                 await Task.Delay(1000, token).ContinueWith(_ => { }, TaskScheduler.Default);
             }
+        }
+    }
+
+    internal static async Task<string?> ReadBoundedLineAsync(
+        StreamReader reader,
+        int maximumCharacters,
+        TimeSpan timeout,
+        CancellationToken token)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        if (maximumCharacters <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maximumCharacters));
+        }
+
+        if (timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout));
+        }
+
+        using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeoutSource.CancelAfter(timeout);
+        var result = new StringBuilder(Math.Min(maximumCharacters, 4096));
+        var buffer = new char[1024];
+        try
+        {
+            while (true)
+            {
+                var remainingCharacters = maximumCharacters - result.Length;
+                var charactersToRead = Math.Min(buffer.Length, remainingCharacters + 1);
+                var charactersRead = await reader.ReadAsync(
+                    buffer.AsMemory(0, charactersToRead),
+                    timeoutSource.Token);
+                if (charactersRead == 0)
+                {
+                    if (result.Length == 0)
+                    {
+                        return null;
+                    }
+
+                    throw new EndOfStreamException(
+                        "Browser hint pipe message ended before the line terminator.");
+                }
+
+                for (var index = 0; index < charactersRead; index++)
+                {
+                    var character = buffer[index];
+                    if (character == '\n')
+                    {
+                        if (result.Length > 0 && result[^1] == '\r')
+                        {
+                            result.Length--;
+                        }
+
+                        return result.ToString();
+                    }
+
+                    result.Append(character);
+                    if (result.Length > maximumCharacters)
+                    {
+                        throw new InvalidDataException(
+                            $"Browser hint pipe message exceeded the maximum of {maximumCharacters} characters.");
+                    }
+                }
+            }
+        }
+        catch (OperationCanceledException) when (!token.IsCancellationRequested)
+        {
+            throw new TimeoutException("Browser hint pipe message did not complete before the read timeout.");
         }
     }
 
@@ -2082,8 +2154,10 @@ internal static class BrowserHintStore
     private const int MaxProcessIdsPerWindow = 32;
     private const int MaxTitlesPerWindow = 16;
     private const int MaxTitleChars = 256;
+    private const int MaxSourceInstanceIdChars = 128;
     private static readonly object LockObject = new();
     private static readonly Dictionary<string, BrowserHintSet> HintsByProcess = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, long> HighestSequenceBySource = new(StringComparer.Ordinal);
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
     private static readonly Dictionary<string, string> LastLoggedHintSignatures = new(StringComparer.OrdinalIgnoreCase);
 
@@ -2099,6 +2173,20 @@ internal static class BrowserHintStore
 
             var processName = BrowserToProcessName(update.Browser);
             if (processName is null)
+            {
+                return false;
+            }
+
+            var hasSourceInstanceId = !string.IsNullOrWhiteSpace(update.SourceInstanceId);
+            var hasSequence = update.Sequence.HasValue;
+            if (hasSourceInstanceId != hasSequence)
+            {
+                return false;
+            }
+
+            var sourceInstanceId = hasSourceInstanceId ? update.SourceInstanceId!.Trim() : null;
+            if (sourceInstanceId is not null &&
+                (sourceInstanceId.Length > MaxSourceInstanceIdChars || update.Sequence <= 0))
             {
                 return false;
             }
@@ -2133,13 +2221,25 @@ internal static class BrowserHintStore
             int? preferredWindowId;
             lock (LockObject)
             {
+                var now = DateTimeOffset.UtcNow;
+                if (sourceInstanceId is not null &&
+                    HighestSequenceBySource.TryGetValue(sourceInstanceId, out var highestSequence) &&
+                    update.Sequence <= highestSequence)
+                {
+                    return false;
+                }
+
                 HintsByProcess.TryGetValue(processName, out var previous);
                 preferredWindowId = DeterminePreferredWindowId(previous, windows);
                 HintsByProcess[processName] = new BrowserHintSet(
                     processName,
-                    DateTimeOffset.UtcNow,
+                    now,
                     windows,
                     preferredWindowId);
+                if (sourceInstanceId is not null)
+                {
+                    HighestSequenceBySource[sourceInstanceId] = update.Sequence!.Value;
+                }
             }
 
             var changed = LogHintIfChanged(processName, windows, preferredWindowId);
@@ -2216,6 +2316,15 @@ internal static class BrowserHintStore
                processName.Equals("vivaldi.exe", StringComparison.OrdinalIgnoreCase);
     }
 
+    internal static bool IsAdvisoryProcessMatch(
+        string expectedProcessName,
+        string actualProcessName,
+        bool ownsRelevantAudioSession)
+    {
+        return ownsRelevantAudioSession &&
+               actualProcessName.Equals(expectedProcessName, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static int? DeterminePreferredWindowId(
         BrowserHintSet? previous,
         List<BrowserHintWindow> windows)
@@ -2263,7 +2372,7 @@ internal static class BrowserHintStore
             .Select(hintWindow =>
             {
                 var monitor = WindowInspector.PickMonitor(hintWindow.Bounds, monitors);
-                return $"id={hintWindow.WindowId};{ShortBounds(hintWindow.Bounds)}>{monitor.BoundsKey};processIds={CompactProcessIdList(hintWindow.ProcessIds)};tabs={hintWindow.Titles.Count};active={hintWindow.WindowTitles.Count};titles={CompactTitleSignature(hintWindow)}";
+                return $"id={hintWindow.WindowId};{ShortBounds(hintWindow.Bounds)}>{monitor.BoundsKey};processIds={CompactProcessIdList(hintWindow.ProcessIds)};tabs={hintWindow.Titles.Count};active={hintWindow.WindowTitles.Count};{CreateTitleDiagnostic(hintWindow.Titles.Concat(hintWindow.WindowTitles))}";
             });
         var signature = $"{processName}|preferred={preferredWindowId?.ToString() ?? "none"}|{string.Join("|", signatureParts)}";
         lock (LockObject)
@@ -2280,8 +2389,8 @@ internal static class BrowserHintStore
         var summary = string.Join("; ", windows.Select((hintWindow, index) =>
         {
             var monitor = WindowInspector.PickMonitor(hintWindow.Bounds, monitors);
-            var activeTitle = hintWindow.WindowTitles.FirstOrDefault() ?? hintWindow.Titles.FirstOrDefault() ?? "";
-            return $"w{index + 1}@{ShortMonitor(monitor)} bounds={ShortBounds(hintWindow.Bounds)} processIds={CompactProcessIdList(hintWindow.ProcessIds)} tabs={hintWindow.Titles.Count} active=\"{ShortLogValue(activeTitle)}\"";
+            var titleDiagnostic = CreateTitleDiagnostic(hintWindow.Titles.Concat(hintWindow.WindowTitles));
+            return $"w{index + 1}@{ShortMonitor(monitor)} bounds={ShortBounds(hintWindow.Bounds)} processIds={CompactProcessIdList(hintWindow.ProcessIds)} tabs={hintWindow.Titles.Count} {titleDiagnostic}";
         }));
         Log.Write(
             $"Browser hint: {processName} windows={windows.Count} preferred={preferredWindowId?.ToString() ?? "none"}" +
@@ -2355,17 +2464,6 @@ internal static class BrowserHintStore
         return title.Length <= MaxTitleChars ? title : title[..MaxTitleChars];
     }
 
-    private static string ShortLogValue(string value)
-    {
-        value = value
-            .Replace("|", " ")
-            .Replace(";", " ")
-            .Replace("\"", "'")
-            .Replace("\r", " ")
-            .Replace("\n", " ");
-        return value.Length <= 40 ? value : value[..40] + "...";
-    }
-
     private static string ShortError(string value)
     {
         value = value.Replace("\r", " ").Replace("\n", " ");
@@ -2403,22 +2501,23 @@ internal static class BrowserHintStore
             : string.Join(",", visibleProcessIds) + $"+{processIds.Count - 3}";
     }
 
-    private static string CompactTitleSignature(BrowserHintWindow window)
+    internal static string CreateTitleDiagnostic(IEnumerable<string> titles)
     {
-        var joined = string.Join(
-            "\u001F",
-            window.Titles
-                .Concat(window.WindowTitles)
-                .Select(NormalizeTitle)
-                .Where(title => title.Length > 0)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(title => title, StringComparer.OrdinalIgnoreCase));
-        if (joined.Length == 0)
+        var normalizedTitles = titles
+            .Select(NormalizeTitle)
+            .Where(title => title.Length > 0)
+            .GroupBy(title => title, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.OrderBy(title => title, StringComparer.Ordinal).First())
+            .OrderBy(title => title, StringComparer.Ordinal)
+            .ToList();
+        if (normalizedTitles.Count == 0)
         {
-            return "none";
+            return "titleCount=0 titleHash=none";
         }
 
-        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(joined)))[..10].ToLowerInvariant();
+        var joined = string.Join("\u001F", normalizedTitles);
+        var signature = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(joined)))[..10].ToLowerInvariant();
+        return $"titleCount={normalizedTitles.Count} titleHash={signature}";
     }
 
 }
@@ -2427,6 +2526,8 @@ internal sealed class BrowserHintUpdate
 {
     public string? Type { get; set; }
     public string? Browser { get; set; }
+    public string? SourceInstanceId { get; set; }
+    public long? Sequence { get; set; }
     public List<BrowserHintWindowUpdate>? Windows { get; set; }
 }
 
@@ -3632,15 +3733,11 @@ internal sealed class RoutingEngine : IDisposable
             return;
         }
 
-        static string ShortTitle(string title)
-        {
-            title = title.Replace("|", " ").Replace(Environment.NewLine, " ");
-            return title.Length <= 60 ? title : title[..60] + "...";
-        }
-
         var browserWindows = windows
             .Where(window => BrowserHintStore.IsBrowserProcessName(window.ProcessName))
-            .Select(window => $"{window.ProcessId}@{window.Monitor.BoundsKey}:{ShortTitle(window.Title)}");
+            .Select(window =>
+                $"{window.ProcessId}@{window.Monitor.BoundsKey}:" +
+                BrowserHintStore.CreateTitleDiagnostic(new[] { window.Title }).Replace(' ', ';'));
         var hintSummary = hints.Values.Select(hintSet => $"{hintSet.ProcessName}:{hintSet.Windows.Count}");
         var targetSummary = targets.Values.Select(target => $"{target.ProcessId}->{target.Endpoint?.Name ?? "<none>"}@{target.Monitor.BoundsKey}");
         var signature =
@@ -3667,21 +3764,34 @@ internal sealed class RoutingEngine : IDisposable
         List<WindowInfo> windows,
         List<AudioEndpoint> endpoints)
     {
-        // Browser-provided PIDs are trusted only when Windows also reports an
-        // active audio session for that PID. If the extension cannot provide a
-        // usable PID, the fallback is a single active browser audio session plus
-        // one audible browser window.
+        // Browser-provided PIDs are trusted only when Windows also reports a
+        // relevant audio session for that PID. If the extension cannot provide
+        // a usable PID, the fallback is a single matching browser audio session
+        // plus one audible browser window.
         var monitors = WindowInspector.GetMonitors();
         foreach (var hintSet in hints.Values)
         {
-            var usableExplicitProcessIds = hintSet.Windows
+            var usableExplicitProcesses = hintSet.Windows
                 .SelectMany(window => window.ProcessIds)
-                .Where(audioSessionProcessIds.Contains)
-                .ToHashSet();
+                .Distinct()
+                .Select(processId => new
+                {
+                    OwnsRelevantAudioSession = audioSessionProcessIds.Contains(processId),
+                    Process = GetProcessInfo(processId)
+                })
+                .Where(candidate =>
+                    candidate.Process is not null &&
+                    BrowserHintStore.IsAdvisoryProcessMatch(
+                        hintSet.ProcessName,
+                        candidate.Process.Value.ProcessName,
+                        candidate.OwnsRelevantAudioSession) &&
+                    IsAllowedProcessName(candidate.Process.Value.ProcessName))
+                .Select(candidate => candidate.Process!.Value)
+                .ToDictionary(process => process.ProcessId);
             var routeWindows = hintSet.Windows;
             if (hintSet.PreferredWindowId is int preferredWindowId &&
                 hintSet.Windows.Count > 1 &&
-                usableExplicitProcessIds.Count == 0)
+                usableExplicitProcesses.Count == 0)
             {
                 var preferredWindows = hintSet.Windows
                     .Where(window => window.WindowId == preferredWindowId)
@@ -3722,19 +3832,13 @@ internal sealed class RoutingEngine : IDisposable
                 var matchedExplicitProcessIds = 0;
                 foreach (var processId in hintWindow.ProcessIds.Distinct())
                 {
-                    if (!audioSessionProcessIds.Contains(processId))
-                    {
-                        continue;
-                    }
-
-                    var process = GetProcessInfo(processId);
-                    if (process is null || !IsAllowedProcessName(process.Value.ProcessName))
+                    if (!usableExplicitProcesses.TryGetValue(processId, out var process))
                     {
                         continue;
                     }
 
                     matchedExplicitProcessIds++;
-                    AddRouteTarget(targets, ambiguousProcessIds, new ProcessRouteTarget(processId, process.Value.ProcessName, process.Value.StartUtc, monitor, endpoint));
+                    AddRouteTarget(targets, ambiguousProcessIds, new ProcessRouteTarget(processId, process.ProcessName, process.StartUtc, monitor, endpoint));
                     authoritativeHintProcessIds.Add(processId);
                 }
 

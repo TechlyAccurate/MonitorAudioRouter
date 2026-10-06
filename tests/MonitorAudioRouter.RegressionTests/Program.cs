@@ -1,4 +1,7 @@
 using System.Globalization;
+using System.Reflection;
+using System.Text;
+using System.Text.Json;
 
 namespace MonitorAudioRouter.RegressionTests;
 
@@ -33,6 +36,15 @@ internal static class Program
         runner.Add("Conflicting explicit role endpoints produce Unavailable", ConflictingExplicitRoleEndpointsProduceUnavailable);
         runner.Add("Different explicit clear readback reports ownership loss", DifferentExplicitClearReadbackReportsOwnershipLoss);
         runner.Add("Verified legacy ownership migrates and clears through engine cleanup", VerifiedLegacyOwnershipMigratesAndClearsThroughEngineCleanup);
+        runner.Add("Older browser hints from the same source are rejected", OlderBrowserHintsFromSameSourceAreRejected);
+        runner.Add("A restarted browser hint source may begin at sequence one", RestartedBrowserHintSourceMayBeginAtOne);
+        runner.Add("Browser hint source sequences remain independent", BrowserHintSourceSequencesRemainIndependent);
+        runner.Add("Legacy browser hints remain accepted during rollout", LegacyBrowserHintsRemainAccepted);
+        runner.Add("A Firefox hint cannot claim a Chrome PID", FirefoxHintCannotClaimChromePid);
+        runner.Add("Browser title diagnostics never contain raw titles", BrowserTitleDiagnosticsNeverContainRawTitles);
+        runner.Add("Oversized browser pipe lines fail before processing", OversizedBrowserPipeLinesFail);
+        runner.Add("Disconnected partial browser pipe lines fail before processing", DisconnectedPartialBrowserPipeLinesFail);
+        runner.Add("A timed-out partial browser pipe line changes no hint state", TimedOutPartialBrowserPipeLineChangesNoState);
 
         var result = runner.RunAll();
         Console.WriteLine($"C# regression tests passed: {result.Passed}/{result.Total}.");
@@ -678,6 +690,187 @@ internal static class Program
         RegressionAssert.Equal(0, state.Managed.Count, "Verified default readback should remove the migrated ownership record.");
     }
 
+    private static void OlderBrowserHintsFromSameSourceAreRejected()
+    {
+        var sourceInstanceId = "ordering-" + Guid.NewGuid().ToString("N");
+        var newestAccepted = global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("chrome", sourceInstanceId, 2, windowId: 301, left: 200));
+        var staleAccepted = global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("chrome", sourceInstanceId, 1, windowId: 301, left: 100));
+        var snapshot = global::MonitorAudioRouter.BrowserHintStore.GetSnapshot();
+
+        RegressionAssert.True(newestAccepted, "The newest source sequence should be accepted.");
+        RegressionAssert.True(!staleAccepted, "An older sequence from the same source must be rejected.");
+        RegressionAssert.Equal(200, snapshot["chrome.exe"].Windows.Single().Bounds.Left, "A stale hint must not replace accepted state.");
+    }
+
+    private static void RestartedBrowserHintSourceMayBeginAtOne()
+    {
+        RegressionAssert.True(
+            typeof(global::MonitorAudioRouter.BrowserHintUpdate).GetProperty("SourceInstanceId") is not null &&
+            typeof(global::MonitorAudioRouter.BrowserHintUpdate).GetProperty("Sequence") is not null,
+            "The compatible browser hint contract should expose source ordering fields.");
+
+        var firstSource = "restart-old-" + Guid.NewGuid().ToString("N");
+        var restartedSource = "restart-new-" + Guid.NewGuid().ToString("N");
+        global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("edge", firstSource, 99, windowId: 302, left: 990));
+
+        var restartedAccepted = global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("edge", restartedSource, 1, windowId: 302, left: 10));
+        var snapshot = global::MonitorAudioRouter.BrowserHintStore.GetSnapshot();
+
+        RegressionAssert.True(restartedAccepted, "A new source instance should be allowed to restart at sequence one.");
+        RegressionAssert.Equal(10, snapshot["msedge.exe"].Windows.Single().Bounds.Left, "The restarted source should update browser hints.");
+    }
+
+    private static void BrowserHintSourceSequencesRemainIndependent()
+    {
+        var firstSource = "independent-a-" + Guid.NewGuid().ToString("N");
+        var secondSource = "independent-b-" + Guid.NewGuid().ToString("N");
+        global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("firefox", firstSource, 5, windowId: 303, left: 50));
+
+        var secondAccepted = global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("firefox", secondSource, 1, windowId: 303, left: 10));
+        var staleFirstAccepted = global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("firefox", firstSource, 4, windowId: 303, left: 40));
+        var snapshot = global::MonitorAudioRouter.BrowserHintStore.GetSnapshot();
+
+        RegressionAssert.True(secondAccepted, "A second source's sequence one should be independent of the first source.");
+        RegressionAssert.True(!staleFirstAccepted, "The first source must still reject its own older sequence.");
+        RegressionAssert.Equal(10, snapshot["firefox.exe"].Windows.Single().Bounds.Left, "Rejecting one source must preserve the independently accepted state.");
+    }
+
+    private static void LegacyBrowserHintsRemainAccepted()
+    {
+        var accepted = global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("chrome", sourceInstanceId: null, sequence: null, windowId: 304, left: 304));
+        var snapshot = global::MonitorAudioRouter.BrowserHintStore.GetSnapshot();
+
+        RegressionAssert.True(accepted, "A legacy hint without ordering fields should remain accepted during store rollout.");
+        RegressionAssert.Equal(304, snapshot["chrome.exe"].Windows.Single().Bounds.Left, "The legacy hint should update browser state.");
+    }
+
+    private static void FirefoxHintCannotClaimChromePid()
+    {
+        var method = RequireStaticMethod(
+            typeof(global::MonitorAudioRouter.BrowserHintStore),
+            "IsAdvisoryProcessMatch");
+        var matches = (bool)method.Invoke(null, new object[] { "firefox.exe", "chrome.exe", true })!;
+
+        RegressionAssert.True(!matches, "An active Chrome audio-session PID must not satisfy a Firefox hint.");
+    }
+
+    private static void BrowserTitleDiagnosticsNeverContainRawTitles()
+    {
+        const string privateTitle = "Private diagnostic title";
+        var method = RequireStaticMethod(
+            typeof(global::MonitorAudioRouter.BrowserHintStore),
+            "CreateTitleDiagnostic");
+        var diagnostic = (string)method.Invoke(null, new object[] { new[] { privateTitle } })!;
+        var firstCaseOrder = (string)method.Invoke(null, new object[] { new[] { "Case title", "case title" } })!;
+        var secondCaseOrder = (string)method.Invoke(null, new object[] { new[] { "case title", "Case title" } })!;
+
+        RegressionAssert.Equal("titleCount=1 titleHash=999f6f0562", diagnostic, "Title diagnostics should use a short deterministic SHA-256 signature.");
+        RegressionAssert.True(!diagnostic.Contains(privateTitle, StringComparison.Ordinal), "Diagnostics must never contain a raw browser title.");
+        RegressionAssert.Equal(firstCaseOrder, secondCaseOrder, "Case-insensitive duplicate titles should have an order-independent signature.");
+    }
+
+    private static void OversizedBrowserPipeLinesFail()
+    {
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes("123456789\n"));
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+
+        var exception = RegressionAssert.Throws<InvalidDataException>(() =>
+            InvokeBoundedBrowserLineRead(reader, maximumCharacters: 8, TimeSpan.FromSeconds(1)));
+
+        RegressionAssert.Contains("maximum", exception.Message, "The oversized-line failure should identify the enforced boundary.");
+    }
+
+    private static void DisconnectedPartialBrowserPipeLinesFail()
+    {
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes("partial"));
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+
+        var exception = RegressionAssert.Throws<EndOfStreamException>(() =>
+            InvokeBoundedBrowserLineRead(reader, maximumCharacters: 128, TimeSpan.FromSeconds(1)));
+
+        RegressionAssert.Contains("terminator", exception.Message, "The incomplete-line failure should identify the missing terminator.");
+    }
+
+    private static void TimedOutPartialBrowserPipeLineChangesNoState()
+    {
+        const string browser = "edge";
+        var sourceInstanceId = "partial-line-" + Guid.NewGuid().ToString("N");
+        global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson(browser, sourceInstanceId, 1, windowId: 305, left: 305));
+        var before = global::MonitorAudioRouter.BrowserHintStore.GetSnapshot()["msedge.exe"];
+        using var stream = new PartialThenBlockingStream(Encoding.UTF8.GetBytes("{\"type\":\"audibleWindows\""));
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+
+        RegressionAssert.Throws<TimeoutException>(() =>
+            InvokeBoundedBrowserLineRead(reader, maximumCharacters: 128, TimeSpan.FromMilliseconds(25)));
+        var after = global::MonitorAudioRouter.BrowserHintStore.GetSnapshot()["msedge.exe"];
+
+        RegressionAssert.True(ReferenceEquals(before, after), "A partial timed-out line must not replace browser hint state.");
+    }
+
+    private static string CreateBrowserHintJson(
+        string browser,
+        string? sourceInstanceId,
+        long? sequence,
+        int windowId,
+        int left)
+    {
+        return JsonSerializer.Serialize(new
+        {
+            type = "audibleWindows",
+            browser,
+            sourceInstanceId,
+            sequence,
+            windows = new[]
+            {
+                new
+                {
+                    windowId,
+                    left,
+                    top = 0,
+                    width = 800,
+                    height = 600,
+                    processIds = Array.Empty<int>(),
+                    titles = new[] { $"hint-{windowId}-{left}" },
+                    windowTitles = Array.Empty<string>()
+                }
+            }
+        });
+    }
+
+    private static MethodInfo RequireStaticMethod(Type type, string methodName)
+    {
+        var method = type.GetMethod(methodName, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        if (method is null)
+        {
+            throw new RegressionAssertionException($"Expected {type.Name}.{methodName} to exist.");
+        }
+
+        return method;
+    }
+
+    private static string? InvokeBoundedBrowserLineRead(
+        StreamReader reader,
+        int maximumCharacters,
+        TimeSpan timeout)
+    {
+        var method = RequireStaticMethod(
+            typeof(global::MonitorAudioRouter.BrowserHintServer),
+            "ReadBoundedLineAsync");
+        var task = (Task<string?>)method.Invoke(
+            null,
+            new object[] { reader, maximumCharacters, timeout, CancellationToken.None })!;
+        return task.GetAwaiter().GetResult();
+    }
+
     private static global::MonitorAudioRouter.ProcessRouteTarget CreateTarget(
         int processId,
         string processName,
@@ -869,6 +1062,97 @@ internal static class RegressionAssert
             throw new RegressionAssertionException($"{message} Missing text: {expectedSubstring}.");
         }
     }
+
+    internal static TException Throws<TException>(Action action)
+        where TException : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (TException exception)
+        {
+            return exception;
+        }
+
+        throw new RegressionAssertionException($"Expected {typeof(TException).Name} to be thrown.");
+    }
+}
+
+internal sealed class PartialThenBlockingStream : Stream
+{
+    private readonly byte[] prefix;
+    private int offset;
+
+    internal PartialThenBlockingStream(byte[] prefix)
+    {
+        this.prefix = prefix;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position
+    {
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
+    }
+
+    public override int Read(byte[] buffer, int bufferOffset, int count)
+    {
+        return ReadPrefix(buffer.AsSpan(bufferOffset, count));
+    }
+
+    public override Task<int> ReadAsync(
+        byte[] buffer,
+        int bufferOffset,
+        int count,
+        CancellationToken cancellationToken)
+    {
+        var bytesRead = ReadPrefix(buffer.AsSpan(bufferOffset, count));
+        return bytesRead > 0
+            ? Task.FromResult(bytesRead)
+            : WaitForCancellationAsync(cancellationToken);
+    }
+
+    public override ValueTask<int> ReadAsync(
+        Memory<byte> buffer,
+        CancellationToken cancellationToken = default)
+    {
+        var bytesRead = ReadPrefix(buffer.Span);
+        return bytesRead > 0
+            ? ValueTask.FromResult(bytesRead)
+            : new ValueTask<int>(WaitForCancellationAsync(cancellationToken));
+    }
+
+    private int ReadPrefix(Span<byte> destination)
+    {
+        var bytesRemaining = prefix.Length - offset;
+        if (bytesRemaining <= 0)
+        {
+            return 0;
+        }
+
+        var bytesToCopy = Math.Min(bytesRemaining, destination.Length);
+        prefix.AsSpan(offset, bytesToCopy).CopyTo(destination);
+        offset += bytesToCopy;
+        return bytesToCopy;
+    }
+
+    private static async Task<int> WaitForCancellationAsync(CancellationToken cancellationToken)
+    {
+        await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        return 0;
+    }
+
+    public override void Flush()
+    {
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 }
 
 internal sealed class RegressionAssertionException : Exception

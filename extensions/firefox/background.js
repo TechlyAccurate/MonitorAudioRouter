@@ -6,9 +6,13 @@
 // - let the Windows tray app decide and apply audio routes.
 const NATIVE_HOST_NAME = "com.monitoraudiorouter.router";
 const SNAPSHOT_INTERVAL_MS = 1500;
+const sourceInstanceId = crypto.randomUUID();
 
 let nativeHostPort = null;
 let nativeHostReconnectTimer = null;
+let snapshotRequested = false;
+let snapshotDrainPromise = null;
+let nextSnapshotSequence = 1;
 
 // Native messaging connection
 
@@ -125,33 +129,56 @@ async function collectAudibleWindows() {
 
 // Snapshot scheduling
 
-async function sendSnapshot() {
+function requestSnapshot() {
+  snapshotRequested = true;
+  if (snapshotDrainPromise === null) {
+    snapshotDrainPromise = drainSnapshotRequests();
+  }
+
+  return snapshotDrainPromise;
+}
+
+async function drainSnapshotRequests() {
   try {
-    postToNativeHost({
-      type: "audibleWindows",
-      browser: "firefox",
-      sentAt: Date.now(),
-      windows: await collectAudibleWindows()
-    });
-  } catch {
-    // The next scheduled pass will retry.
+    while (snapshotRequested) {
+      snapshotRequested = false;
+      try {
+        const windows = await collectAudibleWindows();
+        postToNativeHost({
+          type: "audibleWindows",
+          browser: "firefox",
+          sourceInstanceId,
+          sequence: nextSnapshotSequence,
+          sentAt: Date.now(),
+          windows
+        });
+        nextSnapshotSequence++;
+      } catch {
+        // A request that arrived during collection starts a fresh pass.
+      }
+    }
+  } finally {
+    snapshotDrainPromise = null;
+    if (snapshotRequested) {
+      requestSnapshot();
+    }
   }
 }
 
 function sendSnapshotBurst() {
   // A tab move or pause/play handoff can produce short-lived stale browser
   // state, so send a small burst instead of waiting for the passive interval.
-  sendSnapshot();
-  setTimeout(sendSnapshot, 150);
-  setTimeout(sendSnapshot, 750);
+  requestSnapshot();
+  setTimeout(requestSnapshot, 150);
+  setTimeout(requestSnapshot, 750);
 }
 
 // Extension entry point
 
 function start() {
   connectNativeHost();
-  sendSnapshot();
-  setInterval(sendSnapshot, SNAPSHOT_INTERVAL_MS);
+  requestSnapshot();
+  setInterval(requestSnapshot, SNAPSHOT_INTERVAL_MS);
 
   browser.tabs.onUpdated.addListener(sendSnapshotBurst);
   browser.tabs.onActivated.addListener(sendSnapshotBurst);
