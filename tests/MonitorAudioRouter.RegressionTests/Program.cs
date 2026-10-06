@@ -16,12 +16,17 @@ internal static class Program
         runner.Add("Installer update arguments preserve every installed option", InstallerUpdateArgumentsPreserveEveryInstalledOption);
         runner.Add("Legacy install information remains readable", LegacyInstallInformationRemainsReadable);
         runner.Add("Installed executable matching requires a normalized full path", InstalledExecutableMatchingRequiresNormalizedFullPath);
+        runner.Add("Installer process discovery queries only installed executable names", InstallerProcessDiscoveryQueriesOnlyInstalledNames);
         runner.Add("Changed registry values are retained during uninstall", ChangedRegistryValuesAreRetainedDuringUninstall);
         runner.Add("Unchanged installer registry values restore their predecessor", UnchangedInstallerRegistryValuesRestoreTheirPredecessor);
         runner.Add("Unchanged new installer registry values are deleted", UnchangedNewInstallerRegistryValuesAreDeleted);
         runner.Add("Registry ownership across update keeps the original predecessor", RegistryOwnershipAcrossUpdateKeepsOriginalPredecessor);
-        runner.Add("Failed staging cannot select replacement", FailedStagingCannotSelectReplacement);
-        runner.Add("Failed replacement selects rollback", FailedReplacementSelectsRollback);
+        runner.Add(
+            "Post-replacement failure restores registry shortcut and configuration state",
+            PostReplacementFailureRestoresExternalState);
+        runner.Add(
+            "Legacy browser ownership survives migration with deployment disabled",
+            LegacyBrowserOwnershipSurvivesDisabledMigration);
         runner.Add("Replacement paths must stay inside their bounded root", ReplacementPathsMustStayInsideBoundedRoot);
         runner.Add("Updater accepts only expected HTTPS GitHub release hosts", UpdaterAcceptsOnlyExpectedHttpsGitHubReleaseHosts);
         runner.Add("Updater rejects a reparse-point download directory", UpdaterRejectsReparsePointDownloadDirectory);
@@ -191,6 +196,25 @@ internal static class Program
             "A same-named executable outside the install root must not match.");
     }
 
+    private static void InstallerProcessDiscoveryQueriesOnlyInstalledNames()
+    {
+        var queriedNames = new List<string>();
+
+        var candidates = global::MonitorAudioRouter.Setup.InstallDecisions
+            .EnumerateInstalledProcessCandidates(name =>
+            {
+                queriedNames.Add(name);
+                return new[] { name + "-candidate" };
+            })
+            .ToArray();
+
+        RegressionAssert.Equal(
+            "MonitorAudioRouter|MonitorAudioRouterNativeHost",
+            string.Join('|', queriedNames),
+            "Process discovery must query only the two installed executable names.");
+        RegressionAssert.Equal(2, candidates.Length, "Both exact-name candidate sets should be returned.");
+    }
+
     private static void ChangedRegistryValuesAreRetainedDuringUninstall()
     {
         var ownership = CreateRegistryOwnership(priorExists: true, priorValue: "before", writtenValue: "installed");
@@ -268,28 +292,104 @@ internal static class Program
             JsonPropertyName: null);
     }
 
-    private static void FailedStagingCannotSelectReplacement()
+    private static void PostReplacementFailureRestoresExternalState()
     {
-        var action = global::MonitorAudioRouter.Setup.InstallDecisions.SelectReplacementAction(
-            stagingValidated: false,
-            replacementSucceeded: false);
+        var temporaryDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "MonitorAudioRouter.RegressionTests",
+            Guid.NewGuid().ToString("N"));
+        var shortcutPath = Path.Combine(temporaryDirectory, "Monitor Audio Router.lnk");
+        var configurationPath = Path.Combine(temporaryDirectory, "config.json");
+        Directory.CreateDirectory(temporaryDirectory);
+        File.WriteAllText(shortcutPath, "prior-shortcut", Encoding.UTF8);
+        File.WriteAllText(configurationPath, "{\"AutostartEnabled\":false}", Encoding.UTF8);
+        var registryValue = "prior-registry";
+        var registryWriteObserved = false;
 
-        RegressionAssert.Equal(
-            global::MonitorAudioRouter.Setup.ReplacementAction.Abort,
-            action,
-            "An invalid stage must never be selected for replacement.");
+        try
+        {
+            using var transaction = new global::MonitorAudioRouter.Setup.InstallerStateTransaction(
+                (kind, _) =>
+                {
+                    if (kind == global::MonitorAudioRouter.Setup.InstallerMutationKind.UserConfiguration)
+                    {
+                        throw new InvalidOperationException("Injected post-replacement failure.");
+                    }
+                });
+            var shortcutSnapshot = global::MonitorAudioRouter.Setup.FileStateSnapshot.Capture(shortcutPath);
+            var configurationSnapshot = global::MonitorAudioRouter.Setup.FileStateSnapshot.Capture(configurationPath);
+
+            try
+            {
+                transaction.Apply(
+                    global::MonitorAudioRouter.Setup.InstallerMutationKind.Registry,
+                    () =>
+                    {
+                        registryValue = "installer-registry";
+                        registryWriteObserved = true;
+                    },
+                    () => registryValue = "prior-registry");
+                transaction.Apply(
+                    global::MonitorAudioRouter.Setup.InstallerMutationKind.StartMenuShortcut,
+                    () => File.WriteAllText(shortcutPath, "installer-shortcut", Encoding.UTF8),
+                    () => shortcutSnapshot.Restore(shortcutPath));
+                transaction.Apply(
+                    global::MonitorAudioRouter.Setup.InstallerMutationKind.UserConfiguration,
+                    () => File.WriteAllText(configurationPath, "{\"AutostartEnabled\":true}", Encoding.UTF8),
+                    () => configurationSnapshot.Restore(configurationPath));
+                transaction.Commit();
+                throw new RegressionAssertionException("The deterministic failure injection did not run.");
+            }
+            catch (InvalidOperationException exception)
+            {
+                RegressionAssert.Contains("Injected post-replacement failure", exception.Message, "The expected failure should escape the production transaction path.");
+                transaction.RollBack();
+            }
+
+            RegressionAssert.True(registryWriteObserved, "Failure injection must occur after a registry write.");
+            RegressionAssert.Equal("prior-registry", registryValue, "Registry state must return to its predecessor.");
+            RegressionAssert.Equal("prior-shortcut", File.ReadAllText(shortcutPath, Encoding.UTF8), "The prior shortcut must be restored byte for byte.");
+            RegressionAssert.Equal("{\"AutostartEnabled\":false}", File.ReadAllText(configurationPath, Encoding.UTF8), "The prior user configuration must be restored byte for byte.");
+        }
+        finally
+        {
+            Directory.Delete(temporaryDirectory, recursive: true);
+        }
     }
 
-    private static void FailedReplacementSelectsRollback()
+    private static void LegacyBrowserOwnershipSurvivesDisabledMigration()
     {
-        var action = global::MonitorAudioRouter.Setup.InstallDecisions.SelectReplacementAction(
-            stagingValidated: true,
-            replacementSucceeded: false);
+        const string legacyJson = """
+            {
+              "ChromeExtensionIds": ["legacy-chrome"],
+              "FirefoxExtensionIds": ["legacy-firefox@example.test"],
+              "PrivateBrowsingEnabled": false
+            }
+            """;
+        var legacy = global::MonitorAudioRouter.Setup.InstallInfo.Deserialize(legacyJson);
+        var disabledOptions = new global::MonitorAudioRouter.Setup.InstalledOptions(
+            InstallBrowserExtensions: false,
+            Autostart: false,
+            EnablePrivateBrowsing: false,
+            ChromeExtensionId: "current-chrome",
+            ChromeUpdateUrl: "https://clients2.google.com/service/update2/crx",
+            EdgeExtensionId: string.Empty,
+            EdgeUpdateUrl: "https://edge.microsoft.com/extensionwebstorebase/v1/crx",
+            FirefoxExtensionId: "current-firefox@example.test",
+            FirefoxInstallUrl: "https://addons.mozilla.org/firefox/downloads/file/legacy.xpi");
 
-        RegressionAssert.Equal(
-            global::MonitorAudioRouter.Setup.ReplacementAction.Rollback,
-            action,
-            "A failed replacement after validation must select rollback.");
+        var migrated = global::MonitorAudioRouter.Setup.InstallInfo.FromOptions(
+            disabledOptions,
+            registryValues: [],
+            legacyBrowserCleanupRequired: legacy.RequiresLegacyBrowserCleanup,
+            previousInstallInfo: legacy);
+        var roundTripped = global::MonitorAudioRouter.Setup.InstallInfo.Deserialize(migrated.Serialize());
+
+        RegressionAssert.True(!disabledOptions.InstallBrowserExtensions, "The migration fixture must keep browser deployment disabled.");
+        RegressionAssert.True(legacy.RequiresLegacyBrowserCleanup, "Legacy policy ownership must be recognized before migration.");
+        RegressionAssert.True(roundTripped.LegacyBrowserCleanupRequired, "Migration must retain an explicit uninstall cleanup marker.");
+        RegressionAssert.True(roundTripped.ChromeExtensionIds.Contains("legacy-chrome"), "The cleanup marker must retain the legacy Chrome policy ID.");
+        RegressionAssert.True(roundTripped.FirefoxExtensionIds.Contains("legacy-firefox@example.test"), "The cleanup marker must retain the legacy Firefox policy ID.");
     }
 
     private static void ReplacementPathsMustStayInsideBoundedRoot()

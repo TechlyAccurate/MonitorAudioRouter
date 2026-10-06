@@ -50,6 +50,7 @@ if (options.UpdateToLatestDuringInstall && TryLaunchNewerInstaller(options, prev
 
 var replacementApplied = false;
 string? pendingBackupDir = null;
+InstallerStateTransaction? stateTransaction = null;
 try
 {
     var tempDir = Path.Combine(Path.GetTempPath(), AppId + "-" + Guid.NewGuid().ToString("N"));
@@ -73,19 +74,26 @@ try
         var backupCreated = ReplaceInstallation(stagedInstallDir, installDir, backupDir);
         replacementApplied = true;
         pendingBackupDir = backupCreated ? backupDir : null;
+        stateTransaction = new InstallerStateTransaction();
         var registryOwnership = new RegistryOwnershipRecorder(previousInstallInfo?.RegistryValues);
         WriteInstallerLog("Writing native messaging manifests.");
         WriteNativeMessagingManifests(installDir, options);
         WriteInstallerLog("Registering native messaging hosts.");
-        RegisterNativeMessagingHosts(installDir, registryOwnership);
+        RegisterNativeMessagingHosts(installDir, registryOwnership, stateTransaction);
         WriteInstallerLog("Registering browser extension deployment policies.");
-        var browserExtensionDeployment = RegisterBrowserExtensionPolicies(options, registryOwnership);
+        var browserExtensionDeployment = RegisterBrowserExtensionPolicies(options, registryOwnership, stateTransaction);
         WriteInstallerLog("Applying startup and shortcut settings.");
-        SetStartup(installDir, options.Autostart, registryOwnership);
-        InstallStartMenuShortcut(installDir);
-        WriteUserAutostartSetting(options.Autostart);
-        RegisterUninstaller(installDir, registryOwnership);
-        WriteInstallInfo(installDir, options, registryOwnership.Values);
+        SetStartup(installDir, options.Autostart, registryOwnership, stateTransaction);
+        InstallStartMenuShortcut(installDir, stateTransaction);
+        WriteUserAutostartSetting(options.Autostart, stateTransaction);
+        RegisterUninstaller(installDir, registryOwnership, stateTransaction);
+        WriteInstallInfo(
+            installDir,
+            options,
+            registryOwnership.Values,
+            previousInstallInfo?.RequiresLegacyBrowserCleanup == true,
+            previousInstallInfo);
+        stateTransaction.Commit();
         WriteInstallerLog("Install registry state written.");
         if (pendingBackupDir is not null)
         {
@@ -118,7 +126,19 @@ try
 }
 catch (Exception exception)
 {
-    Exception reportedException = exception;
+    var rollbackFailures = new List<Exception>();
+    if (stateTransaction is not null)
+    {
+        try
+        {
+            stateTransaction.RollBack();
+        }
+        catch (Exception rollbackException)
+        {
+            rollbackFailures.Add(rollbackException);
+        }
+    }
+
     if (replacementApplied)
     {
         try
@@ -127,12 +147,15 @@ catch (Exception exception)
         }
         catch (Exception rollbackException)
         {
-            reportedException = new AggregateException(
-                "Installation failed and the prior payload could not be restored.",
-                exception,
-                rollbackException);
+            rollbackFailures.Add(rollbackException);
         }
     }
+
+    Exception reportedException = rollbackFailures.Count == 0
+        ? exception
+        : new AggregateException(
+            "Installation failed and one or more parts of the prior state could not be restored.",
+            new[] { exception }.Concat(rollbackFailures));
 
     Console.Error.WriteLine("Install failed:");
     Console.Error.WriteLine(reportedException);
@@ -165,13 +188,12 @@ static void StopExistingApp(string installDir)
         Path.Combine(installDir, "MonitorAudioRouterNativeHost.exe")
     };
     var installedProcesses = new List<Process>();
-    foreach (var process in Process.GetProcesses())
+    var candidates = InstallDecisions.EnumerateInstalledProcessCandidates(Process.GetProcessesByName);
+    foreach (var process in candidates)
     {
         try
         {
-            if (process.Id == Environment.ProcessId ||
-                !expectedPaths.Any(expected =>
-                    Path.GetFileNameWithoutExtension(expected).Equals(process.ProcessName, StringComparison.OrdinalIgnoreCase)))
+            if (process.Id == Environment.ProcessId)
             {
                 process.Dispose();
                 continue;
@@ -452,7 +474,10 @@ static void WriteNativeMessagingManifests(string installDir, InstallerOptions op
         JsonSerializer.Serialize(firefoxManifest, serializerOptions));
 }
 
-static void RegisterNativeMessagingHosts(string installDir, RegistryOwnershipRecorder registryOwnership)
+static void RegisterNativeMessagingHosts(
+    string installDir,
+    RegistryOwnershipRecorder registryOwnership,
+    InstallerStateTransaction stateTransaction)
 {
     var chromiumManifest = Path.Combine(installDir, "native-hosts", "chromium-com.monitoraudiorouter.router.json");
     var firefoxManifest = Path.Combine(installDir, "native-hosts", "firefox-com.monitoraudiorouter.router.json");
@@ -474,28 +499,32 @@ static void RegisterNativeMessagingHosts(string installDir, RegistryOwnershipRec
                 $@"{softwareRoot}\Google\Chrome\NativeMessagingHosts\{HostName}",
                 string.Empty,
                 chromiumManifest,
-                registryOwnership);
+                registryOwnership,
+                stateTransaction);
             WriteOwnedRegistryValue(
                 registryLocation.Hive,
                 registryLocation.Name,
                 $@"{softwareRoot}\Chromium\NativeMessagingHosts\{HostName}",
                 string.Empty,
                 chromiumManifest,
-                registryOwnership);
+                registryOwnership,
+                stateTransaction);
             WriteOwnedRegistryValue(
                 registryLocation.Hive,
                 registryLocation.Name,
                 $@"{softwareRoot}\Microsoft\Edge\NativeMessagingHosts\{HostName}",
                 string.Empty,
                 chromiumManifest,
-                registryOwnership);
+                registryOwnership,
+                stateTransaction);
             WriteOwnedRegistryValue(
                 registryLocation.Hive,
                 registryLocation.Name,
                 $@"{softwareRoot}\Mozilla\NativeMessagingHosts\{HostName}",
                 string.Empty,
                 firefoxManifest,
-                registryOwnership);
+                registryOwnership,
+                stateTransaction);
         }
     }
 }
@@ -516,7 +545,8 @@ static void AddChromiumOrigin(List<string> origins, string extensionId)
 
 static BrowserExtensionDeploymentResult RegisterBrowserExtensionPolicies(
     InstallerOptions options,
-    RegistryOwnershipRecorder registryOwnership)
+    RegistryOwnershipRecorder registryOwnership,
+    InstallerStateTransaction stateTransaction)
 {
     var result = new BrowserExtensionDeploymentResult();
     if (!options.InstallBrowserExtensions)
@@ -537,7 +567,8 @@ static BrowserExtensionDeploymentResult RegisterBrowserExtensionPolicies(
                 @"Software\Policies\Google\Chrome\ExtensionInstallForcelist",
                 options.ChromeExtensionId,
                 options.ChromeUpdateUrl,
-                registryOwnership),
+                registryOwnership,
+                stateTransaction),
             () => result.ChromePolicyInstalled = true,
             () => result.ChromePolicyFailed = true);
         installedAny |= TryRegisterPolicy(
@@ -548,7 +579,8 @@ static BrowserExtensionDeploymentResult RegisterBrowserExtensionPolicies(
                 @"Software\Policies\Chromium\ExtensionInstallForcelist",
                 options.ChromeExtensionId,
                 options.ChromeUpdateUrl,
-                registryOwnership),
+                registryOwnership,
+                stateTransaction),
             () => result.ChromiumPolicyInstalled = true,
             () => result.ChromiumPolicyFailed = true);
     }
@@ -563,7 +595,8 @@ static BrowserExtensionDeploymentResult RegisterBrowserExtensionPolicies(
                 @"Software\Policies\Microsoft\Edge\ExtensionInstallForcelist",
                 options.EdgeExtensionId,
                 options.EdgeUpdateUrl,
-                registryOwnership),
+                registryOwnership,
+                stateTransaction),
             () => result.EdgePolicyInstalled = true,
             () => result.EdgePolicyFailed = true);
     }
@@ -576,7 +609,8 @@ static BrowserExtensionDeploymentResult RegisterBrowserExtensionPolicies(
                 options.FirefoxExtensionId,
                 options.FirefoxInstallUrl,
                 options.EnablePrivateBrowsing,
-                registryOwnership),
+                registryOwnership,
+                stateTransaction),
             () => result.FirefoxPolicyInstalled = true,
             () => result.FirefoxPolicyFailed = true);
     }
@@ -611,7 +645,8 @@ static void AddExtensionForcelistEntry(
     string subKey,
     string extensionId,
     string updateUrl,
-    RegistryOwnershipRecorder registryOwnership)
+    RegistryOwnershipRecorder registryOwnership,
+    InstallerStateTransaction stateTransaction)
 {
     var entry = $"{extensionId};{updateUrl}";
     using var key = hive.CreateSubKey(subKey, writable: true);
@@ -625,7 +660,7 @@ static void AddExtensionForcelistEntry(
         var existing = key.GetValue(valueName)?.ToString();
         if (existing is not null && existing.StartsWith(extensionId + ";", StringComparison.OrdinalIgnoreCase))
         {
-            WriteOwnedRegistryValue(hive, hiveName, subKey, valueName, entry, registryOwnership);
+            WriteOwnedRegistryValue(hive, hiveName, subKey, valueName, entry, registryOwnership, stateTransaction);
             return;
         }
     }
@@ -636,24 +671,20 @@ static void AddExtensionForcelistEntry(
         index++;
     }
 
-    WriteOwnedRegistryValue(hive, hiveName, subKey, index.ToString(), entry, registryOwnership);
+    WriteOwnedRegistryValue(hive, hiveName, subKey, index.ToString(), entry, registryOwnership, stateTransaction);
 }
 
 static void SetFirefoxExtensionPolicy(
     string extensionId,
     string installUrl,
     bool enablePrivateBrowsing,
-    RegistryOwnershipRecorder registryOwnership)
+    RegistryOwnershipRecorder registryOwnership,
+    InstallerStateTransaction stateTransaction)
 {
     const string subKey = @"Software\Policies\Mozilla\Firefox";
     const string valueName = "ExtensionSettings";
-    using var key = Registry.LocalMachine.CreateSubKey(subKey, writable: true);
-    if (key is null)
-    {
-        return;
-    }
-
-    var currentValue = ReadRegistryValue(key, valueName);
+    var keyExisted = RegistryKeyExists(Registry.LocalMachine, subKey);
+    var currentValue = ReadRegistryValueAtPath(Registry.LocalMachine, subKey, valueName);
     EnsureStringRegistryValue(currentValue, "HKLM", subKey, valueName);
     var settings = ParseExistingJsonObjectForMerge(currentValue.Value);
     var priorExtensionPolicy = settings[extensionId];
@@ -674,17 +705,37 @@ static void SetFirefoxExtensionPolicy(
     }
 
     settings[extensionId] = extensionPolicy;
-    key.SetValue(valueName, settings.ToJsonString(new JsonSerializerOptions { WriteIndented = false }), RegistryValueKind.String);
-    registryOwnership.Record(
-        "HKLM",
-        subKey,
-        valueName,
-        prior,
-        new RegistryValueSnapshot(
-            true,
-            extensionPolicy.ToJsonString(new JsonSerializerOptions { WriteIndented = false }),
-            "Json"),
-        extensionId);
+    var writtenExtensionPolicy = new RegistryValueSnapshot(
+        true,
+        extensionPolicy.ToJsonString(new JsonSerializerOptions { WriteIndented = false }),
+        "Json");
+    RegistryValueSnapshot? writtenValue = null;
+    stateTransaction.Apply(
+        InstallerMutationKind.Registry,
+        () =>
+        {
+            using var key = Registry.LocalMachine.CreateSubKey(subKey, writable: true)
+                ?? throw new InvalidOperationException($"Registry key could not be created: HKLM\\{subKey}");
+            key.SetValue(
+                valueName,
+                settings.ToJsonString(new JsonSerializerOptions { WriteIndented = false }),
+                RegistryValueKind.String);
+            writtenValue = ReadRegistryValue(key, valueName);
+            registryOwnership.Record(
+                "HKLM",
+                subKey,
+                valueName,
+                prior,
+                writtenExtensionPolicy,
+                extensionId);
+        },
+        () => RestoreRegistryMutation(
+            Registry.LocalMachine,
+            subKey,
+            valueName,
+            currentValue,
+            writtenValue,
+            keyExisted));
 }
 
 static JsonObject ParseExistingJsonObjectForMerge(string? json)
@@ -715,7 +766,11 @@ static JsonObject ParseJsonObject(string? json)
     }
 }
 
-static void SetStartup(string installDir, bool enabled, RegistryOwnershipRecorder registryOwnership)
+static void SetStartup(
+    string installDir,
+    bool enabled,
+    RegistryOwnershipRecorder registryOwnership,
+    InstallerStateTransaction stateTransaction)
 {
     const string subKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
 
@@ -727,7 +782,8 @@ static void SetStartup(string installDir, bool enabled, RegistryOwnershipRecorde
             subKey,
             RunValueName,
             Quote(Path.Combine(installDir, "MonitorAudioRouter.exe")),
-            registryOwnership);
+            registryOwnership,
+            stateTransaction);
     }
     else
     {
@@ -736,29 +792,44 @@ static void SetStartup(string installDir, bool enabled, RegistryOwnershipRecorde
             "HKCU",
             subKey,
             RunValueName,
-            registryOwnership);
+            registryOwnership,
+            stateTransaction);
     }
 }
 
-static void WriteUserAutostartSetting(bool enabled)
+static void WriteUserAutostartSetting(bool enabled, InstallerStateTransaction stateTransaction)
 {
+    var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+    var configPath = Path.Combine(localAppData, AppName, "config.json");
+    var priorState = FileStateSnapshot.Capture(configPath);
     try
     {
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var appDataDir = Path.Combine(localAppData, AppName);
-        Directory.CreateDirectory(appDataDir);
-        var configPath = Path.Combine(appDataDir, "config.json");
-        var settings = ParseJsonObject(File.Exists(configPath) ? File.ReadAllText(configPath) : null);
-        settings["AutostartEnabled"] = enabled;
-        File.WriteAllText(configPath, settings.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        stateTransaction.Apply(
+            InstallerMutationKind.UserConfiguration,
+            () =>
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(configPath)!);
+                var settings = ParseJsonObject(File.Exists(configPath) ? File.ReadAllText(configPath) : null);
+                settings["AutostartEnabled"] = enabled;
+                File.WriteAllText(configPath, settings.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+            },
+            () => priorState.Restore(configPath));
     }
-    catch
+    catch (AggregateException)
     {
+        throw;
+    }
+    catch (Exception exception)
+    {
+        WriteInstallerLog($"User autostart configuration sync failed: {exception.Message}");
         // The tray app can still manage autostart if the config sync fails.
     }
 }
 
-static void RegisterUninstaller(string installDir, RegistryOwnershipRecorder registryOwnership)
+static void RegisterUninstaller(
+    string installDir,
+    RegistryOwnershipRecorder registryOwnership,
+    InstallerStateTransaction stateTransaction)
 {
     var subKey = $@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{AppId}";
     var uninstallCommand = $"powershell.exe -NoProfile -ExecutionPolicy Bypass -File {Quote(Path.Combine(installDir, "Uninstall-MonitorAudioRouter.ps1"))}";
@@ -780,33 +851,46 @@ static void RegisterUninstaller(string installDir, RegistryOwnershipRecorder reg
             subKey,
             value.Key,
             value.Value,
-            registryOwnership);
+            registryOwnership,
+            stateTransaction);
     }
 }
 
-static void InstallStartMenuShortcut(string installDir)
+static void InstallStartMenuShortcut(string installDir, InstallerStateTransaction stateTransaction)
 {
+    var programsDir = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
+    var shortcutPath = Path.Combine(programsDir, $"{AppName}.lnk");
+    var priorState = FileStateSnapshot.Capture(shortcutPath);
     try
     {
-        var programsDir = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
-        Directory.CreateDirectory(programsDir);
-        var shortcutPath = Path.Combine(programsDir, $"{AppName}.lnk");
-        var shellType = Type.GetTypeFromProgID("WScript.Shell");
-        if (shellType is null)
-        {
-            return;
-        }
+        stateTransaction.Apply(
+            InstallerMutationKind.StartMenuShortcut,
+            () =>
+            {
+                Directory.CreateDirectory(programsDir);
+                var shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType is null)
+                {
+                    return;
+                }
 
-        dynamic shell = Activator.CreateInstance(shellType)!;
-        dynamic shortcut = shell.CreateShortcut(shortcutPath);
-        shortcut.TargetPath = Path.Combine(installDir, "MonitorAudioRouter.exe");
-        shortcut.WorkingDirectory = installDir;
-        shortcut.IconLocation = Path.Combine(installDir, "MonitorAudioRouter.ico") + ",0";
-        shortcut.Description = AppName;
-        shortcut.Save();
+                dynamic shell = Activator.CreateInstance(shellType)!;
+                dynamic shortcut = shell.CreateShortcut(shortcutPath);
+                shortcut.TargetPath = Path.Combine(installDir, "MonitorAudioRouter.exe");
+                shortcut.WorkingDirectory = installDir;
+                shortcut.IconLocation = Path.Combine(installDir, "MonitorAudioRouter.ico") + ",0";
+                shortcut.Description = AppName;
+                shortcut.Save();
+            },
+            () => priorState.Restore(shortcutPath));
     }
-    catch
+    catch (AggregateException)
     {
+        throw;
+    }
+    catch (Exception exception)
+    {
+        WriteInstallerLog($"Start Menu shortcut creation failed: {exception.Message}");
         // Shortcut creation should not block the core install.
     }
 }
@@ -814,9 +898,15 @@ static void InstallStartMenuShortcut(string installDir)
 static void WriteInstallInfo(
     string installDir,
     InstallerOptions options,
-    IReadOnlyList<RegistryValueOwnership> registryOwnership)
+    IReadOnlyList<RegistryValueOwnership> registryOwnership,
+    bool legacyBrowserCleanupRequired,
+    InstallInfo? previousInstallInfo)
 {
-    var installInfo = InstallInfo.FromOptions(ToInstalledOptions(options), registryOwnership);
+    var installInfo = InstallInfo.FromOptions(
+        ToInstalledOptions(options),
+        registryOwnership,
+        legacyBrowserCleanupRequired,
+        previousInstallInfo);
     File.WriteAllText(
         Path.Combine(installDir, "install-info.json"),
         installInfo.Serialize());
@@ -945,15 +1035,24 @@ static void WriteOwnedRegistryValue(
     string subKey,
     string valueName,
     string value,
-    RegistryOwnershipRecorder registryOwnership)
+    RegistryOwnershipRecorder registryOwnership,
+    InstallerStateTransaction stateTransaction)
 {
-    using var key = hive.CreateSubKey(subKey, writable: true)
-        ?? throw new InvalidOperationException($"Registry key could not be created: {hiveName}\\{subKey}");
-    var current = ReadRegistryValue(key, valueName);
+    var keyExisted = RegistryKeyExists(hive, subKey);
+    var current = ReadRegistryValueAtPath(hive, subKey, valueName);
     EnsureStringRegistryValue(current, hiveName, subKey, valueName);
-    key.SetValue(valueName, value, RegistryValueKind.String);
-    var written = ReadRegistryValue(key, valueName);
-    registryOwnership.Record(hiveName, subKey, valueName, current, written, jsonPropertyName: null);
+    RegistryValueSnapshot? written = null;
+    stateTransaction.Apply(
+        InstallerMutationKind.Registry,
+        () =>
+        {
+            using var key = hive.CreateSubKey(subKey, writable: true)
+                ?? throw new InvalidOperationException($"Registry key could not be created: {hiveName}\\{subKey}");
+            key.SetValue(valueName, value, RegistryValueKind.String);
+            written = ReadRegistryValue(key, valueName);
+            registryOwnership.Record(hiveName, subKey, valueName, current, written, jsonPropertyName: null);
+        },
+        () => RestoreRegistryMutation(hive, subKey, valueName, current, written, keyExisted));
 }
 
 static void DeleteOwnedRegistryValue(
@@ -961,15 +1060,94 @@ static void DeleteOwnedRegistryValue(
     string hiveName,
     string subKey,
     string valueName,
-    RegistryOwnershipRecorder registryOwnership)
+    RegistryOwnershipRecorder registryOwnership,
+    InstallerStateTransaction stateTransaction)
 {
-    using var key = hive.CreateSubKey(subKey, writable: true)
-        ?? throw new InvalidOperationException($"Registry key could not be created: {hiveName}\\{subKey}");
-    var current = ReadRegistryValue(key, valueName);
+    var keyExisted = RegistryKeyExists(hive, subKey);
+    var current = ReadRegistryValueAtPath(hive, subKey, valueName);
     EnsureStringRegistryValue(current, hiveName, subKey, valueName);
-    key.DeleteValue(valueName, throwOnMissingValue: false);
-    var written = ReadRegistryValue(key, valueName);
-    registryOwnership.Record(hiveName, subKey, valueName, current, written, jsonPropertyName: null);
+    RegistryValueSnapshot? written = null;
+    stateTransaction.Apply(
+        InstallerMutationKind.Registry,
+        () =>
+        {
+            using var key = hive.CreateSubKey(subKey, writable: true)
+                ?? throw new InvalidOperationException($"Registry key could not be created: {hiveName}\\{subKey}");
+            key.DeleteValue(valueName, throwOnMissingValue: false);
+            written = ReadRegistryValue(key, valueName);
+            registryOwnership.Record(hiveName, subKey, valueName, current, written, jsonPropertyName: null);
+        },
+        () => RestoreRegistryMutation(hive, subKey, valueName, current, written, keyExisted));
+}
+
+static bool RegistryKeyExists(RegistryKey hive, string subKey)
+{
+    using var key = hive.OpenSubKey(subKey);
+    return key is not null;
+}
+
+static RegistryValueSnapshot ReadRegistryValueAtPath(RegistryKey hive, string subKey, string valueName)
+{
+    using var key = hive.OpenSubKey(subKey);
+    return key is null
+        ? new RegistryValueSnapshot(false, null, null)
+        : ReadRegistryValue(key, valueName);
+}
+
+static void RestoreRegistryMutation(
+    RegistryKey hive,
+    string subKey,
+    string valueName,
+    RegistryValueSnapshot prior,
+    RegistryValueSnapshot? written,
+    bool keyExisted)
+{
+    if (written is not null)
+    {
+        var ownership = new RegistryValueOwnership(
+            string.Empty,
+            subKey,
+            valueName,
+            prior,
+            written,
+            JsonPropertyName: null);
+        var current = ReadRegistryValueAtPath(hive, subKey, valueName);
+        var decision = InstallDecisions.DecideRegistryRemoval(ownership, current);
+        if (decision.Action == RegistryRemovalAction.RetainCurrent)
+        {
+            return;
+        }
+    }
+
+    RestoreRegistrySnapshot(hive, subKey, valueName, prior);
+    if (!keyExisted)
+    {
+        using var key = hive.OpenSubKey(subKey);
+        if (key is not null && key.ValueCount == 0 && key.SubKeyCount == 0)
+        {
+            key.Dispose();
+            hive.DeleteSubKey(subKey, throwOnMissingSubKey: false);
+        }
+    }
+}
+
+static void RestoreRegistrySnapshot(
+    RegistryKey hive,
+    string subKey,
+    string valueName,
+    RegistryValueSnapshot snapshot)
+{
+    if (!snapshot.Exists)
+    {
+        using var existingKey = hive.OpenSubKey(subKey, writable: true);
+        existingKey?.DeleteValue(valueName, throwOnMissingValue: false);
+        return;
+    }
+
+    using var key = hive.CreateSubKey(subKey, writable: true)
+        ?? throw new InvalidOperationException($"Registry key could not be restored: {subKey}");
+    var kind = Enum.Parse<RegistryValueKind>(snapshot.Kind ?? RegistryValueKind.String.ToString());
+    key.SetValue(valueName, snapshot.Value ?? string.Empty, kind);
 }
 
 static RegistryValueSnapshot ReadRegistryValue(RegistryKey key, string valueName)

@@ -8,6 +8,7 @@ Set-StrictMode -Version 2.0
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $csharpTestProject = Join-Path $PSScriptRoot "MonitorAudioRouter.RegressionTests\MonitorAudioRouter.RegressionTests.csproj"
 $browserTestRunner = Join-Path $PSScriptRoot "browser-extension-regression-tests.js"
+$installerPowerShellTestRunner = Join-Path $PSScriptRoot "installer-uninstaller-regression-tests.ps1"
 $installerBuild = Join-Path $repositoryRoot "Build-Installer.ps1"
 $testAppData = Join-Path $PSScriptRoot ".appdata"
 
@@ -19,6 +20,7 @@ function Assert-TestEntryPoint([string]$Name, [string]$Path) {
 
 Assert-TestEntryPoint "C# regression test project" $csharpTestProject
 Assert-TestEntryPoint "browser extension test runner" $browserTestRunner
+Assert-TestEntryPoint "installer PowerShell test runner" $installerPowerShellTestRunner
 
 $nugetDirectory = Join-Path $testAppData "NuGet"
 $nugetConfigPath = Join-Path $nugetDirectory "NuGet.Config"
@@ -106,7 +108,7 @@ if ($null -eq $nodeCommand) {
 }
 
 $passedSuites = 1
-$totalSuites = 6
+$totalSuites = 7
 
 $powerShellScripts = @(
     Get-ChildItem -LiteralPath $repositoryRoot -Filter "*.ps1" -File
@@ -141,6 +143,11 @@ Write-Host "[PASS] JavaScript syntax ($($javaScriptFiles.Count) scripts)"
 
 Invoke-CheckedCommand "C# regression tests" {
     & $dotnetCommand.Source run --project $csharpTestProject -c Release
+}
+$passedSuites++
+
+Invoke-CheckedCommand "Installer PowerShell regression tests" {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installerPowerShellTestRunner
 }
 $passedSuites++
 

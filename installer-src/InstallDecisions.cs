@@ -15,7 +15,7 @@ internal sealed record InstalledOptions(
 
 internal sealed class InstallInfo
 {
-    public int SchemaVersion { get; set; } = 2;
+    public int SchemaVersion { get; set; }
     public string[] ChromeExtensionIds { get; set; } = [];
     public string[] EdgeExtensionIds { get; set; } = [];
     public string[] FirefoxExtensionIds { get; set; } = [];
@@ -28,7 +28,10 @@ internal sealed class InstallInfo
     public string? EdgeUpdateUrl { get; set; }
     public string? FirefoxExtensionId { get; set; }
     public string? FirefoxInstallUrl { get; set; }
+    public bool LegacyBrowserCleanupRequired { get; set; }
     public List<RegistryValueOwnership> RegistryValues { get; set; } = [];
+
+    internal bool RequiresLegacyBrowserCleanup => LegacyBrowserCleanupRequired || SchemaVersion < 2;
 
     internal static InstallInfo Deserialize(string json) =>
         JsonSerializer.Deserialize<InstallInfo>(json, new JsonSerializerOptions
@@ -38,12 +41,19 @@ internal sealed class InstallInfo
 
     internal static InstallInfo FromOptions(
         InstalledOptions options,
-        IEnumerable<RegistryValueOwnership> registryValues) =>
-        new()
+        IEnumerable<RegistryValueOwnership> registryValues,
+        bool legacyBrowserCleanupRequired = false,
+        InstallInfo? previousInstallInfo = null)
+    {
+        var legacyChromeIds = legacyBrowserCleanupRequired ? previousInstallInfo?.ChromeExtensionIds : null;
+        var legacyEdgeIds = legacyBrowserCleanupRequired ? previousInstallInfo?.EdgeExtensionIds : null;
+        var legacyFirefoxIds = legacyBrowserCleanupRequired ? previousInstallInfo?.FirefoxExtensionIds : null;
+        return new InstallInfo
         {
-            ChromeExtensionIds = HasText(options.ChromeExtensionId) ? [options.ChromeExtensionId] : [],
-            EdgeExtensionIds = HasText(options.EdgeExtensionId) ? [options.EdgeExtensionId] : [],
-            FirefoxExtensionIds = HasText(options.FirefoxExtensionId) ? [options.FirefoxExtensionId] : [],
+            SchemaVersion = 2,
+            ChromeExtensionIds = MergeIds(legacyChromeIds, options.ChromeExtensionId),
+            EdgeExtensionIds = MergeIds(legacyEdgeIds, options.EdgeExtensionId),
+            FirefoxExtensionIds = MergeIds(legacyFirefoxIds, options.FirefoxExtensionId),
             PrivateBrowsingEnabled = options.EnablePrivateBrowsing,
             InstallBrowserExtensions = options.InstallBrowserExtensions,
             Autostart = options.Autostart,
@@ -53,8 +63,10 @@ internal sealed class InstallInfo
             EdgeUpdateUrl = options.EdgeUpdateUrl,
             FirefoxExtensionId = options.FirefoxExtensionId,
             FirefoxInstallUrl = options.FirefoxInstallUrl,
+            LegacyBrowserCleanupRequired = legacyBrowserCleanupRequired,
             RegistryValues = registryValues.ToList()
         };
+    }
 
     internal InstalledOptions ResolveOptions(InstalledOptions fallback) =>
         new(
@@ -80,6 +92,13 @@ internal sealed class InstallInfo
 
         return legacyValues?.FirstOrDefault(HasText) ?? fallback;
     }
+
+    private static string[] MergeIds(IEnumerable<string>? previousIds, string currentId) =>
+        (previousIds ?? [])
+        .Append(currentId)
+        .Where(HasText)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
 
     private static bool HasText(string value) => !string.IsNullOrWhiteSpace(value);
 }
@@ -154,15 +173,120 @@ internal enum RegistryRemovalAction
 
 internal sealed record RegistryRemovalDecision(RegistryRemovalAction Action, RegistryValueSnapshot? Value);
 
-internal enum ReplacementAction
+internal enum InstallerMutationKind
 {
-    Abort,
-    Replace,
-    Rollback
+    Registry,
+    StartMenuShortcut,
+    UserConfiguration
+}
+
+internal sealed class InstallerStateTransaction : IDisposable
+{
+    private readonly List<Action> rollbackActions = [];
+    private readonly Action<InstallerMutationKind, int>? afterMutation;
+    private bool completed;
+    private int mutationCount;
+
+    internal InstallerStateTransaction(Action<InstallerMutationKind, int>? afterMutation = null)
+    {
+        this.afterMutation = afterMutation;
+    }
+
+    internal void Apply(InstallerMutationKind kind, Action mutation, Action rollback)
+    {
+        ObjectDisposedException.ThrowIf(completed, this);
+        rollbackActions.Add(rollback);
+        try
+        {
+            mutation();
+            mutationCount++;
+            afterMutation?.Invoke(kind, mutationCount);
+        }
+        catch (Exception mutationException)
+        {
+            rollbackActions.RemoveAt(rollbackActions.Count - 1);
+            try
+            {
+                rollback();
+            }
+            catch (Exception rollbackException)
+            {
+                throw new AggregateException(
+                    "An installer mutation failed and its prior state could not be restored.",
+                    mutationException,
+                    rollbackException);
+            }
+
+            throw;
+        }
+    }
+
+    internal void Commit()
+    {
+        ObjectDisposedException.ThrowIf(completed, this);
+        rollbackActions.Clear();
+        completed = true;
+    }
+
+    internal void RollBack()
+    {
+        if (completed)
+        {
+            return;
+        }
+
+        var failures = new List<Exception>();
+        for (var index = rollbackActions.Count - 1; index >= 0; index--)
+        {
+            try
+            {
+                rollbackActions[index]();
+            }
+            catch (Exception exception)
+            {
+                failures.Add(exception);
+            }
+        }
+
+        rollbackActions.Clear();
+        completed = true;
+        if (failures.Count > 0)
+        {
+            throw new AggregateException("One or more installer state mutations could not be rolled back.", failures);
+        }
+    }
+
+    public void Dispose()
+    {
+        RollBack();
+    }
+}
+
+internal sealed record FileStateSnapshot(bool Exists, byte[]? Contents)
+{
+    internal static FileStateSnapshot Capture(string path) =>
+        File.Exists(path)
+            ? new FileStateSnapshot(true, File.ReadAllBytes(path))
+            : new FileStateSnapshot(false, null);
+
+    internal void Restore(string path)
+    {
+        if (!Exists)
+        {
+            File.Delete(path);
+            return;
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(path)
+            ?? throw new InvalidOperationException($"The file path has no parent directory: {path}"));
+        File.WriteAllBytes(path, Contents ?? []);
+    }
 }
 
 internal static class InstallDecisions
 {
+    private static readonly string[] InstalledProcessNames =
+        ["MonitorAudioRouter", "MonitorAudioRouterNativeHost"];
     private const string ReleaseApiHost = "api.github.com";
     private const string ReleaseAssetHost = "github.com";
     private const string RedirectedReleaseAssetHost = "release-assets.githubusercontent.com";
@@ -211,6 +335,10 @@ internal static class InstallDecisions
         }
     }
 
+    internal static IEnumerable<T> EnumerateInstalledProcessCandidates<T>(
+        Func<string, IEnumerable<T>> getProcessesByName) =>
+        InstalledProcessNames.SelectMany(getProcessesByName);
+
     internal static RegistryRemovalDecision DecideRegistryRemoval(
         RegistryValueOwnership ownership,
         RegistryValueSnapshot current)
@@ -223,16 +351,6 @@ internal static class InstallDecisions
         return ownership.Prior.Exists
             ? new RegistryRemovalDecision(RegistryRemovalAction.RestorePrior, ownership.Prior)
             : new RegistryRemovalDecision(RegistryRemovalAction.Delete, null);
-    }
-
-    internal static ReplacementAction SelectReplacementAction(bool stagingValidated, bool replacementSucceeded)
-    {
-        if (!stagingValidated)
-        {
-            return ReplacementAction.Abort;
-        }
-
-        return replacementSucceeded ? ReplacementAction.Replace : ReplacementAction.Rollback;
     }
 
     internal static bool IsPathWithinRoot(string rootPath, string candidatePath)
