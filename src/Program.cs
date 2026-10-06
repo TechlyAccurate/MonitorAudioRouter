@@ -5399,6 +5399,8 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
 {
     private readonly object _lockObject = new();
     private readonly List<T> _active = new();
+    private readonly HashSet<T> _deferred = new();
+    private readonly HashSet<T> _disposalRequested = new();
     private readonly DeferredDisposalQueue<T> _pending = new();
     private readonly Action<Action> _scheduleCleanup;
     private readonly Action<T> _disposeItem;
@@ -5410,18 +5412,34 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
         _disposeItem = disposeItem;
     }
 
-    public bool TryAdd(T item, Func<T, bool> isTerminal)
+    public bool TryTakeOwnership(T item, Func<T, bool> isTerminal)
     {
+        var scheduleCleanup = false;
         lock (_lockObject)
         {
-            if (_disposed || isTerminal(item) || _pending.Contains(item))
+            var disposalRequested = _disposalRequested.Contains(item);
+            if (isTerminal(item) || disposalRequested)
+            {
+                // A terminal item may still be inside its callback; wait for its queued cleanup.
+                _deferred.Add(item);
+                scheduleCleanup = disposalRequested && _pending.Enqueue(item);
+            }
+            else if (_disposed)
             {
                 return false;
             }
-
-            _active.Add(item);
-            return true;
+            else
+            {
+                _active.Add(item);
+            }
         }
+
+        if (scheduleCleanup)
+        {
+            _scheduleCleanup(DrainPending);
+        }
+
+        return true;
     }
 
     public void QueueForDisposal(T item)
@@ -5429,11 +5447,8 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
         var scheduleCleanup = false;
         lock (_lockObject)
         {
-            if (_disposed)
-            {
-                return;
-            }
-
+            // Preserve requests from callbacks that overlap shutdown or admission.
+            _disposalRequested.Add(item);
             scheduleCleanup = _pending.Enqueue(item);
         }
 
@@ -5450,7 +5465,11 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
             var removed = false;
             lock (_lockObject)
             {
-                removed = _active.Remove(item);
+                removed = _active.Remove(item) || _deferred.Remove(item);
+                if (removed)
+                {
+                    _disposalRequested.Remove(item);
+                }
             }
 
             if (removed)
@@ -5473,9 +5492,12 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
             _disposed = true;
             active = _active.ToArray();
             _active.Clear();
+            foreach (var item in active)
+            {
+                _disposalRequested.Remove(item);
+            }
         }
 
-        _pending.Drain(_ => { });
         foreach (var item in active)
         {
             _disposeItem(item);
@@ -5769,7 +5791,7 @@ internal sealed class AudioSessionDeviceSubscription : IDisposable
             if (subscription is not null)
             {
                 control = null!;
-                if (!_controls.TryAdd(subscription, controlSubscription => controlSubscription.IsDisconnected))
+                if (!_controls.TryTakeOwnership(subscription, controlSubscription => controlSubscription.IsDisconnected))
                 {
                     subscription.Dispose();
                 }

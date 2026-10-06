@@ -21,6 +21,7 @@ internal static class Program
         runner.Add("Tray resource owner reuses menu and disposes replaced icons", TrayResourceOwnerReusesMenuAndDisposesReplacedIcons);
         runner.Add("Disconnected session cleanup is deferred and idempotent", DisconnectedSessionCleanupIsDeferredAndIdempotent);
         runner.Add("Pre-admission disconnect cleanup rejects and disposes once", PreAdmissionDisconnectCleanupRejectsAndDisposesOnce);
+        runner.Add("Terminal rejection waits for disconnect callback completion", TerminalRejectionWaitsForDisconnectCallbackCompletion);
         runner.Add("All absent role values produce Default", AllAbsentRoleValuesProduceDefault);
         runner.Add("Any untrustworthy role query produces Unavailable unless a consistent explicit endpoint is proven", UntrustworthyRoleQueryProducesUnavailableWithoutExplicitEndpoint);
         runner.Add("An explicit endpoint produces Explicit with its ID", ExplicitEndpointProducesExplicitWithItsId);
@@ -285,7 +286,7 @@ internal static class Program
                 disposalCounts[item] = disposalCounts.GetValueOrDefault(item) + 1;
             });
         var disconnectedSession = new object();
-        RegressionAssert.True(manager.TryAdd(disconnectedSession, _ => false), "The active session should be tracked.");
+        RegressionAssert.True(manager.TryTakeOwnership(disconnectedSession, _ => false), "The active session should be tracked.");
         var eventsClient = new global::MonitorAudioRouter.AudioSessionEventsClient(
             _ => { },
             () => manager.QueueForDisposal(disconnectedSession));
@@ -301,7 +302,7 @@ internal static class Program
         RegressionAssert.Equal(1, disposalCounts[disconnectedSession], "Deferred cleanup should dispose the session once.");
 
         var shutdownSession = new object();
-        RegressionAssert.True(manager.TryAdd(shutdownSession, _ => false), "A second active session should be tracked.");
+        RegressionAssert.True(manager.TryTakeOwnership(shutdownSession, _ => false), "A second active session should be tracked.");
         manager.QueueForDisposal(shutdownSession);
         RegressionAssert.Equal(1, scheduledCleanup.Count, "The disconnect should schedule cleanup without a routing scan.");
         manager.Dispose();
@@ -340,16 +341,75 @@ internal static class Program
         scheduledCleanup.Dequeue()();
         RegressionAssert.Equal(0, disposalCount, "Cleanup before admission should not dispose an unowned session.");
 
-        var admitted = manager.TryAdd(session, _ => disconnected);
-        if (!admitted)
+        var managerOwned = manager.TryTakeOwnership(session, _ => disconnected);
+        manager.Dispose();
+        RegressionAssert.Equal(1, scheduledCleanup.Count, "Deferred admission should reschedule the retained cleanup.");
+        scheduledCleanup.Dequeue()();
+
+        RegressionAssert.True(managerOwned, "The manager should retain ownership without admitting the disconnected session.");
+        RegressionAssert.Equal(1, disposalCount, "Rejection and shutdown must dispose the session exactly once.");
+    }
+
+    private static void TerminalRejectionWaitsForDisconnectCallbackCompletion()
+    {
+        var scheduledCleanup = new Queue<Action>();
+        using var terminalPublished = new ManualResetEventSlim();
+        using var allowQueue = new ManualResetEventSlim();
+        var session = new object();
+        var disconnected = 0;
+        var callbackActive = 0;
+        var disposalCount = 0;
+        var manager = new global::MonitorAudioRouter.DeferredSubscriptionManager<object>(
+            scheduleCleanup: action => scheduledCleanup.Enqueue(action),
+            disposeItem: item =>
+            {
+                RegressionAssert.True(ReferenceEquals(session, item), "Only the terminal session should be disposed.");
+                RegressionAssert.Equal(0, Volatile.Read(ref callbackActive), "Disposal must wait for callback completion.");
+                disposalCount++;
+            });
+        var eventsClient = new global::MonitorAudioRouter.AudioSessionEventsClient(
+            _ => { },
+            () =>
+            {
+                Volatile.Write(ref disconnected, 1);
+                terminalPublished.Set();
+                allowQueue.Wait();
+                manager.QueueForDisposal(session);
+            });
+        var callbackTask = Task.Run(() =>
         {
-            DisposeSession(session);
+            Volatile.Write(ref callbackActive, 1);
+            try
+            {
+                eventsClient.OnSessionDisconnected(global::MonitorAudioRouter.AudioSessionDisconnectReason.DeviceRemoval);
+            }
+            finally
+            {
+                Volatile.Write(ref callbackActive, 0);
+            }
+        });
+
+        try
+        {
+            RegressionAssert.True(terminalPublished.Wait(TimeSpan.FromSeconds(5)), "The callback should publish terminal state.");
+            RegressionAssert.True(
+                manager.TryTakeOwnership(session, _ => Volatile.Read(ref disconnected) != 0),
+                "The manager should own a terminal subscription without admitting it as active.");
+            manager.Dispose();
+            RegressionAssert.Equal(0, scheduledCleanup.Count, "Terminal admission must wait for the callback to queue cleanup.");
+            RegressionAssert.Equal(0, disposalCount, "Admission rejection and shutdown must not dispose during the callback.");
+        }
+        finally
+        {
+            allowQueue.Set();
+            callbackTask.GetAwaiter().GetResult();
         }
 
+        RegressionAssert.Equal(1, scheduledCleanup.Count, "Callback completion should leave one deferred cleanup.");
+        scheduledCleanup.Dequeue()();
         manager.Dispose();
 
-        RegressionAssert.True(!admitted, "An already-disconnected session must be rejected during admission.");
-        RegressionAssert.Equal(1, disposalCount, "Rejection and shutdown must dispose the session exactly once.");
+        RegressionAssert.Equal(1, disposalCount, "Deferred rejection must dispose exactly once.");
     }
 
     private static void AllAbsentRoleValuesProduceDefault()
