@@ -46,6 +46,8 @@ internal static class Program
         runner.Add("Browser title diagnostics never contain raw titles", BrowserTitleDiagnosticsNeverContainRawTitles);
         runner.Add("Browser pipe framing honors exact LF and CRLF limits", BrowserPipeFramingHonorsExactLfAndCrLfLimits);
         runner.Add("Browser pipe framing preserves Unicode and escaped JSON", BrowserPipeFramingPreservesUnicodeAndEscapedJson);
+        runner.Add("Worst-case near-limit browser frames fit the envelope capacity", WorstCaseNearLimitBrowserFrameFitsEnvelopeCapacity);
+        runner.Add("A one-character envelope overrun is rejected", OneCharacterEnvelopeOverrunIsRejected);
         runner.Add("Disconnected partial browser pipe lines fail before processing", DisconnectedPartialBrowserPipeLinesFail);
         runner.Add("A timed-out partial browser pipe line changes no hint state", TimedOutPartialBrowserPipeLineChangesNoState);
         runner.Add("Browser source state is pruned and capped", BrowserSourceStateIsPrunedAndCapped);
@@ -921,6 +923,66 @@ internal static class Program
             envelope,
             InvokeBoundedBrowserLineRead(reader, envelope.Length, TimeSpan.FromSeconds(1)),
             "A Unicode envelope at the exact character limit should round-trip.");
+    }
+
+    private static void WorstCaseNearLimitBrowserFrameFitsEnvelopeCapacity()
+    {
+        const string prefix = "{\"value\":\"";
+        const string suffix = "\"}";
+        var token = new string(
+            '\u007F',
+            global::MonitorAudioRouter.BrowserBridgeProtocol.MaximumTokenCharacters);
+        var fixedPayloadBytes = Encoding.UTF8.GetByteCount(prefix) + Encoding.UTF8.GetByteCount(suffix);
+        var remainingBytes = global::MonitorAudioRouter.BrowserBridgeProtocol.MaximumBrowserMessageBytes - fixedPayloadBytes;
+        var payload = prefix +
+                      new string('\u007F', remainingBytes) +
+                      suffix;
+
+        RegressionAssert.Equal(
+            global::MonitorAudioRouter.BrowserBridgeProtocol.MaximumPipeMessageCharacters,
+            global::MonitorAudioRouterNativeHost.BrowserBridgeProtocol.MaximumPipeMessageCharacters,
+            "Tray and native host must enforce exactly the same envelope capacity.");
+        RegressionAssert.Equal(
+            global::MonitorAudioRouter.BrowserBridgeProtocol.MaximumBrowserMessageBytes,
+            Encoding.UTF8.GetByteCount(payload),
+            "The fixture should exercise the exact admitted browser-frame byte limit.");
+        var trayEnvelope = global::MonitorAudioRouter.BrowserBridgeSecurity.SerializeEnvelope(payload, token);
+        var nativeEnvelope = global::MonitorAudioRouterNativeHost.Program.BrowserBridgeSecurity.SerializeEnvelope(payload, token);
+        RegressionAssert.Equal(trayEnvelope, nativeEnvelope, "Tray and native host serializers must produce identical envelopes.");
+        RegressionAssert.Equal(
+            global::MonitorAudioRouter.BrowserBridgeProtocol.EnvelopeFixedCharacters,
+            global::MonitorAudioRouter.BrowserBridgeSecurity.SerializeEnvelope("", "").Length,
+            "The fixed envelope-character count must match the actual tray serializer shape.");
+        RegressionAssert.Equal(
+            global::MonitorAudioRouterNativeHost.BrowserBridgeProtocol.EnvelopeFixedCharacters,
+            global::MonitorAudioRouterNativeHost.Program.BrowserBridgeSecurity.SerializeEnvelope("", "").Length,
+            "The fixed envelope-character count must match the actual native-host serializer shape.");
+        RegressionAssert.Contains("\\u007F", trayEnvelope, "The fixture character should exercise the six-character worst-case Unicode escape.");
+        RegressionAssert.True(
+            global::MonitorAudioRouter.BrowserBridgeProtocol.IsEnvelopeLengthAllowed(trayEnvelope.Length),
+            "The tray must accept a worst-case exact-limit browser frame.");
+        RegressionAssert.True(
+            global::MonitorAudioRouterNativeHost.BrowserBridgeProtocol.IsEnvelopeLengthAllowed(nativeEnvelope.Length),
+            "The native host must accept a worst-case exact-limit browser frame.");
+    }
+
+    private static void OneCharacterEnvelopeOverrunIsRejected()
+    {
+        var maximumCharacters = global::MonitorAudioRouter.BrowserBridgeProtocol.MaximumPipeMessageCharacters;
+        RegressionAssert.True(
+            global::MonitorAudioRouter.BrowserBridgeProtocol.IsEnvelopeLengthAllowed(maximumCharacters),
+            "The tray should accept an envelope exactly at the derived capacity.");
+        RegressionAssert.True(
+            !global::MonitorAudioRouter.BrowserBridgeProtocol.IsEnvelopeLengthAllowed(maximumCharacters + 1),
+            "The tray should reject a one-character envelope overrun.");
+        RegressionAssert.True(
+            !global::MonitorAudioRouterNativeHost.BrowserBridgeProtocol.IsEnvelopeLengthAllowed(maximumCharacters + 1),
+            "The native host should reject the same one-character envelope overrun.");
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(new string('x', maximumCharacters + 1) + "\n"));
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+
+        RegressionAssert.Throws<InvalidDataException>(() =>
+            InvokeBoundedBrowserLineRead(reader, maximumCharacters, TimeSpan.FromSeconds(5)));
     }
 
     private static void DisconnectedPartialBrowserPipeLinesFail()

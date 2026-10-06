@@ -13,5 +13,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\MonitorAudioRouter.csproj" />
     <ProjectReference Include="..\..\installer-src\MonitorAudioRouterSetup.csproj" />
+    <ProjectReference Include="..\..\native-host-src\MonitorAudioRouterNativeHost.csproj" />
   </ItemGroup>
 </Project>

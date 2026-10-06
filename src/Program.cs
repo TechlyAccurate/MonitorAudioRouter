@@ -1837,14 +1837,23 @@ internal sealed class ScanScheduler : IDisposable
 internal static class BrowserBridgeProtocol
 {
     public const int MaximumBrowserMessageBytes = 1024 * 1024;
-    public const int EnvelopeFramingOverheadCharacters = 1024;
-
-    // Valid JSON embedded as a JSON string can at most double for local
-    // quote, slash, and line-break escaping. The fixed allowance covers the
-    // envelope properties, a bounded token, and future local framing fields.
-    public const int MaximumPipeMessageCharacters =
-        (2 * MaximumBrowserMessageBytes) + EnvelopeFramingOverheadCharacters;
     public const int MaximumTokenCharacters = 512;
+    public const int MaximumSerializedCharacterExpansion = 6;
+    public const int EnvelopeFixedCharacters = 54;
+
+    // UnsafeRelaxedJsonEscaping can emit one six-character \uXXXX escape for
+    // each input UTF-16 unit. A valid UTF-8 frame has no more UTF-16 units than
+    // bytes. The token is bounded in UTF-16 units, and the fixed count is the
+    // exact serialized envelope with empty token and payload values.
+    public const int MaximumPipeMessageCharacters =
+        (MaximumSerializedCharacterExpansion * MaximumBrowserMessageBytes) +
+        (MaximumSerializedCharacterExpansion * MaximumTokenCharacters) +
+        EnvelopeFixedCharacters;
+
+    public static bool IsEnvelopeLengthAllowed(int characterCount)
+    {
+        return characterCount >= 0 && characterCount <= MaximumPipeMessageCharacters;
+    }
 }
 
 internal sealed class BrowserHintServer : IDisposable
@@ -2914,7 +2923,7 @@ internal static class NativeMessagingHost
         try
         {
             var envelope = BrowserBridgeSecurity.CreateEnvelope(json);
-            if (envelope.Length > BrowserBridgeProtocol.MaximumPipeMessageCharacters)
+            if (!BrowserBridgeProtocol.IsEnvelopeLengthAllowed(envelope.Length))
             {
                 return false;
             }

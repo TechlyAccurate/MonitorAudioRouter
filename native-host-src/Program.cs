@@ -6,19 +6,30 @@ using System.Text.Json;
 
 namespace MonitorAudioRouterNativeHost;
 
+internal static class BrowserBridgeProtocol
+{
+    public const int MaximumBrowserMessageBytes = 1024 * 1024;
+    public const int MaximumTokenCharacters = 512;
+    public const int MaximumSerializedCharacterExpansion = 6;
+    public const int EnvelopeFixedCharacters = 54;
+
+    // Keep this exactly equivalent to BrowserBridgeProtocol in the tray
+    // project. See that definition for the serializer-expansion proof.
+    public const int MaximumPipeMessageCharacters =
+        (MaximumSerializedCharacterExpansion * MaximumBrowserMessageBytes) +
+        (MaximumSerializedCharacterExpansion * MaximumTokenCharacters) +
+        EnvelopeFixedCharacters;
+
+    public static bool IsEnvelopeLengthAllowed(int characterCount)
+    {
+        return characterCount >= 0 && characterCount <= MaximumPipeMessageCharacters;
+    }
+}
+
 internal static class Program
 {
     private const string PipeName = "MonitorAudioRouterHints";
     private const int TrayConnectTimeoutMs = 500;
-    private const int MaximumBrowserMessageBytes = 1024 * 1024;
-    private const int EnvelopeFramingOverheadCharacters = 1024;
-
-    // Keep this equivalent to BrowserBridgeProtocol in the tray project.
-    // Valid JSON can at most double under the local JSON-in-JSON encoder; the
-    // fixed allowance covers the envelope, bounded token, and framing fields.
-    private const int MaximumPipeMessageCharacters =
-        (2 * MaximumBrowserMessageBytes) + EnvelopeFramingOverheadCharacters;
-    private const int MaximumTokenCharacters = 512;
     private const string BrowserBridgeTokenFileName = "browser-bridge.token";
     private const string AppDataFolderName = "Monitor Audio Router";
     private static readonly TimeSpan InitialMessageTimeout = TimeSpan.FromSeconds(15);
@@ -62,7 +73,7 @@ internal static class Program
         }
 
         var length = BitConverter.ToInt32(lengthBytes, 0);
-        if (length <= 0 || length > MaximumBrowserMessageBytes)
+        if (length <= 0 || length > BrowserBridgeProtocol.MaximumBrowserMessageBytes)
         {
             LogThrottled(
                 "native-host-rejected-length",
@@ -119,7 +130,7 @@ internal static class Program
         try
         {
             var envelope = BrowserBridgeSecurity.CreateEnvelope(json);
-            if (envelope.Length > MaximumPipeMessageCharacters)
+            if (!BrowserBridgeProtocol.IsEnvelopeLengthAllowed(envelope.Length))
             {
                 LogThrottled(
                     "native-host-rejected-envelope-length",
@@ -201,7 +212,7 @@ internal static class Program
 
     private static string BrowserBridgeTokenFile => Path.Combine(UserDataRoot, BrowserBridgeTokenFileName);
 
-    private static class BrowserBridgeSecurity
+    internal static class BrowserBridgeSecurity
     {
         private const string EnvelopeType = "browserHintEnvelope";
         private const int TokenByteCount = 32;
@@ -215,10 +226,15 @@ internal static class Program
 
         public static string CreateEnvelope(string payloadJson)
         {
+            return SerializeEnvelope(payloadJson, GetToken());
+        }
+
+        internal static string SerializeEnvelope(string payloadJson, string token)
+        {
             return JsonSerializer.Serialize(new BrowserBridgeEnvelope
             {
                 Type = EnvelopeType,
-                Token = GetToken(),
+                Token = token,
                 Payload = payloadJson
             }, JsonOptions);
         }
@@ -255,7 +271,7 @@ internal static class Program
                     if (File.Exists(BrowserBridgeTokenFile))
                     {
                         var existing = File.ReadAllText(BrowserBridgeTokenFile).Trim();
-                        if (existing.Length is >= 32 and <= MaximumTokenCharacters)
+                        if (existing.Length is >= 32 and <= BrowserBridgeProtocol.MaximumTokenCharacters)
                         {
                             _token = existing;
                             return _token;
