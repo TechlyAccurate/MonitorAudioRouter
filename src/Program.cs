@@ -5438,6 +5438,7 @@ internal sealed class DeferredSubscriptionManager<T> : IDisposable where T : cla
             var isTerminal = state.IsTerminal || state.DisposalRequested;
             if (_disposed && !isTerminal)
             {
+                state.DisposalCommitted = true;
                 return false;
             }
 

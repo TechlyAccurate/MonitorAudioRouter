@@ -221,11 +221,17 @@ function Install-FirefoxPolicies {
         $extensionSetting.private_browsing = $true
     }
 
-    $settings = @{
-        $firefoxExtensionId = $extensionSetting
-    } | ConvertTo-Json -Compress -Depth 10
+    $settings = [pscustomobject]@{}
+    if (Test-Path -LiteralPath $policyRoot) {
+        $existingValue = (Get-ItemProperty -LiteralPath $policyRoot -Name "ExtensionSettings" -ErrorAction SilentlyContinue).ExtensionSettings
+        if (-not [string]::IsNullOrWhiteSpace([string]$existingValue)) {
+            $settings = $existingValue | ConvertFrom-Json
+        }
+    }
 
-    Set-StringPolicy $policyRoot "ExtensionSettings" $settings
+    $settings | Add-Member -NotePropertyName $firefoxExtensionId -NotePropertyValue $extensionSetting -Force
+
+    Set-StringPolicy $policyRoot "ExtensionSettings" ($settings | ConvertTo-Json -Compress -Depth 10)
 }
 
 function Install-ShortcutsAndAutostart {

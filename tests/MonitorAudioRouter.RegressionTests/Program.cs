@@ -13,6 +13,19 @@ internal static class Program
         runner.Add("Regression runner reports passing and failing checks", RegressionRunnerReportsPassAndFail);
         runner.Add("Tray application assembly loads through its project reference", TrayAssemblyLoadsThroughProjectReference);
         runner.Add("Installer assembly loads through its project reference", InstallerAssemblyLoadsThroughProjectReference);
+        runner.Add("Installer update arguments preserve every installed option", InstallerUpdateArgumentsPreserveEveryInstalledOption);
+        runner.Add("Legacy install information remains readable", LegacyInstallInformationRemainsReadable);
+        runner.Add("Installed executable matching requires a normalized full path", InstalledExecutableMatchingRequiresNormalizedFullPath);
+        runner.Add("Changed registry values are retained during uninstall", ChangedRegistryValuesAreRetainedDuringUninstall);
+        runner.Add("Unchanged installer registry values restore their predecessor", UnchangedInstallerRegistryValuesRestoreTheirPredecessor);
+        runner.Add("Unchanged new installer registry values are deleted", UnchangedNewInstallerRegistryValuesAreDeleted);
+        runner.Add("Registry ownership across update keeps the original predecessor", RegistryOwnershipAcrossUpdateKeepsOriginalPredecessor);
+        runner.Add("Failed staging cannot select replacement", FailedStagingCannotSelectReplacement);
+        runner.Add("Failed replacement selects rollback", FailedReplacementSelectsRollback);
+        runner.Add("Replacement paths must stay inside their bounded root", ReplacementPathsMustStayInsideBoundedRoot);
+        runner.Add("Updater accepts only expected HTTPS GitHub release hosts", UpdaterAcceptsOnlyExpectedHttpsGitHubReleaseHosts);
+        runner.Add("Updater rejects a reparse-point download directory", UpdaterRejectsReparsePointDownloadDirectory);
+        runner.Add("Updater requires a matching checksum immediately before launch", UpdaterRequiresMatchingChecksumImmediatelyBeforeLaunch);
         runner.Add("Missing configuration returns first-run defaults", MissingConfigurationReturnsFirstRunDefaults);
         runner.Add("Malformed configuration fails disabled without an autostart decision", MalformedConfigurationFailsDisabledWithoutAutostartDecision);
         runner.Add("Disabling reload clears managed routes before engine disposal", DisablingReloadClearsRoutesBeforeEngineDisposal);
@@ -26,6 +39,9 @@ internal static class Program
         runner.Add("Scheduled cleanup waits for an overlapping terminal callback", ScheduledCleanupWaitsForOverlappingTerminalCallback);
         runner.Add("Shutdown cleanup claim rejects a later terminal callback", ShutdownCleanupClaimRejectsLaterTerminalCallback);
         runner.Add("Stale cleanup claim rejects a later terminal callback", StaleCleanupClaimRejectsLaterTerminalCallback);
+        runner.Add(
+            "Pre-admission shutdown rejection commits disposal before caller cleanup",
+            PreAdmissionShutdownRejectionCommitsDisposalBeforeCallerCleanup);
         runner.Add("All absent role values produce Default", AllAbsentRoleValuesProduceDefault);
         runner.Add("Any untrustworthy role query produces Unavailable unless a consistent explicit endpoint is proven", UntrustworthyRoleQueryProducesUnavailableWithoutExplicitEndpoint);
         runner.Add("An explicit endpoint produces Explicit with its ID", ExplicitEndpointProducesExplicitWithItsId);
@@ -99,6 +115,250 @@ internal static class Program
 
         RegressionAssert.Equal("MonitorAudioRouterSetup", assembly.GetName().Name, "The installer assembly name should be preserved.");
         RegressionAssert.True(!assembly.IsDynamic, "The installer assembly should load from a compiled project reference.");
+    }
+
+    private static void InstallerUpdateArgumentsPreserveEveryInstalledOption()
+    {
+        var installedOptions = new global::MonitorAudioRouter.Setup.InstalledOptions(
+            InstallBrowserExtensions: true,
+            Autostart: false,
+            EnablePrivateBrowsing: true,
+            ChromeExtensionId: "chrome-installed-id",
+            ChromeUpdateUrl: "https://clients2.google.com/service/update2/crx",
+            EdgeExtensionId: "edge-installed-id",
+            EdgeUpdateUrl: "https://edge.microsoft.com/extensionwebstorebase/v1/crx",
+            FirefoxExtensionId: "firefox-installed-id@example.test",
+            FirefoxInstallUrl: "https://addons.mozilla.org/firefox/downloads/file/installed.xpi");
+
+        var arguments = global::MonitorAudioRouter.Setup.InstallDecisions.BuildForwardedArguments(installedOptions);
+
+        RegressionAssert.Equal(
+            "/browserextensions|/noautostart|/enableprivatebrowsing|" +
+            "/ChromeExtensionId=chrome-installed-id|" +
+            "/ChromeUpdateUrl=https://clients2.google.com/service/update2/crx|" +
+            "/EdgeExtensionId=edge-installed-id|" +
+            "/EdgeUpdateUrl=https://edge.microsoft.com/extensionwebstorebase/v1/crx|" +
+            "/FirefoxExtensionId=firefox-installed-id@example.test|" +
+            "/FirefoxInstallUrl=https://addons.mozilla.org/firefox/downloads/file/installed.xpi",
+            string.Join('|', arguments),
+            "The updater handoff must forward every persisted install choice.");
+    }
+
+    private static void LegacyInstallInformationRemainsReadable()
+    {
+        const string legacyJson = """
+            {
+              "ChromeExtensionIds": ["legacy-chrome"],
+              "EdgeExtensionIds": ["legacy-edge"],
+              "FirefoxExtensionIds": ["legacy-firefox@example.test"],
+              "PrivateBrowsingEnabled": true
+            }
+            """;
+        var fallback = new global::MonitorAudioRouter.Setup.InstalledOptions(
+            InstallBrowserExtensions: false,
+            Autostart: false,
+            EnablePrivateBrowsing: false,
+            ChromeExtensionId: "fallback-chrome",
+            ChromeUpdateUrl: "fallback-chrome-url",
+            EdgeExtensionId: "fallback-edge",
+            EdgeUpdateUrl: "fallback-edge-url",
+            FirefoxExtensionId: "fallback-firefox",
+            FirefoxInstallUrl: "fallback-firefox-url");
+
+        var installInfo = global::MonitorAudioRouter.Setup.InstallInfo.Deserialize(legacyJson);
+        var resolved = installInfo.ResolveOptions(fallback);
+
+        RegressionAssert.Equal("legacy-chrome", resolved.ChromeExtensionId, "Legacy Chrome IDs should remain readable.");
+        RegressionAssert.Equal("legacy-edge", resolved.EdgeExtensionId, "Legacy Edge IDs should remain readable.");
+        RegressionAssert.Equal("legacy-firefox@example.test", resolved.FirefoxExtensionId, "Legacy Firefox IDs should remain readable.");
+        RegressionAssert.True(resolved.EnablePrivateBrowsing, "The legacy private browsing choice should be preserved.");
+        RegressionAssert.True(!resolved.InstallBrowserExtensions, "Missing legacy choices should use the supplied fallback.");
+        RegressionAssert.True(!resolved.Autostart, "Missing legacy autostart should use the supplied fallback.");
+    }
+
+    private static void InstalledExecutableMatchingRequiresNormalizedFullPath()
+    {
+        var installRoot = Path.Combine(Path.GetTempPath(), "Monitor Audio Router", "installed");
+        var expected = Path.Combine(installRoot, "MonitorAudioRouter.exe");
+        var equivalent = Path.Combine(installRoot, ".", "MonitorAudioRouter.exe");
+        var unrelated = Path.Combine(Path.GetTempPath(), "other", "MonitorAudioRouter.exe");
+
+        RegressionAssert.True(
+            global::MonitorAudioRouter.Setup.InstallDecisions.IsExactExecutablePath(equivalent, expected),
+            "Equivalent normalized paths should match.");
+        RegressionAssert.True(
+            !global::MonitorAudioRouter.Setup.InstallDecisions.IsExactExecutablePath(unrelated, expected),
+            "A same-named executable outside the install root must not match.");
+    }
+
+    private static void ChangedRegistryValuesAreRetainedDuringUninstall()
+    {
+        var ownership = CreateRegistryOwnership(priorExists: true, priorValue: "before", writtenValue: "installed");
+        var current = new global::MonitorAudioRouter.Setup.RegistryValueSnapshot(true, "changed", "String");
+
+        var decision = global::MonitorAudioRouter.Setup.InstallDecisions.DecideRegistryRemoval(ownership, current);
+
+        RegressionAssert.Equal(
+            global::MonitorAudioRouter.Setup.RegistryRemovalAction.RetainCurrent,
+            decision.Action,
+            "A value changed after install must remain untouched.");
+    }
+
+    private static void UnchangedInstallerRegistryValuesRestoreTheirPredecessor()
+    {
+        var ownership = CreateRegistryOwnership(priorExists: true, priorValue: "before", writtenValue: "installed");
+        var current = new global::MonitorAudioRouter.Setup.RegistryValueSnapshot(true, "installed", "String");
+
+        var decision = global::MonitorAudioRouter.Setup.InstallDecisions.DecideRegistryRemoval(ownership, current);
+
+        RegressionAssert.Equal(
+            global::MonitorAudioRouter.Setup.RegistryRemovalAction.RestorePrior,
+            decision.Action,
+            "An unchanged owned value should restore its predecessor.");
+        RegressionAssert.Equal("before", decision.Value?.Value, "The recorded predecessor should be restored.");
+    }
+
+    private static void UnchangedNewInstallerRegistryValuesAreDeleted()
+    {
+        var ownership = CreateRegistryOwnership(priorExists: false, priorValue: null, writtenValue: "installed");
+        var current = new global::MonitorAudioRouter.Setup.RegistryValueSnapshot(true, "installed", "String");
+
+        var decision = global::MonitorAudioRouter.Setup.InstallDecisions.DecideRegistryRemoval(ownership, current);
+
+        RegressionAssert.Equal(
+            global::MonitorAudioRouter.Setup.RegistryRemovalAction.Delete,
+            decision.Action,
+            "An unchanged value created by the installer should be deleted.");
+    }
+
+    private static void RegistryOwnershipAcrossUpdateKeepsOriginalPredecessor()
+    {
+        var previousOwnership = CreateRegistryOwnership(
+            priorExists: true,
+            priorValue: "before-first-install",
+            writtenValue: "first-install");
+        var recorder = new global::MonitorAudioRouter.Setup.RegistryOwnershipRecorder([previousOwnership]);
+        var current = new global::MonitorAudioRouter.Setup.RegistryValueSnapshot(true, "first-install", "String");
+        var updated = new global::MonitorAudioRouter.Setup.RegistryValueSnapshot(true, "updated-install", "String");
+
+        recorder.Record(
+            previousOwnership.Hive,
+            previousOwnership.SubKey,
+            previousOwnership.ValueName,
+            current,
+            updated,
+            jsonPropertyName: null);
+
+        var recorded = recorder.Values.Single();
+        RegressionAssert.Equal("before-first-install", recorded.Prior.Value, "Update must preserve the original predecessor.");
+        RegressionAssert.Equal("updated-install", recorded.Written.Value, "Update must record the replacement value.");
+    }
+
+    private static global::MonitorAudioRouter.Setup.RegistryValueOwnership CreateRegistryOwnership(
+        bool priorExists,
+        string? priorValue,
+        string writtenValue)
+    {
+        return new global::MonitorAudioRouter.Setup.RegistryValueOwnership(
+            Hive: "HKLM",
+            SubKey: @"Software\MonitorAudioRouter\Test",
+            ValueName: "Value",
+            Prior: new global::MonitorAudioRouter.Setup.RegistryValueSnapshot(priorExists, priorValue, "String"),
+            Written: new global::MonitorAudioRouter.Setup.RegistryValueSnapshot(true, writtenValue, "String"),
+            JsonPropertyName: null);
+    }
+
+    private static void FailedStagingCannotSelectReplacement()
+    {
+        var action = global::MonitorAudioRouter.Setup.InstallDecisions.SelectReplacementAction(
+            stagingValidated: false,
+            replacementSucceeded: false);
+
+        RegressionAssert.Equal(
+            global::MonitorAudioRouter.Setup.ReplacementAction.Abort,
+            action,
+            "An invalid stage must never be selected for replacement.");
+    }
+
+    private static void FailedReplacementSelectsRollback()
+    {
+        var action = global::MonitorAudioRouter.Setup.InstallDecisions.SelectReplacementAction(
+            stagingValidated: true,
+            replacementSucceeded: false);
+
+        RegressionAssert.Equal(
+            global::MonitorAudioRouter.Setup.ReplacementAction.Rollback,
+            action,
+            "A failed replacement after validation must select rollback.");
+    }
+
+    private static void ReplacementPathsMustStayInsideBoundedRoot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "MonitorAudioRouter", "stage");
+        var child = Path.Combine(root, "app", "MonitorAudioRouter.exe");
+        var sibling = Path.Combine(Path.GetDirectoryName(root)!, "stage-escape", "file.txt");
+
+        RegressionAssert.True(
+            global::MonitorAudioRouter.Setup.InstallDecisions.IsPathWithinRoot(root, child),
+            "A staged child should remain inside the bounded root.");
+        RegressionAssert.True(
+            !global::MonitorAudioRouter.Setup.InstallDecisions.IsPathWithinRoot(root, sibling),
+            "A sibling with a shared name prefix must not pass the root boundary.");
+    }
+
+    private static void UpdaterAcceptsOnlyExpectedHttpsGitHubReleaseHosts()
+    {
+        RegressionAssert.True(
+            global::MonitorAudioRouter.Setup.InstallDecisions.IsAllowedReleaseUri(
+                "https://api.github.com/repos/TechlyAccurate/MonitorAudioRouter/releases/latest",
+                isApiRequest: true),
+            "The exact GitHub release API endpoint should be accepted.");
+        RegressionAssert.True(
+            global::MonitorAudioRouter.Setup.InstallDecisions.IsAllowedReleaseUri(
+                "https://github.com/TechlyAccurate/MonitorAudioRouter/releases/download/v1/MonitorAudioRouterSetup.exe",
+                isApiRequest: false),
+            "The expected GitHub release asset path should be accepted.");
+        RegressionAssert.True(
+            !global::MonitorAudioRouter.Setup.InstallDecisions.IsAllowedReleaseUri(
+                "http://github.com/TechlyAccurate/MonitorAudioRouter/releases/download/v1/MonitorAudioRouterSetup.exe",
+                isApiRequest: false),
+            "Non-HTTPS release assets must be rejected.");
+        RegressionAssert.True(
+            !global::MonitorAudioRouter.Setup.InstallDecisions.IsAllowedReleaseUri(
+                "https://github.example/TechlyAccurate/MonitorAudioRouter/releases/download/v1/MonitorAudioRouterSetup.exe",
+                isApiRequest: false),
+            "Lookalike release hosts must be rejected.");
+    }
+
+    private static void UpdaterRejectsReparsePointDownloadDirectory()
+    {
+        RegressionAssert.True(
+            !global::MonitorAudioRouter.Setup.InstallDecisions.IsSafeUpdateDirectory(FileAttributes.Directory | FileAttributes.ReparsePoint),
+            "A reparse-point update directory must be rejected.");
+        RegressionAssert.True(
+            global::MonitorAudioRouter.Setup.InstallDecisions.IsSafeUpdateDirectory(FileAttributes.Directory),
+            "A normal directory should be accepted.");
+    }
+
+    private static void UpdaterRequiresMatchingChecksumImmediatelyBeforeLaunch()
+    {
+        const string expected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const string changed = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        RegressionAssert.True(
+            !global::MonitorAudioRouter.Setup.InstallDecisions.CanLaunchVerifiedInstaller(
+                expected,
+                downloadedHash: expected,
+                immediatePreLaunchHash: changed,
+                updateDirectoryIsSafe: true),
+            "Changing the installer after download verification must block launch.");
+        RegressionAssert.True(
+            global::MonitorAudioRouter.Setup.InstallDecisions.CanLaunchVerifiedInstaller(
+                expected,
+                downloadedHash: expected,
+                immediatePreLaunchHash: expected,
+                updateDirectoryIsSafe: true),
+            "Matching download and immediate pre-launch hashes should permit launch.");
     }
 
     private static void MissingConfigurationReturnsFirstRunDefaults()
@@ -624,6 +884,64 @@ internal static class Program
 
         manager.Dispose();
         RegressionAssert.Equal(1, disposalCount, "Queued cleanup and shutdown must dispose the claimed session exactly once.");
+    }
+
+    private static void PreAdmissionShutdownRejectionCommitsDisposalBeforeCallerCleanup()
+    {
+        using var callerCleanupStarted = new ManualResetEventSlim();
+        using var allowCallerCleanup = new ManualResetEventSlim();
+        var session = new object();
+        var callbackBodyCount = 0;
+        var callbackCleanupOverlapCount = 0;
+        var callerCleanupActive = 0;
+        var disposalCount = 0;
+        var manager = new global::MonitorAudioRouter.DeferredSubscriptionManager<object>(
+            scheduleCleanup: _ => throw new InvalidOperationException("Rejected ownership should not schedule cleanup."),
+            disposeItem: _ => throw new InvalidOperationException("The manager must not dispose an unadmitted session."));
+        var eventsClient = new global::MonitorAudioRouter.AudioSessionEventsClient(
+            _ => { },
+            () => manager.RunTerminalCallback(session, () =>
+            {
+                Interlocked.Increment(ref callbackBodyCount);
+                if (Volatile.Read(ref callerCleanupActive) != 0)
+                {
+                    Interlocked.Increment(ref callbackCleanupOverlapCount);
+                }
+            }));
+
+        manager.Dispose();
+        var managerOwned = manager.TryTakeOwnership(session);
+        var callerCleanupTask = Task.Run(() =>
+        {
+            Volatile.Write(ref callerCleanupActive, 1);
+            callerCleanupStarted.Set();
+            try
+            {
+                allowCallerCleanup.Wait();
+                Interlocked.Increment(ref disposalCount);
+            }
+            finally
+            {
+                Volatile.Write(ref callerCleanupActive, 0);
+            }
+        });
+
+        try
+        {
+            RegressionAssert.True(callerCleanupStarted.Wait(TimeSpan.FromSeconds(5)), "Caller cleanup should start.");
+            eventsClient.OnSessionDisconnected(global::MonitorAudioRouter.AudioSessionDisconnectReason.DeviceRemoval);
+            RegressionAssert.Equal(0, callbackBodyCount, "A late callback must be rejected after ownership rejection commits disposal.");
+            RegressionAssert.Equal(0, callbackCleanupOverlapCount, "A callback body must not overlap caller cleanup.");
+        }
+        finally
+        {
+            allowCallerCleanup.Set();
+            callerCleanupTask.GetAwaiter().GetResult();
+        }
+
+        manager.Dispose();
+        RegressionAssert.True(!managerOwned, "A disposed manager must reject an unadmitted nonterminal session.");
+        RegressionAssert.Equal(1, disposalCount, "Rejected ownership must leave exactly one caller disposal.");
     }
 
     private static void AllAbsentRoleValuesProduceDefault()

@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO.Compression;
 using System.Net.Http.Headers;
 using System.Reflection;
+using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Security.Cryptography;
 using System.Text;
@@ -9,6 +10,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using MonitorAudioRouter.Setup;
 
 const string AppName = "Monitor Audio Router";
 const string AppId = "MonitorAudioRouter";
@@ -36,41 +38,62 @@ if (options.Canceled)
 
 WriteInstallerLog($"Setup started. Version={AppVersion}; ProcessId={Environment.ProcessId}; Arguments={FormatArgumentsForLog(args)}");
 
-if (options.UpdateToLatestDuringInstall && TryLaunchNewerInstaller(options))
+var installDir = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+    AppName);
+var previousInstallInfo = ReadInstallInfo(installDir);
+if (options.UpdateToLatestDuringInstall && TryLaunchNewerInstaller(options, previousInstallInfo))
 {
     WriteInstallerLog("Setup handed off to a newer published installer.");
     return;
 }
 
-var installDir = Path.Combine(
-    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-    AppName);
-
+var replacementApplied = false;
+string? pendingBackupDir = null;
 try
 {
     var tempDir = Path.Combine(Path.GetTempPath(), AppId + "-" + Guid.NewGuid().ToString("N"));
     Directory.CreateDirectory(tempDir);
+    var replacementRoot = Path.GetDirectoryName(installDir)
+        ?? throw new InvalidOperationException("The installation directory does not have a parent directory.");
+    var replacementId = Guid.NewGuid().ToString("N");
+    var stagingContainer = Path.Combine(replacementRoot, $".{AppId}-stage-{replacementId}");
+    var stagedInstallDir = Path.Combine(stagingContainer, AppName);
+    var backupDir = Path.Combine(replacementRoot, $".{AppId}-backup-{replacementId}");
     try
     {
         WriteInstallerLog($"Extracting payload to {tempDir}.");
         ExtractPayload(tempDir);
+        WriteInstallerLog($"Staging and validating replacement at {stagedInstallDir}.");
+        StageInstallation(tempDir, installDir, stagedInstallDir);
+        ValidateStagedInstallation(stagedInstallDir);
         WriteInstallerLog($"Stopping existing app processes before installing to {installDir}.");
         StopExistingApp(installDir);
-        WriteInstallerLog("Copying application files.");
-        InstallFiles(tempDir, installDir);
+        WriteInstallerLog("Replacing application files transactionally.");
+        var backupCreated = ReplaceInstallation(stagedInstallDir, installDir, backupDir);
+        replacementApplied = true;
+        pendingBackupDir = backupCreated ? backupDir : null;
+        var registryOwnership = new RegistryOwnershipRecorder(previousInstallInfo?.RegistryValues);
         WriteInstallerLog("Writing native messaging manifests.");
         WriteNativeMessagingManifests(installDir, options);
         WriteInstallerLog("Registering native messaging hosts.");
-        RegisterNativeMessagingHosts(installDir);
+        RegisterNativeMessagingHosts(installDir, registryOwnership);
         WriteInstallerLog("Registering browser extension deployment policies.");
-        var browserExtensionDeployment = RegisterBrowserExtensionPolicies(options);
+        var browserExtensionDeployment = RegisterBrowserExtensionPolicies(options, registryOwnership);
         WriteInstallerLog("Applying startup and shortcut settings.");
-        SetStartup(installDir, options.Autostart);
+        SetStartup(installDir, options.Autostart, registryOwnership);
         InstallStartMenuShortcut(installDir);
         WriteUserAutostartSetting(options.Autostart);
-        WriteInstallInfo(installDir, options);
-        RegisterUninstaller(installDir);
+        RegisterUninstaller(installDir, registryOwnership);
+        WriteInstallInfo(installDir, options, registryOwnership.Values);
         WriteInstallerLog("Install registry state written.");
+        if (pendingBackupDir is not null)
+        {
+            TryDeleteDirectory(pendingBackupDir);
+            pendingBackupDir = null;
+        }
+
+        replacementApplied = false;
 
         if (options.Launch)
         {
@@ -90,17 +113,34 @@ try
     finally
     {
         TryDeleteDirectory(tempDir);
+        TryDeleteDirectory(stagingContainer);
     }
 }
 catch (Exception exception)
 {
+    Exception reportedException = exception;
+    if (replacementApplied)
+    {
+        try
+        {
+            RollBackInstallation(installDir, pendingBackupDir);
+        }
+        catch (Exception rollbackException)
+        {
+            reportedException = new AggregateException(
+                "Installation failed and the prior payload could not be restored.",
+                exception,
+                rollbackException);
+        }
+    }
+
     Console.Error.WriteLine("Install failed:");
-    Console.Error.WriteLine(exception);
-    WriteInstallerLog($"Setup failed: {exception}");
+    Console.Error.WriteLine(reportedException);
+    WriteInstallerLog($"Setup failed: {reportedException}");
     if (!HasSwitch(args, "/quiet"))
     {
         MessageBox.Show(
-            "Monitor Audio Router could not be installed.\n\n" + exception.Message + "\n\nSee installer.log in the app data folder for details.",
+            "Monitor Audio Router could not be installed.\n\n" + reportedException.Message + "\n\nSee installer.log in the app data folder for details.",
             "Monitor Audio Router setup failed",
             MessageBoxButtons.OK,
             MessageBoxIcon.Error);
@@ -119,59 +159,85 @@ static void ExtractPayload(string tempDir)
 
 static void StopExistingApp(string installDir)
 {
-    TryClearManagedRoutes(installDir);
-
-    foreach (var processName in new[] { "MonitorAudioRouter", "MonitorAudioRouterNativeHost" })
+    var expectedPaths = new[]
     {
-        var processes = Process.GetProcessesByName(processName);
+        Path.Combine(installDir, "MonitorAudioRouter.exe"),
+        Path.Combine(installDir, "MonitorAudioRouterNativeHost.exe")
+    };
+    var installedProcesses = new List<Process>();
+    foreach (var process in Process.GetProcesses())
+    {
         try
         {
-            foreach (var process in processes)
-            {
-                try
-                {
-                    if (process.Id == Environment.ProcessId)
-                    {
-                        continue;
-                    }
-
-                    WriteInstallerLog($"Stopping {process.ProcessName} PID {process.Id}.");
-                    process.Kill(entireProcessTree: false);
-                }
-                catch (Exception exception)
-                {
-                    WriteInstallerLog($"Could not stop {process.ProcessName} PID {process.Id}: {exception.Message}");
-                }
-            }
-
-            var deadline = DateTime.UtcNow.AddSeconds(10);
-            foreach (var process in processes)
-            {
-                try
-                {
-                    var remaining = deadline - DateTime.UtcNow;
-                    if (remaining > TimeSpan.Zero)
-                    {
-                        process.WaitForExit((int)Math.Min(remaining.TotalMilliseconds, int.MaxValue));
-                    }
-                }
-                catch
-                {
-                    // Best effort only. File replacement below will fail if the app is still locked.
-                }
-            }
-        }
-        finally
-        {
-            foreach (var process in processes)
+            if (process.Id == Environment.ProcessId ||
+                !expectedPaths.Any(expected =>
+                    Path.GetFileNameWithoutExtension(expected).Equals(process.ProcessName, StringComparison.OrdinalIgnoreCase)))
             {
                 process.Dispose();
+                continue;
+            }
+
+            var executablePath = process.MainModule?.FileName;
+            if (executablePath is null ||
+                !expectedPaths.Any(expected => InstallDecisions.IsExactExecutablePath(executablePath, expected)))
+            {
+                process.Dispose();
+                continue;
+            }
+
+            installedProcesses.Add(process);
+        }
+        catch (Exception exception)
+        {
+            var processId = process.Id;
+            process.Dispose();
+            foreach (var installedProcess in installedProcesses)
+            {
+                installedProcess.Dispose();
+            }
+
+            throw new InvalidOperationException(
+                $"Process PID {processId} has an installed executable name, but its path could not be verified.",
+                exception);
+        }
+    }
+
+    try
+    {
+        foreach (var process in installedProcesses)
+        {
+            WriteInstallerLog($"Stopping installed executable {process.MainModule?.FileName} PID {process.Id}.");
+            process.Kill(entireProcessTree: false);
+        }
+
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        foreach (var process in installedProcesses)
+        {
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining > TimeSpan.Zero)
+            {
+                process.WaitForExit((int)Math.Min(remaining.TotalMilliseconds, int.MaxValue));
+            }
+
+            if (!process.HasExited)
+            {
+                throw new InvalidOperationException(
+                    $"Installed process PID {process.Id} did not exit within the shutdown timeout.");
             }
         }
     }
+    finally
+    {
+        foreach (var process in installedProcesses)
+        {
+            process.Dispose();
+        }
+    }
+
+    ClearManagedRoutes(installDir);
 }
 
-static void TryClearManagedRoutes(string installDir)
+static void ClearManagedRoutes(string installDir)
 {
     var existingExe = Path.Combine(installDir, "MonitorAudioRouter.exe");
     if (!File.Exists(existingExe))
@@ -179,40 +245,170 @@ static void TryClearManagedRoutes(string installDir)
         return;
     }
 
-    try
+    WriteInstallerLog("Clearing managed audio routes after installed processes stopped.");
+    using var process = Process.Start(new ProcessStartInfo(existingExe, "--clear-managed-routes")
     {
-        WriteInstallerLog("Clearing managed audio routes before app shutdown.");
-        using var process = Process.Start(new ProcessStartInfo(existingExe, "--clear-managed-routes")
+        UseShellExecute = false,
+        CreateNoWindow = true
+    }) ?? throw new InvalidOperationException("The installed route cleanup helper did not start.");
+    if (!process.WaitForExit(5000))
+    {
+        try
         {
-            UseShellExecute = false,
-            CreateNoWindow = true
-        });
-        process?.WaitForExit(5000);
+            process.Kill(entireProcessTree: false);
+        }
+        catch
+        {
+            // Report the bounded wait failure even if terminating the helper also fails.
+        }
+
+        throw new TimeoutException("The installed route cleanup helper did not exit within five seconds.");
     }
-    catch (Exception exception)
+
+    if (process.ExitCode != 0)
     {
-        WriteInstallerLog($"Managed route cleanup did not complete: {exception.Message}");
+        throw new InvalidOperationException($"The installed route cleanup helper exited with code {process.ExitCode}.");
     }
 }
 
-static void InstallFiles(string tempDir, string installDir)
+static void StageInstallation(string payloadRoot, string installDir, string stagedInstallDir)
 {
-    Directory.CreateDirectory(installDir);
+    Directory.CreateDirectory(stagedInstallDir);
 
-    CopyDirectory(Path.Combine(tempDir, "app"), installDir);
-    CopyDirectory(Path.Combine(tempDir, "extensions"), Path.Combine(installDir, "extensions"));
-    CopyDirectory(Path.Combine(tempDir, "packages"), Path.Combine(installDir, "packages"));
+    CopyDirectory(Path.Combine(payloadRoot, "app"), stagedInstallDir);
+    CopyDirectory(Path.Combine(payloadRoot, "extensions"), Path.Combine(stagedInstallDir, "extensions"));
+    CopyDirectory(Path.Combine(payloadRoot, "packages"), Path.Combine(stagedInstallDir, "packages"));
 
-    CopyIfExists(Path.Combine(tempDir, "README.md"), Path.Combine(installDir, "README.md"));
-    CopyIfExists(Path.Combine(tempDir, "PUBLISHING.md"), Path.Combine(installDir, "PUBLISHING.md"));
-    CopyIfExists(Path.Combine(tempDir, "BrowserSetup.html"), Path.Combine(installDir, "BrowserSetup.html"));
-    CopyIfExists(Path.Combine(tempDir, "Uninstall-MonitorAudioRouter.ps1"), Path.Combine(installDir, "Uninstall-MonitorAudioRouter.ps1"));
+    CopyIfExists(Path.Combine(payloadRoot, "README.md"), Path.Combine(stagedInstallDir, "README.md"));
+    CopyIfExists(Path.Combine(payloadRoot, "PUBLISHING.md"), Path.Combine(stagedInstallDir, "PUBLISHING.md"));
+    CopyIfExists(Path.Combine(payloadRoot, "BrowserSetup.html"), Path.Combine(stagedInstallDir, "BrowserSetup.html"));
+    CopyIfExists(
+        Path.Combine(payloadRoot, "Uninstall-MonitorAudioRouter.ps1"),
+        Path.Combine(stagedInstallDir, "Uninstall-MonitorAudioRouter.ps1"));
 
-    var configPath = Path.Combine(installDir, "config.json");
-    var defaultConfigPath = Path.Combine(installDir, "config.default.json");
+    CopyIfExists(Path.Combine(installDir, "config.json"), Path.Combine(stagedInstallDir, "config.json"));
+    CopyIfExists(Path.Combine(installDir, "install-info.json"), Path.Combine(stagedInstallDir, "install-info.json"));
+
+    var configPath = Path.Combine(stagedInstallDir, "config.json");
+    var defaultConfigPath = Path.Combine(stagedInstallDir, "config.default.json");
     if (!File.Exists(configPath) && File.Exists(defaultConfigPath))
     {
         File.Copy(defaultConfigPath, configPath);
+    }
+}
+
+static void ValidateStagedInstallation(string stagedInstallDir)
+{
+    if (!InstallDecisions.IsSafeUpdateDirectory(File.GetAttributes(stagedInstallDir)))
+    {
+        throw new InvalidOperationException("The staged installation root is a reparse point or is not a directory.");
+    }
+
+    var requiredFiles = new[]
+    {
+        "MonitorAudioRouter.exe",
+        "MonitorAudioRouterNativeHost.exe",
+        "Uninstall-MonitorAudioRouter.ps1"
+    };
+    foreach (var relativePath in requiredFiles)
+    {
+        var requiredPath = Path.Combine(stagedInstallDir, relativePath);
+        if (!InstallDecisions.IsPathWithinRoot(stagedInstallDir, requiredPath) || !File.Exists(requiredPath))
+        {
+            throw new InvalidOperationException($"The staged payload is missing required file {relativePath}.");
+        }
+    }
+
+    foreach (var path in Directory.EnumerateFileSystemEntries(stagedInstallDir, "*", SearchOption.AllDirectories))
+    {
+        if (!InstallDecisions.IsPathWithinRoot(stagedInstallDir, path))
+        {
+            throw new InvalidOperationException($"The staged payload escaped its root: {path}");
+        }
+
+        if (File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint))
+        {
+            throw new InvalidOperationException($"The staged payload contains a reparse point: {path}");
+        }
+    }
+}
+
+static bool ReplaceInstallation(string stagedInstallDir, string installDir, string backupDir)
+{
+    var replacementRoot = Path.GetDirectoryName(installDir)
+        ?? throw new InvalidOperationException("The installation directory does not have a parent directory.");
+    RequireChildPath(replacementRoot, stagedInstallDir, "staged installation");
+    RequireChildPath(replacementRoot, installDir, "installation directory");
+    RequireChildPath(replacementRoot, backupDir, "backup directory");
+
+    var backupCreated = false;
+    var replacementStarted = false;
+    try
+    {
+        if (Directory.Exists(backupDir))
+        {
+            throw new InvalidOperationException($"The backup directory already exists: {backupDir}");
+        }
+
+        if (Directory.Exists(installDir))
+        {
+            Directory.Move(installDir, backupDir);
+            backupCreated = true;
+        }
+
+        replacementStarted = true;
+        Directory.Move(stagedInstallDir, installDir);
+    }
+    catch (Exception replacementException)
+    {
+        try
+        {
+            if (replacementStarted && Directory.Exists(installDir))
+            {
+                Directory.Delete(installDir, recursive: true);
+            }
+
+            if (backupCreated)
+            {
+                Directory.Move(backupDir, installDir);
+            }
+        }
+        catch (Exception rollbackException)
+        {
+            throw new AggregateException(
+                "Installation replacement and rollback both failed.",
+                replacementException,
+                rollbackException);
+        }
+
+        throw;
+    }
+
+    return backupCreated;
+}
+
+static void RollBackInstallation(string installDir, string? backupDir)
+{
+    var replacementRoot = Path.GetDirectoryName(installDir)
+        ?? throw new InvalidOperationException("The installation directory does not have a parent directory.");
+    RequireChildPath(replacementRoot, installDir, "installation directory");
+    if (Directory.Exists(installDir))
+    {
+        Directory.Delete(installDir, recursive: true);
+    }
+
+    if (backupDir is not null)
+    {
+        RequireChildPath(replacementRoot, backupDir, "backup directory");
+        Directory.Move(backupDir, installDir);
+    }
+}
+
+static void RequireChildPath(string rootPath, string candidatePath, string description)
+{
+    if (!InstallDecisions.IsPathWithinRoot(rootPath, candidatePath))
+    {
+        throw new InvalidOperationException($"The {description} is outside its bounded root: {candidatePath}");
     }
 
 }
@@ -256,7 +452,7 @@ static void WriteNativeMessagingManifests(string installDir, InstallerOptions op
         JsonSerializer.Serialize(firefoxManifest, serializerOptions));
 }
 
-static void RegisterNativeMessagingHosts(string installDir)
+static void RegisterNativeMessagingHosts(string installDir, RegistryOwnershipRecorder registryOwnership)
 {
     var chromiumManifest = Path.Combine(installDir, "native-hosts", "chromium-com.monitoraudiorouter.router.json");
     var firefoxManifest = Path.Combine(installDir, "native-hosts", "firefox-com.monitoraudiorouter.router.json");
@@ -264,14 +460,42 @@ static void RegisterNativeMessagingHosts(string installDir)
         ? new[] { "Software", @"Software\WOW6432Node" }
         : new[] { "Software" };
 
-    foreach (var hive in new[] { Registry.LocalMachine, Registry.CurrentUser })
+    foreach (var registryLocation in new[]
+    {
+        (Hive: Registry.LocalMachine, Name: "HKLM"),
+        (Hive: Registry.CurrentUser, Name: "HKCU")
+    })
     {
         foreach (var softwareRoot in softwareRoots)
         {
-            SetDefaultValue(hive, $@"{softwareRoot}\Google\Chrome\NativeMessagingHosts\{HostName}", chromiumManifest);
-            SetDefaultValue(hive, $@"{softwareRoot}\Chromium\NativeMessagingHosts\{HostName}", chromiumManifest);
-            SetDefaultValue(hive, $@"{softwareRoot}\Microsoft\Edge\NativeMessagingHosts\{HostName}", chromiumManifest);
-            SetDefaultValue(hive, $@"{softwareRoot}\Mozilla\NativeMessagingHosts\{HostName}", firefoxManifest);
+            WriteOwnedRegistryValue(
+                registryLocation.Hive,
+                registryLocation.Name,
+                $@"{softwareRoot}\Google\Chrome\NativeMessagingHosts\{HostName}",
+                string.Empty,
+                chromiumManifest,
+                registryOwnership);
+            WriteOwnedRegistryValue(
+                registryLocation.Hive,
+                registryLocation.Name,
+                $@"{softwareRoot}\Chromium\NativeMessagingHosts\{HostName}",
+                string.Empty,
+                chromiumManifest,
+                registryOwnership);
+            WriteOwnedRegistryValue(
+                registryLocation.Hive,
+                registryLocation.Name,
+                $@"{softwareRoot}\Microsoft\Edge\NativeMessagingHosts\{HostName}",
+                string.Empty,
+                chromiumManifest,
+                registryOwnership);
+            WriteOwnedRegistryValue(
+                registryLocation.Hive,
+                registryLocation.Name,
+                $@"{softwareRoot}\Mozilla\NativeMessagingHosts\{HostName}",
+                string.Empty,
+                firefoxManifest,
+                registryOwnership);
         }
     }
 }
@@ -290,7 +514,9 @@ static void AddChromiumOrigin(List<string> origins, string extensionId)
     }
 }
 
-static BrowserExtensionDeploymentResult RegisterBrowserExtensionPolicies(InstallerOptions options)
+static BrowserExtensionDeploymentResult RegisterBrowserExtensionPolicies(
+    InstallerOptions options,
+    RegistryOwnershipRecorder registryOwnership)
 {
     var result = new BrowserExtensionDeploymentResult();
     if (!options.InstallBrowserExtensions)
@@ -307,18 +533,22 @@ static BrowserExtensionDeploymentResult RegisterBrowserExtensionPolicies(Install
             "Chrome extension policy",
             () => AddExtensionForcelistEntry(
                 Registry.LocalMachine,
+                "HKLM",
                 @"Software\Policies\Google\Chrome\ExtensionInstallForcelist",
                 options.ChromeExtensionId,
-                ChromeWebStoreUpdateUrl),
+                options.ChromeUpdateUrl,
+                registryOwnership),
             () => result.ChromePolicyInstalled = true,
             () => result.ChromePolicyFailed = true);
         installedAny |= TryRegisterPolicy(
             "Chromium extension policy",
             () => AddExtensionForcelistEntry(
                 Registry.LocalMachine,
+                "HKLM",
                 @"Software\Policies\Chromium\ExtensionInstallForcelist",
                 options.ChromeExtensionId,
-                ChromeWebStoreUpdateUrl),
+                options.ChromeUpdateUrl,
+                registryOwnership),
             () => result.ChromiumPolicyInstalled = true,
             () => result.ChromiumPolicyFailed = true);
     }
@@ -329,9 +559,11 @@ static BrowserExtensionDeploymentResult RegisterBrowserExtensionPolicies(Install
             "Edge extension policy",
             () => AddExtensionForcelistEntry(
                 Registry.LocalMachine,
+                "HKLM",
                 @"Software\Policies\Microsoft\Edge\ExtensionInstallForcelist",
                 options.EdgeExtensionId,
-                EdgeAddOnsUpdateUrl),
+                options.EdgeUpdateUrl,
+                registryOwnership),
             () => result.EdgePolicyInstalled = true,
             () => result.EdgePolicyFailed = true);
     }
@@ -340,7 +572,11 @@ static BrowserExtensionDeploymentResult RegisterBrowserExtensionPolicies(Install
     {
         installedAny |= TryRegisterPolicy(
             "Firefox extension policy",
-            () => SetFirefoxExtensionPolicy(options.FirefoxExtensionId, options.FirefoxInstallUrl, options.EnablePrivateBrowsing),
+            () => SetFirefoxExtensionPolicy(
+                options.FirefoxExtensionId,
+                options.FirefoxInstallUrl,
+                options.EnablePrivateBrowsing,
+                registryOwnership),
             () => result.FirefoxPolicyInstalled = true,
             () => result.FirefoxPolicyFailed = true);
     }
@@ -369,7 +605,13 @@ static bool TryRegisterPolicy(string name, Action action, Action onSuccess, Acti
     }
 }
 
-static void AddExtensionForcelistEntry(RegistryKey hive, string subKey, string extensionId, string updateUrl)
+static void AddExtensionForcelistEntry(
+    RegistryKey hive,
+    string hiveName,
+    string subKey,
+    string extensionId,
+    string updateUrl,
+    RegistryOwnershipRecorder registryOwnership)
 {
     var entry = $"{extensionId};{updateUrl}";
     using var key = hive.CreateSubKey(subKey, writable: true);
@@ -383,7 +625,7 @@ static void AddExtensionForcelistEntry(RegistryKey hive, string subKey, string e
         var existing = key.GetValue(valueName)?.ToString();
         if (existing is not null && existing.StartsWith(extensionId + ";", StringComparison.OrdinalIgnoreCase))
         {
-            key.SetValue(valueName, entry, RegistryValueKind.String);
+            WriteOwnedRegistryValue(hive, hiveName, subKey, valueName, entry, registryOwnership);
             return;
         }
     }
@@ -394,18 +636,31 @@ static void AddExtensionForcelistEntry(RegistryKey hive, string subKey, string e
         index++;
     }
 
-    key.SetValue(index.ToString(), entry, RegistryValueKind.String);
+    WriteOwnedRegistryValue(hive, hiveName, subKey, index.ToString(), entry, registryOwnership);
 }
 
-static void SetFirefoxExtensionPolicy(string extensionId, string installUrl, bool enablePrivateBrowsing)
+static void SetFirefoxExtensionPolicy(
+    string extensionId,
+    string installUrl,
+    bool enablePrivateBrowsing,
+    RegistryOwnershipRecorder registryOwnership)
 {
-    using var key = Registry.LocalMachine.CreateSubKey(@"Software\Policies\Mozilla\Firefox", writable: true);
+    const string subKey = @"Software\Policies\Mozilla\Firefox";
+    const string valueName = "ExtensionSettings";
+    using var key = Registry.LocalMachine.CreateSubKey(subKey, writable: true);
     if (key is null)
     {
         return;
     }
 
-    var settings = ParseJsonObject(key.GetValue("ExtensionSettings")?.ToString());
+    var currentValue = ReadRegistryValue(key, valueName);
+    EnsureStringRegistryValue(currentValue, "HKLM", subKey, valueName);
+    var settings = ParseExistingJsonObjectForMerge(currentValue.Value);
+    var priorExtensionPolicy = settings[extensionId];
+    var prior = new RegistryValueSnapshot(
+        priorExtensionPolicy is not null,
+        priorExtensionPolicy?.ToJsonString(new JsonSerializerOptions { WriteIndented = false }),
+        "Json");
     var extensionPolicy = new JsonObject
     {
         ["installation_mode"] = "force_installed",
@@ -419,7 +674,28 @@ static void SetFirefoxExtensionPolicy(string extensionId, string installUrl, boo
     }
 
     settings[extensionId] = extensionPolicy;
-    key.SetValue("ExtensionSettings", settings.ToJsonString(new JsonSerializerOptions { WriteIndented = false }), RegistryValueKind.String);
+    key.SetValue(valueName, settings.ToJsonString(new JsonSerializerOptions { WriteIndented = false }), RegistryValueKind.String);
+    registryOwnership.Record(
+        "HKLM",
+        subKey,
+        valueName,
+        prior,
+        new RegistryValueSnapshot(
+            true,
+            extensionPolicy.ToJsonString(new JsonSerializerOptions { WriteIndented = false }),
+            "Json"),
+        extensionId);
+}
+
+static JsonObject ParseExistingJsonObjectForMerge(string? json)
+{
+    if (string.IsNullOrWhiteSpace(json))
+    {
+        return new JsonObject();
+    }
+
+    return JsonNode.Parse(json) as JsonObject
+        ?? throw new InvalidOperationException("The existing Firefox ExtensionSettings value is not a JSON object.");
 }
 
 static JsonObject ParseJsonObject(string? json)
@@ -439,21 +715,28 @@ static JsonObject ParseJsonObject(string? json)
     }
 }
 
-static void SetStartup(string installDir, bool enabled)
+static void SetStartup(string installDir, bool enabled, RegistryOwnershipRecorder registryOwnership)
 {
-    using var key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run");
-    if (key is null)
-    {
-        return;
-    }
+    const string subKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
 
     if (enabled)
     {
-        key.SetValue(RunValueName, Quote(Path.Combine(installDir, "MonitorAudioRouter.exe")), RegistryValueKind.String);
+        WriteOwnedRegistryValue(
+            Registry.CurrentUser,
+            "HKCU",
+            subKey,
+            RunValueName,
+            Quote(Path.Combine(installDir, "MonitorAudioRouter.exe")),
+            registryOwnership);
     }
     else
     {
-        key.DeleteValue(RunValueName, throwOnMissingValue: false);
+        DeleteOwnedRegistryValue(
+            Registry.CurrentUser,
+            "HKCU",
+            subKey,
+            RunValueName,
+            registryOwnership);
     }
 }
 
@@ -475,22 +758,30 @@ static void WriteUserAutostartSetting(bool enabled)
     }
 }
 
-static void RegisterUninstaller(string installDir)
+static void RegisterUninstaller(string installDir, RegistryOwnershipRecorder registryOwnership)
 {
-    using var key = Registry.LocalMachine.CreateSubKey($@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{AppId}");
-    if (key is null)
-    {
-        return;
-    }
-
+    var subKey = $@"Software\Microsoft\Windows\CurrentVersion\Uninstall\{AppId}";
     var uninstallCommand = $"powershell.exe -NoProfile -ExecutionPolicy Bypass -File {Quote(Path.Combine(installDir, "Uninstall-MonitorAudioRouter.ps1"))}";
-    key.SetValue("DisplayName", AppName, RegistryValueKind.String);
-    key.SetValue("DisplayVersion", AppVersion, RegistryValueKind.String);
-    key.SetValue("Publisher", "Local", RegistryValueKind.String);
-    key.SetValue("InstallLocation", installDir, RegistryValueKind.String);
-    key.SetValue("DisplayIcon", Path.Combine(installDir, "MonitorAudioRouter.exe"), RegistryValueKind.String);
-    key.SetValue("UninstallString", uninstallCommand, RegistryValueKind.String);
-    key.SetValue("QuietUninstallString", uninstallCommand + " -Quiet", RegistryValueKind.String);
+    var values = new Dictionary<string, string>
+    {
+        ["DisplayName"] = AppName,
+        ["DisplayVersion"] = AppVersion,
+        ["Publisher"] = "Local",
+        ["InstallLocation"] = installDir,
+        ["DisplayIcon"] = Path.Combine(installDir, "MonitorAudioRouter.exe"),
+        ["UninstallString"] = uninstallCommand,
+        ["QuietUninstallString"] = uninstallCommand + " -Quiet"
+    };
+    foreach (var value in values)
+    {
+        WriteOwnedRegistryValue(
+            Registry.LocalMachine,
+            "HKLM",
+            subKey,
+            value.Key,
+            value.Value,
+            registryOwnership);
+    }
 }
 
 static void InstallStartMenuShortcut(string installDir)
@@ -520,24 +811,192 @@ static void InstallStartMenuShortcut(string installDir)
     }
 }
 
-static void WriteInstallInfo(string installDir, InstallerOptions options)
+static void WriteInstallInfo(
+    string installDir,
+    InstallerOptions options,
+    IReadOnlyList<RegistryValueOwnership> registryOwnership)
 {
-    var installInfo = new
-    {
-        ChromeExtensionIds = HasPublishedValue(options.ChromeExtensionId) ? new[] { options.ChromeExtensionId } : Array.Empty<string>(),
-        EdgeExtensionIds = HasPublishedValue(options.EdgeExtensionId) ? new[] { options.EdgeExtensionId } : Array.Empty<string>(),
-        FirefoxExtensionIds = HasPublishedValue(options.FirefoxExtensionId) ? new[] { options.FirefoxExtensionId } : Array.Empty<string>(),
-        PrivateBrowsingEnabled = options.EnablePrivateBrowsing
-    };
+    var installInfo = InstallInfo.FromOptions(ToInstalledOptions(options), registryOwnership);
     File.WriteAllText(
         Path.Combine(installDir, "install-info.json"),
-        JsonSerializer.Serialize(installInfo, new JsonSerializerOptions { WriteIndented = true }));
+        installInfo.Serialize());
 }
 
-static void SetDefaultValue(RegistryKey hive, string subKey, string value)
+static InstallInfo? ReadInstallInfo(string installDir)
 {
-    using var key = hive.CreateSubKey(subKey);
-    key?.SetValue(null, value, RegistryValueKind.String);
+    var installInfoPath = Path.Combine(installDir, "install-info.json");
+    if (!File.Exists(installInfoPath))
+    {
+        return null;
+    }
+
+    try
+    {
+        return InstallInfo.Deserialize(File.ReadAllText(installInfoPath));
+    }
+    catch (Exception exception)
+    {
+        WriteInstallerLog($"Existing install information could not be read: {exception.Message}");
+        return null;
+    }
+}
+
+static InstalledOptions ToInstalledOptions(InstallerOptions options) =>
+    new(
+        options.InstallBrowserExtensions,
+        options.Autostart,
+        options.EnablePrivateBrowsing,
+        options.ChromeExtensionId,
+        options.ChromeUpdateUrl,
+        options.EdgeExtensionId,
+        options.EdgeUpdateUrl,
+        options.FirefoxExtensionId,
+        options.FirefoxInstallUrl);
+
+static InstalledOptions ResolvePersistedOptionsForUpdate(
+    InstallerOptions options,
+    InstallInfo? previousInstallInfo)
+{
+    var currentOptions = ToInstalledOptions(options);
+    if (previousInstallInfo is null)
+    {
+        return currentOptions;
+    }
+
+    var legacyFallback = currentOptions with
+    {
+        InstallBrowserExtensions = HasInstalledBrowserPolicy(previousInstallInfo.ResolveOptions(currentOptions)),
+        Autostart = HasInstalledAutostart()
+    };
+    return previousInstallInfo.ResolveOptions(legacyFallback);
+}
+
+static bool HasInstalledAutostart()
+{
+    var installDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+        AppName);
+    using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run");
+    var current = key?.GetValue(RunValueName)?.ToString();
+    return string.Equals(
+        current,
+        Quote(Path.Combine(installDir, "MonitorAudioRouter.exe")),
+        StringComparison.OrdinalIgnoreCase);
+}
+
+static bool HasInstalledBrowserPolicy(InstalledOptions options)
+{
+    return HasExtensionForcelistEntry(
+               Registry.LocalMachine,
+               @"Software\Policies\Google\Chrome\ExtensionInstallForcelist",
+               options.ChromeExtensionId,
+               options.ChromeUpdateUrl) ||
+           HasExtensionForcelistEntry(
+               Registry.LocalMachine,
+               @"Software\Policies\Chromium\ExtensionInstallForcelist",
+               options.ChromeExtensionId,
+               options.ChromeUpdateUrl) ||
+           HasExtensionForcelistEntry(
+               Registry.LocalMachine,
+               @"Software\Policies\Microsoft\Edge\ExtensionInstallForcelist",
+               options.EdgeExtensionId,
+               options.EdgeUpdateUrl) ||
+           HasFirefoxExtensionPolicy(options.FirefoxExtensionId, options.FirefoxInstallUrl);
+}
+
+static bool HasExtensionForcelistEntry(
+    RegistryKey hive,
+    string subKey,
+    string extensionId,
+    string updateUrl)
+{
+    if (!HasPublishedValue(extensionId) || !HasPublishedValue(updateUrl))
+    {
+        return false;
+    }
+
+    using var key = hive.OpenSubKey(subKey);
+    var expected = $"{extensionId};{updateUrl}";
+    return key?.GetValueNames().Any(valueName => string.Equals(
+        key.GetValue(valueName)?.ToString(),
+        expected,
+        StringComparison.OrdinalIgnoreCase)) == true;
+}
+
+static bool HasFirefoxExtensionPolicy(string extensionId, string installUrl)
+{
+    if (!HasPublishedValue(extensionId) || !HasPublishedValue(installUrl))
+    {
+        return false;
+    }
+
+    using var key = Registry.LocalMachine.OpenSubKey(@"Software\Policies\Mozilla\Firefox");
+    var settings = ParseJsonObject(key?.GetValue("ExtensionSettings")?.ToString());
+    return settings[extensionId] is JsonObject extensionPolicy &&
+           string.Equals(
+               extensionPolicy["install_url"]?.GetValue<string>(),
+               installUrl,
+               StringComparison.OrdinalIgnoreCase);
+}
+
+static void WriteOwnedRegistryValue(
+    RegistryKey hive,
+    string hiveName,
+    string subKey,
+    string valueName,
+    string value,
+    RegistryOwnershipRecorder registryOwnership)
+{
+    using var key = hive.CreateSubKey(subKey, writable: true)
+        ?? throw new InvalidOperationException($"Registry key could not be created: {hiveName}\\{subKey}");
+    var current = ReadRegistryValue(key, valueName);
+    EnsureStringRegistryValue(current, hiveName, subKey, valueName);
+    key.SetValue(valueName, value, RegistryValueKind.String);
+    var written = ReadRegistryValue(key, valueName);
+    registryOwnership.Record(hiveName, subKey, valueName, current, written, jsonPropertyName: null);
+}
+
+static void DeleteOwnedRegistryValue(
+    RegistryKey hive,
+    string hiveName,
+    string subKey,
+    string valueName,
+    RegistryOwnershipRecorder registryOwnership)
+{
+    using var key = hive.CreateSubKey(subKey, writable: true)
+        ?? throw new InvalidOperationException($"Registry key could not be created: {hiveName}\\{subKey}");
+    var current = ReadRegistryValue(key, valueName);
+    EnsureStringRegistryValue(current, hiveName, subKey, valueName);
+    key.DeleteValue(valueName, throwOnMissingValue: false);
+    var written = ReadRegistryValue(key, valueName);
+    registryOwnership.Record(hiveName, subKey, valueName, current, written, jsonPropertyName: null);
+}
+
+static RegistryValueSnapshot ReadRegistryValue(RegistryKey key, string valueName)
+{
+    var exists = key.GetValueNames().Any(name => name.Equals(valueName, StringComparison.OrdinalIgnoreCase));
+    if (!exists)
+    {
+        return new RegistryValueSnapshot(false, null, null);
+    }
+
+    return new RegistryValueSnapshot(
+        true,
+        key.GetValue(valueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames)?.ToString(),
+        key.GetValueKind(valueName).ToString());
+}
+
+static void EnsureStringRegistryValue(
+    RegistryValueSnapshot value,
+    string hiveName,
+    string subKey,
+    string valueName)
+{
+    if (value.Exists && !string.Equals(value.Kind, RegistryValueKind.String.ToString(), StringComparison.Ordinal))
+    {
+        throw new InvalidOperationException(
+            $"Registry value {hiveName}\\{subKey}\\{valueName} is not a string and will not be overwritten.");
+    }
 }
 
 static void CopyDirectory(string source, string destination)
@@ -550,12 +1009,16 @@ static void CopyDirectory(string source, string destination)
     Directory.CreateDirectory(destination);
     foreach (var directory in Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories))
     {
-        Directory.CreateDirectory(Path.Combine(destination, Path.GetRelativePath(source, directory)));
+        var targetDirectory = Path.Combine(destination, Path.GetRelativePath(source, directory));
+        RequireChildPath(destination, targetDirectory, "staged directory");
+        Directory.CreateDirectory(targetDirectory);
     }
 
     foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
     {
-        File.Copy(file, Path.Combine(destination, Path.GetRelativePath(source, file)), overwrite: true);
+        var targetFile = Path.Combine(destination, Path.GetRelativePath(source, file));
+        RequireChildPath(destination, targetFile, "staged file");
+        File.Copy(file, targetFile, overwrite: true);
     }
 }
 
@@ -770,6 +1233,12 @@ static void TryDeleteDirectory(string path)
     {
         if (Directory.Exists(path))
         {
+            if (File.GetAttributes(path).HasFlag(FileAttributes.ReparsePoint))
+            {
+                WriteInstallerLog($"Refusing to recursively delete reparse-point directory {path}.");
+                return;
+            }
+
             Directory.Delete(path, recursive: true);
         }
     }
@@ -779,8 +1248,11 @@ static void TryDeleteDirectory(string path)
     }
 }
 
-static bool TryLaunchNewerInstaller(InstallerOptions options)
+static bool TryLaunchNewerInstaller(
+    InstallerOptions options,
+    InstallInfo? previousInstallInfo)
 {
+    string? updateDir = null;
     try
     {
         using var httpClient = CreateHttpClient();
@@ -794,10 +1266,11 @@ static bool TryLaunchNewerInstaller(InstallerOptions options)
             return false;
         }
 
-        var updateDir = Path.Combine(Path.GetTempPath(), AppId + "-latest-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(updateDir);
+        updateDir = CreateRestrictedUpdateDirectory();
         var setupPath = Path.Combine(updateDir, SetupAssetName);
         var checksumsPath = Path.Combine(updateDir, ChecksumsAssetName);
+        RequireChildPath(updateDir, setupPath, "downloaded installer");
+        RequireChildPath(updateDir, checksumsPath, "downloaded checksum file");
 
         DownloadFileAsync(httpClient, release.ChecksumsDownloadUrl, checksumsPath).GetAwaiter().GetResult();
         DownloadFileAsync(httpClient, release.SetupDownloadUrl, setupPath).GetAwaiter().GetResult();
@@ -820,17 +1293,34 @@ static bool TryLaunchNewerInstaller(InstallerOptions options)
             MessageBoxButtons.OK,
             MessageBoxIcon.Information);
 
-        Process.Start(new ProcessStartInfo(setupPath)
+        ValidateUpdateDirectory(updateDir);
+        var immediatePreLaunchHash = ComputeSha256(setupPath);
+        if (!InstallDecisions.CanLaunchVerifiedInstaller(
+                expectedHash,
+                actualHash,
+                immediatePreLaunchHash,
+                updateDirectoryIsSafe: true))
+        {
+            throw new InvalidOperationException("The latest installer changed after download verification.");
+        }
+
+        var persistedOptions = ResolvePersistedOptionsForUpdate(options, previousInstallInfo);
+        _ = Process.Start(new ProcessStartInfo(setupPath)
         {
             UseShellExecute = true,
             Verb = "runas",
             WorkingDirectory = updateDir,
-            Arguments = BuildForwardedInstallerArguments(options)
-        });
+            Arguments = BuildForwardedInstallerArguments(options, persistedOptions)
+        }) ?? throw new InvalidOperationException("The verified newer installer did not start.");
         return true;
     }
     catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
     {
+        if (updateDir is not null)
+        {
+            TryDeleteDirectory(updateDir);
+        }
+
         MessageBox.Show(
             "The latest installer was canceled. This installer will continue.",
             "Monitor Audio Router Setup",
@@ -840,12 +1330,66 @@ static bool TryLaunchNewerInstaller(InstallerOptions options)
     }
     catch (Exception ex)
     {
+        if (updateDir is not null)
+        {
+            TryDeleteDirectory(updateDir);
+        }
+
         MessageBox.Show(
             $"Could not update to the latest installer. This installer will continue.\n\n{ex.Message}",
             "Monitor Audio Router Setup",
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning);
         return false;
+    }
+}
+
+static string CreateRestrictedUpdateDirectory()
+{
+    var updateDir = Path.Combine(Path.GetTempPath(), AppId + "-latest-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(updateDir);
+
+    var currentUser = WindowsIdentity.GetCurrent().User
+        ?? throw new InvalidOperationException("The current Windows user SID is unavailable.");
+    var security = new DirectorySecurity();
+    security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+    security.SetOwner(currentUser);
+    var inheritance = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+    security.AddAccessRule(new FileSystemAccessRule(
+        currentUser,
+        FileSystemRights.FullControl,
+        inheritance,
+        PropagationFlags.None,
+        AccessControlType.Allow));
+    security.AddAccessRule(new FileSystemAccessRule(
+        new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+        FileSystemRights.FullControl,
+        inheritance,
+        PropagationFlags.None,
+        AccessControlType.Allow));
+    security.AddAccessRule(new FileSystemAccessRule(
+        new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+        FileSystemRights.FullControl,
+        inheritance,
+        PropagationFlags.None,
+        AccessControlType.Allow));
+    FileSystemAclExtensions.SetAccessControl(new DirectoryInfo(updateDir), security);
+
+    ValidateUpdateDirectory(updateDir);
+    return updateDir;
+}
+
+static void ValidateUpdateDirectory(string updateDir)
+{
+    if (!InstallDecisions.IsPathWithinRoot(Path.GetTempPath(), updateDir))
+    {
+        throw new InvalidOperationException("The update directory is outside the system temporary directory.");
+    }
+
+    var attributes = File.GetAttributes(updateDir);
+    if (!InstallDecisions.IsSafeUpdateDirectory(attributes))
+    {
+        throw new InvalidOperationException("The update directory is a reparse point or is not a directory.");
     }
 }
 
@@ -862,8 +1406,19 @@ static HttpClient CreateHttpClient()
 
 static async Task<ReleaseInfo> GetLatestReleaseAsync(HttpClient httpClient)
 {
+    if (!InstallDecisions.IsAllowedReleaseUri(LatestReleaseApiUrl, isApiRequest: true))
+    {
+        throw new InvalidOperationException("The configured release API URL is not trusted.");
+    }
+
     using var response = await httpClient.GetAsync(LatestReleaseApiUrl);
     response.EnsureSuccessStatusCode();
+    if (response.RequestMessage?.RequestUri is not Uri finalUri ||
+        !InstallDecisions.IsAllowedReleaseUri(finalUri.AbsoluteUri, isApiRequest: true))
+    {
+        throw new InvalidOperationException("The release API redirected to an untrusted URL.");
+    }
+
     await using var stream = await response.Content.ReadAsStreamAsync();
     using var document = await JsonDocument.ParseAsync(stream);
     var root = document.RootElement;
@@ -907,10 +1462,21 @@ static string? FindAssetDownloadUrl(JsonElement releaseRoot, string assetName)
 
 static async Task DownloadFileAsync(HttpClient httpClient, string url, string destinationPath)
 {
+    if (!InstallDecisions.IsAllowedReleaseUri(url, isApiRequest: false))
+    {
+        throw new InvalidOperationException("A release asset URL is not trusted.");
+    }
+
     var tempPath = destinationPath + ".download";
     File.Delete(tempPath);
     using var response = await httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
     response.EnsureSuccessStatusCode();
+    if (response.RequestMessage?.RequestUri is not Uri finalUri ||
+        !InstallDecisions.IsAllowedReleaseUri(finalUri.AbsoluteUri, isApiRequest: false))
+    {
+        throw new InvalidOperationException("A release asset redirected to an untrusted URL.");
+    }
+
     await using (var input = await response.Content.ReadAsStreamAsync())
     await using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
     {
@@ -978,14 +1544,12 @@ static int CompareVersions(Version left, Version right)
     return 0;
 }
 
-static string BuildForwardedInstallerArguments(InstallerOptions options)
+static string BuildForwardedInstallerArguments(InstallerOptions options, InstalledOptions installedOptions)
 {
     var args = new List<string>
     {
         "/nooptions",
-        "/noupdatetolatest",
-        options.InstallBrowserExtensions ? "/browserextensions" : "/nobrowserextensions",
-        options.Autostart ? "/autostart" : "/noautostart"
+        "/noupdatetolatest"
     };
 
     if (!options.Launch)
@@ -998,25 +1562,9 @@ static string BuildForwardedInstallerArguments(InstallerOptions options)
         args.Add("/nobrowsersetup");
     }
 
-    if (options.EnablePrivateBrowsing)
-    {
-        args.Add("/enableprivatebrowsing");
-    }
-
-    AddOptionValue(args, "ChromeExtensionId", options.ChromeExtensionId);
-    AddOptionValue(args, "EdgeExtensionId", options.EdgeExtensionId);
-    AddOptionValue(args, "FirefoxExtensionId", options.FirefoxExtensionId);
-    AddOptionValue(args, "FirefoxInstallUrl", options.FirefoxInstallUrl);
+    args.AddRange(InstallDecisions.BuildForwardedArguments(installedOptions));
 
     return string.Join(" ", args.Select(QuoteArgument));
-}
-
-static void AddOptionValue(List<string> args, string name, string value)
-{
-    if (!string.IsNullOrWhiteSpace(value))
-    {
-        args.Add($"/{name}={value}");
-    }
 }
 
 static string QuoteArgument(string value)
@@ -1096,7 +1644,9 @@ static InstallerOptions ParseOptions(string[] args)
         Autostart: HasSwitch(args, "/autostart") || !HasSwitch(args, "/noautostart"),
         EnablePrivateBrowsing: HasSwitch(args, "/enableprivatebrowsing") || HasSwitch(args, "/browserprivate"),
         ChromeExtensionId: GetOptionValue(args, "ChromeExtensionId", DefaultChromeExtensionId),
+        ChromeUpdateUrl: GetOptionValue(args, "ChromeUpdateUrl", ChromeWebStoreUpdateUrl),
         EdgeExtensionId: GetOptionValue(args, "EdgeExtensionId", DefaultEdgeExtensionId),
+        EdgeUpdateUrl: GetOptionValue(args, "EdgeUpdateUrl", EdgeAddOnsUpdateUrl),
         FirefoxExtensionId: GetOptionValue(args, "FirefoxExtensionId", DefaultFirefoxExtensionId),
         FirefoxInstallUrl: GetOptionValue(args, "FirefoxInstallUrl", DefaultFirefoxInstallUrl));
 }
@@ -1170,7 +1720,9 @@ sealed record InstallerOptions(
     bool Autostart,
     bool EnablePrivateBrowsing,
     string ChromeExtensionId,
+    string ChromeUpdateUrl,
     string EdgeExtensionId,
+    string EdgeUpdateUrl,
     string FirefoxExtensionId,
     string FirefoxInstallUrl);
 
