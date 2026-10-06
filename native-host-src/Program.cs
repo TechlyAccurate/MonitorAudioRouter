@@ -1,6 +1,7 @@
 using System.IO.Pipes;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 
 namespace MonitorAudioRouterNativeHost;
@@ -10,7 +11,14 @@ internal static class Program
     private const string PipeName = "MonitorAudioRouterHints";
     private const int TrayConnectTimeoutMs = 500;
     private const int MaximumBrowserMessageBytes = 1024 * 1024;
-    private const int MaximumPipeMessageCharacters = (2 * MaximumBrowserMessageBytes) + 1024;
+    private const int EnvelopeFramingOverheadCharacters = 1024;
+
+    // Keep this equivalent to BrowserBridgeProtocol in the tray project.
+    // Valid JSON can at most double under the local JSON-in-JSON encoder; the
+    // fixed allowance covers the envelope, bounded token, and framing fields.
+    private const int MaximumPipeMessageCharacters =
+        (2 * MaximumBrowserMessageBytes) + EnvelopeFramingOverheadCharacters;
+    private const int MaximumTokenCharacters = 512;
     private const string BrowserBridgeTokenFileName = "browser-bridge.token";
     private const string AppDataFolderName = "Monitor Audio Router";
     private static readonly TimeSpan InitialMessageTimeout = TimeSpan.FromSeconds(15);
@@ -123,7 +131,8 @@ internal static class Program
             using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.Out);
             pipe.Connect(TrayConnectTimeoutMs);
             using var writer = new StreamWriter(pipe, new UTF8Encoding(false), 1024, leaveOpen: true) { AutoFlush = true };
-            writer.WriteLine(envelope);
+            writer.Write(envelope);
+            writer.Write('\n');
             return true;
         }
         catch (TimeoutException)
@@ -198,6 +207,10 @@ internal static class Program
         private const int TokenByteCount = 32;
         private const string TokenMutexName = @"Local\MonitorAudioRouterBrowserBridgeToken";
         private static readonly object LockObject = new();
+        private static readonly JsonSerializerOptions JsonOptions = new()
+        {
+            Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+        };
         private static string? _token;
 
         public static string CreateEnvelope(string payloadJson)
@@ -207,7 +220,7 @@ internal static class Program
                 Type = EnvelopeType,
                 Token = GetToken(),
                 Payload = payloadJson
-            });
+            }, JsonOptions);
         }
 
         private static string GetToken()
@@ -242,7 +255,7 @@ internal static class Program
                     if (File.Exists(BrowserBridgeTokenFile))
                     {
                         var existing = File.ReadAllText(BrowserBridgeTokenFile).Trim();
-                        if (existing.Length >= 32)
+                        if (existing.Length is >= 32 and <= MaximumTokenCharacters)
                         {
                             _token = existing;
                             return _token;

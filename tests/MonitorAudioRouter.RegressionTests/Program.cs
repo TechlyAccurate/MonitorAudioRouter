@@ -39,12 +39,16 @@ internal static class Program
         runner.Add("Older browser hints from the same source are rejected", OlderBrowserHintsFromSameSourceAreRejected);
         runner.Add("A restarted browser hint source may begin at sequence one", RestartedBrowserHintSourceMayBeginAtOne);
         runner.Add("Browser hint source sequences remain independent", BrowserHintSourceSequencesRemainIndependent);
+        runner.Add("Browser transition preference uses the same source's prior snapshot", BrowserTransitionPreferenceUsesSameSourceSnapshot);
+        runner.Add("An empty browser source does not suppress an audible source", EmptyBrowserSourceDoesNotSuppressAudibleSource);
         runner.Add("Legacy browser hints remain accepted during rollout", LegacyBrowserHintsRemainAccepted);
-        runner.Add("A Firefox hint cannot claim a Chrome PID", FirefoxHintCannotClaimChromePid);
+        runner.Add("Browser process families accept only configured aliases with audio sessions", BrowserProcessFamiliesRequireConfiguredAliasAndAudioSession);
         runner.Add("Browser title diagnostics never contain raw titles", BrowserTitleDiagnosticsNeverContainRawTitles);
-        runner.Add("Oversized browser pipe lines fail before processing", OversizedBrowserPipeLinesFail);
+        runner.Add("Browser pipe framing honors exact LF and CRLF limits", BrowserPipeFramingHonorsExactLfAndCrLfLimits);
+        runner.Add("Browser pipe framing preserves Unicode and escaped JSON", BrowserPipeFramingPreservesUnicodeAndEscapedJson);
         runner.Add("Disconnected partial browser pipe lines fail before processing", DisconnectedPartialBrowserPipeLinesFail);
         runner.Add("A timed-out partial browser pipe line changes no hint state", TimedOutPartialBrowserPipeLineChangesNoState);
+        runner.Add("Browser source state is pruned and capped", BrowserSourceStateIsPrunedAndCapped);
 
         var result = runner.RunAll();
         Console.WriteLine($"C# regression tests passed: {result.Passed}/{result.Total}.");
@@ -721,7 +725,9 @@ internal static class Program
         var snapshot = global::MonitorAudioRouter.BrowserHintStore.GetSnapshot();
 
         RegressionAssert.True(restartedAccepted, "A new source instance should be allowed to restart at sequence one.");
-        RegressionAssert.Equal(10, snapshot["msedge.exe"].Windows.Single().Bounds.Left, "The restarted source should update browser hints.");
+        RegressionAssert.True(
+            snapshot["msedge.exe"].Windows.Any(window => window.Bounds.Left == 10),
+            "The restarted source should be represented without replacing the first source.");
     }
 
     private static void BrowserHintSourceSequencesRemainIndependent()
@@ -739,7 +745,54 @@ internal static class Program
 
         RegressionAssert.True(secondAccepted, "A second source's sequence one should be independent of the first source.");
         RegressionAssert.True(!staleFirstAccepted, "The first source must still reject its own older sequence.");
-        RegressionAssert.Equal(10, snapshot["firefox.exe"].Windows.Single().Bounds.Left, "Rejecting one source must preserve the independently accepted state.");
+        RegressionAssert.Equal(2, snapshot["firefox.exe"].Windows.Count, "Fresh source snapshots should be aggregated instead of replacing one another.");
+        RegressionAssert.True(
+            snapshot["firefox.exe"].Windows.Select(window => window.Bounds.Left).OrderBy(left => left).SequenceEqual(new[] { 10, 50 }),
+            "Rejecting one source must preserve both independently accepted snapshots.");
+    }
+
+    private static void BrowserTransitionPreferenceUsesSameSourceSnapshot()
+    {
+        var movingSource = "moving-" + Guid.NewGuid().ToString("N");
+        var independentSource = "stationary-" + Guid.NewGuid().ToString("N");
+        global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("chrome", movingSource, 1, windowId: 308, left: 308));
+        global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("chrome", independentSource, 1, windowId: 309, left: 309));
+
+        global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJsonWithWindows(
+                "chrome",
+                movingSource,
+                2,
+                (WindowId: 308, Left: 308),
+                (WindowId: 310, Left: 310)));
+        var movingSnapshot = global::MonitorAudioRouter.BrowserHintStore.GetSnapshot()["chrome.exe"].Sources
+            .Single(source => source.SourceInstanceId == movingSource);
+
+        RegressionAssert.Equal(
+            310,
+            movingSnapshot.PreferredWindowId,
+            "The newly added window should be preferred relative to that source's own prior snapshot.");
+    }
+
+    private static void EmptyBrowserSourceDoesNotSuppressAudibleSource()
+    {
+        var audibleSource = "audible-" + Guid.NewGuid().ToString("N");
+        var emptySource = "empty-" + Guid.NewGuid().ToString("N");
+        var beforeCount = global::MonitorAudioRouter.BrowserHintStore.GetSnapshot()["msedge.exe"].Windows.Count;
+        global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("edge", audibleSource, 1, windowId: 306, left: 306));
+
+        var emptyAccepted = global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("edge", emptySource, 1, windowId: 0, left: 0, includeWindow: false));
+        var snapshot = global::MonitorAudioRouter.BrowserHintStore.GetSnapshot();
+
+        RegressionAssert.True(emptyAccepted, "An empty update from an independent source should be accepted.");
+        RegressionAssert.Equal(beforeCount + 1, snapshot["msedge.exe"].Windows.Count, "An empty source must not clear another source's audible window.");
+        RegressionAssert.True(
+            snapshot["msedge.exe"].Windows.Any(window => window.Bounds.Left == 306),
+            "The audible source must remain represented.");
     }
 
     private static void LegacyBrowserHintsRemainAccepted()
@@ -749,17 +802,55 @@ internal static class Program
         var snapshot = global::MonitorAudioRouter.BrowserHintStore.GetSnapshot();
 
         RegressionAssert.True(accepted, "A legacy hint without ordering fields should remain accepted during store rollout.");
-        RegressionAssert.Equal(304, snapshot["chrome.exe"].Windows.Single().Bounds.Left, "The legacy hint should update browser state.");
+        RegressionAssert.True(
+            snapshot["chrome.exe"].Windows.Any(window => window.Bounds.Left == 304),
+            "The per-family legacy slot should remain represented alongside ordered sources.");
     }
 
-    private static void FirefoxHintCannotClaimChromePid()
+    private static void BrowserProcessFamiliesRequireConfiguredAliasAndAudioSession()
     {
         var method = RequireStaticMethod(
             typeof(global::MonitorAudioRouter.BrowserHintStore),
             "IsAdvisoryProcessMatch");
-        var matches = (bool)method.Invoke(null, new object[] { "firefox.exe", "chrome.exe", true })!;
+        foreach (var alias in new[] { "chrome.exe", "chromium.exe", "brave.exe", "vivaldi.exe" })
+        {
+            var matches = (bool)method.Invoke(null, new object[] { "chrome.exe", alias, true })!;
+            RegressionAssert.True(matches, $"The configured Chromium alias {alias} should satisfy a Chrome-family hint.");
+        }
 
-        RegressionAssert.True(!matches, "An active Chrome audio-session PID must not satisfy a Firefox hint.");
+        RegressionAssert.True(
+            !(bool)method.Invoke(null, new object[] { "chrome.exe", "brave.exe", false })!,
+            "A matching Chromium alias without a relevant audio session must be rejected.");
+        RegressionAssert.True(
+            !(bool)method.Invoke(null, new object[] { "chrome.exe", "msedge.exe", true })!,
+            "Edge must remain distinct from the Chrome family.");
+        RegressionAssert.True(
+            !(bool)method.Invoke(null, new object[] { "firefox.exe", "chrome.exe", true })!,
+            "A Chrome audio-session PID must not satisfy a Firefox hint.");
+
+        var source = "alias-window-" + Guid.NewGuid().ToString("N");
+        global::MonitorAudioRouter.BrowserHintStore.ApplyJson(
+            CreateBrowserHintJson("chrome", source, 1, windowId: 307, left: 307));
+        var monitor = new global::MonitorAudioRouter.MonitorInfo(
+            "DISPLAY1",
+            "Display",
+            "display-id",
+            new global::System.Drawing.Rectangle(0, 0, 1920, 1080),
+            true);
+        var braveWindow = new global::MonitorAudioRouter.WindowInfo(
+            IntPtr.Zero,
+            307,
+            "brave.exe",
+            null,
+            "hint-307-307 - Brave",
+            new global::System.Drawing.Rectangle(307, 0, 800, 600),
+            monitor);
+
+        RegressionAssert.True(
+            global::MonitorAudioRouter.BrowserHintStore.WindowMatchesHints(
+                global::MonitorAudioRouter.BrowserHintStore.GetSnapshot(),
+                braveWindow),
+            "Native-window reconciliation should use the same Chromium-family classifier as PID validation.");
     }
 
     private static void BrowserTitleDiagnosticsNeverContainRawTitles()
@@ -777,8 +868,26 @@ internal static class Program
         RegressionAssert.Equal(firstCaseOrder, secondCaseOrder, "Case-insensitive duplicate titles should have an order-independent signature.");
     }
 
-    private static void OversizedBrowserPipeLinesFail()
+    private static void BrowserPipeFramingHonorsExactLfAndCrLfLimits()
     {
+        using (var lfStream = new MemoryStream(Encoding.UTF8.GetBytes("12345678\n")))
+        using (var lfReader = new StreamReader(lfStream, Encoding.UTF8))
+        {
+            RegressionAssert.Equal(
+                "12345678",
+                InvokeBoundedBrowserLineRead(lfReader, maximumCharacters: 8, TimeSpan.FromSeconds(1)),
+                "A terminal LF must not count against the payload limit.");
+        }
+
+        using (var crlfStream = new MemoryStream(Encoding.UTF8.GetBytes("12345678\r\n")))
+        using (var crlfReader = new StreamReader(crlfStream, Encoding.UTF8))
+        {
+            RegressionAssert.Equal(
+                "12345678",
+                InvokeBoundedBrowserLineRead(crlfReader, maximumCharacters: 8, TimeSpan.FromSeconds(1)),
+                "A terminal CRLF must not count against the payload limit.");
+        }
+
         using var stream = new MemoryStream(Encoding.UTF8.GetBytes("123456789\n"));
         using var reader = new StreamReader(stream, Encoding.UTF8);
 
@@ -786,6 +895,32 @@ internal static class Program
             InvokeBoundedBrowserLineRead(reader, maximumCharacters: 8, TimeSpan.FromSeconds(1)));
 
         RegressionAssert.Contains("maximum", exception.Message, "The oversized-line failure should identify the enforced boundary.");
+    }
+
+    private static void BrowserPipeFramingPreservesUnicodeAndEscapedJson()
+    {
+        const string payload = "{\"title\":\"café <private> \\\"quoted\\\" \\\\ path\",\"marker\":\"🔊\"}";
+        const string token = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        var serializer = RequireStaticMethod(
+            typeof(global::MonitorAudioRouter.BrowserBridgeSecurity),
+            "SerializeEnvelope");
+        var envelope = (string)serializer.Invoke(null, new object[] { payload, token })!;
+
+        RegressionAssert.Contains("café", envelope, "The local serializer should preserve valid Unicode instead of expanding it to ASCII escapes.");
+        using (var document = JsonDocument.Parse(envelope))
+        {
+            RegressionAssert.Equal(
+                payload,
+                document.RootElement.GetProperty("Payload").GetString(),
+                "Quotes, backslashes, and Unicode must survive the JSON-in-JSON envelope.");
+        }
+
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(envelope + "\n"));
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        RegressionAssert.Equal(
+            envelope,
+            InvokeBoundedBrowserLineRead(reader, envelope.Length, TimeSpan.FromSeconds(1)),
+            "A Unicode envelope at the exact character limit should round-trip.");
     }
 
     private static void DisconnectedPartialBrowserPipeLinesFail()
@@ -813,7 +948,48 @@ internal static class Program
             InvokeBoundedBrowserLineRead(reader, maximumCharacters: 128, TimeSpan.FromMilliseconds(25)));
         var after = global::MonitorAudioRouter.BrowserHintStore.GetSnapshot()["msedge.exe"];
 
-        RegressionAssert.True(ReferenceEquals(before, after), "A partial timed-out line must not replace browser hint state.");
+        RegressionAssert.True(
+            before.Sources.Select(SourceSignature).SequenceEqual(after.Sources.Select(SourceSignature)),
+            "A partial timed-out line must not replace browser hint state.");
+    }
+
+    private static void BrowserSourceStateIsPrunedAndCapped()
+    {
+        var baseline = DateTimeOffset.UtcNow.AddHours(1);
+        var expiredSource = "expired-" + Guid.NewGuid().ToString("N");
+        var retainedSource = "retained-" + Guid.NewGuid().ToString("N");
+        ApplyBrowserHintAt(
+            CreateBrowserHintJson("firefox", expiredSource, 10, windowId: 500, left: 500),
+            baseline.AddSeconds(-13));
+        ApplyBrowserHintAt(
+            CreateBrowserHintJson("firefox", retainedSource, 2, windowId: 501, left: 501),
+            baseline);
+
+        var prunedSnapshot = GetBrowserHintSnapshotAt(baseline);
+        RegressionAssert.Equal(1, prunedSnapshot["firefox.exe"].Windows.Count, "Sources older than the stale horizon should be pruned.");
+        RegressionAssert.True(
+            !ApplyBrowserHintAt(
+                CreateBrowserHintJson("firefox", retainedSource, 1, windowId: 502, left: 502),
+                baseline.AddMilliseconds(1)),
+            "A retained source must continue to reject stale sequence numbers.");
+        RegressionAssert.True(
+            ApplyBrowserHintAt(
+                CreateBrowserHintJson("firefox", expiredSource, 1, windowId: 503, left: 503),
+                baseline.AddMilliseconds(2)),
+            "A pruned source instance may restart its sequence.");
+
+        var capBaseline = baseline.AddMinutes(1);
+        for (var index = 0; index < 66; index++)
+        {
+            ApplyBrowserHintAt(
+                CreateBrowserHintJson("edge", $"cap-{index}", 1, windowId: 600 + index, left: 600 + index),
+                capBaseline.AddMilliseconds(index));
+        }
+
+        var cappedWindows = GetBrowserHintSnapshotAt(capBaseline.AddMilliseconds(66))["msedge.exe"].Windows;
+        RegressionAssert.Equal(64, cappedWindows.Count, "Ordered source state should be capped at the fixed source limit.");
+        RegressionAssert.True(cappedWindows.Any(window => window.WindowId == 665), "The newest source must survive cap enforcement.");
+        RegressionAssert.True(!cappedWindows.Any(window => window.WindowId == 600), "The oldest source should be evicted first.");
     }
 
     private static string CreateBrowserHintJson(
@@ -821,34 +997,82 @@ internal static class Program
         string? sourceInstanceId,
         long? sequence,
         int windowId,
-        int left)
+        int left,
+        bool includeWindow = true)
     {
+        return CreateBrowserHintJsonWithWindows(
+            browser,
+            sourceInstanceId,
+            sequence,
+            includeWindow ? new[] { (WindowId: windowId, Left: left) } : Array.Empty<(int WindowId, int Left)>());
+    }
+
+    private static string CreateBrowserHintJsonWithWindows(
+        string browser,
+        string? sourceInstanceId,
+        long? sequence,
+        params (int WindowId, int Left)[] hintWindows)
+    {
+        var windows = hintWindows
+            .Select(window => new
+            {
+                windowId = window.WindowId,
+                left = window.Left,
+                top = 0,
+                width = 800,
+                height = 600,
+                processIds = Array.Empty<int>(),
+                titles = new[] { $"hint-{window.WindowId}-{window.Left}" },
+                windowTitles = Array.Empty<string>()
+            })
+            .ToArray();
+
         return JsonSerializer.Serialize(new
         {
             type = "audibleWindows",
             browser,
             sourceInstanceId,
             sequence,
-            windows = new[]
-            {
-                new
-                {
-                    windowId,
-                    left,
-                    top = 0,
-                    width = 800,
-                    height = 600,
-                    processIds = Array.Empty<int>(),
-                    titles = new[] { $"hint-{windowId}-{left}" },
-                    windowTitles = Array.Empty<string>()
-                }
-            }
+            windows
         });
     }
 
-    private static MethodInfo RequireStaticMethod(Type type, string methodName)
+    private static string SourceSignature(global::MonitorAudioRouter.BrowserHintSourceSnapshot source)
     {
-        var method = type.GetMethod(methodName, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        var windows = source.Windows.Select(window => $"{window.WindowId}:{window.Bounds.Left}");
+        return $"{source.SourceInstanceId}:{source.PreferredWindowId}:{string.Join(",", windows)}";
+    }
+
+    private static bool ApplyBrowserHintAt(string json, DateTimeOffset timestamp)
+    {
+        var method = RequireStaticMethod(
+            typeof(global::MonitorAudioRouter.BrowserHintStore),
+            "ApplyJson",
+            typeof(string),
+            typeof(DateTimeOffset));
+        return (bool)method.Invoke(null, new object[] { json, timestamp })!;
+    }
+
+    private static Dictionary<string, global::MonitorAudioRouter.BrowserHintSet> GetBrowserHintSnapshotAt(
+        DateTimeOffset timestamp)
+    {
+        var method = RequireStaticMethod(
+            typeof(global::MonitorAudioRouter.BrowserHintStore),
+            "GetSnapshot",
+            typeof(DateTimeOffset));
+        return (Dictionary<string, global::MonitorAudioRouter.BrowserHintSet>)method.Invoke(null, new object[] { timestamp })!;
+    }
+
+    private static MethodInfo RequireStaticMethod(Type type, string methodName, params Type[] parameterTypes)
+    {
+        var method = parameterTypes.Length == 0
+            ? type.GetMethod(methodName, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+            : type.GetMethod(
+                methodName,
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null,
+                parameterTypes,
+                modifiers: null);
         if (method is null)
         {
             throw new RegressionAssertionException($"Expected {type.Name}.{methodName} to exist.");

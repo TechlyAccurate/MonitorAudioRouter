@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Windows.Forms;
@@ -1833,10 +1834,22 @@ internal sealed class ScanScheduler : IDisposable
     }
 }
 
+internal static class BrowserBridgeProtocol
+{
+    public const int MaximumBrowserMessageBytes = 1024 * 1024;
+    public const int EnvelopeFramingOverheadCharacters = 1024;
+
+    // Valid JSON embedded as a JSON string can at most double for local
+    // quote, slash, and line-break escaping. The fixed allowance covers the
+    // envelope properties, a bounded token, and future local framing fields.
+    public const int MaximumPipeMessageCharacters =
+        (2 * MaximumBrowserMessageBytes) + EnvelopeFramingOverheadCharacters;
+    public const int MaximumTokenCharacters = 512;
+}
+
 internal sealed class BrowserHintServer : IDisposable
 {
     public const string PipeName = "MonitorAudioRouterHints";
-    private const int MaximumPipeMessageCharacters = (2 * 1024 * 1024) + 1024;
     private static readonly TimeSpan PipeReadTimeout = TimeSpan.FromSeconds(5);
     private readonly Action<string> _requestBurst;
     private readonly CancellationTokenSource _cts = new();
@@ -1869,7 +1882,7 @@ internal sealed class BrowserHintServer : IDisposable
                 using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
                 var line = await ReadBoundedLineAsync(
                     reader,
-                    MaximumPipeMessageCharacters,
+                    BrowserBridgeProtocol.MaximumPipeMessageCharacters,
                     PipeReadTimeout,
                     token);
                 if (line is null)
@@ -1925,6 +1938,7 @@ internal sealed class BrowserHintServer : IDisposable
         timeoutSource.CancelAfter(timeout);
         var result = new StringBuilder(Math.Min(maximumCharacters, 4096));
         var buffer = new char[1024];
+        var pendingTerminalCarriageReturn = false;
         try
         {
             while (true)
@@ -1948,6 +1962,17 @@ internal sealed class BrowserHintServer : IDisposable
                 for (var index = 0; index < charactersRead; index++)
                 {
                     var character = buffer[index];
+                    if (pendingTerminalCarriageReturn)
+                    {
+                        if (character == '\n')
+                        {
+                            return result.ToString();
+                        }
+
+                        throw new InvalidDataException(
+                            $"Browser hint pipe message exceeded the maximum of {maximumCharacters} characters.");
+                    }
+
                     if (character == '\n')
                     {
                         if (result.Length > 0 && result[^1] == '\r')
@@ -1958,12 +1983,19 @@ internal sealed class BrowserHintServer : IDisposable
                         return result.ToString();
                     }
 
-                    result.Append(character);
-                    if (result.Length > maximumCharacters)
+                    if (result.Length == maximumCharacters)
                     {
+                        if (character == '\r')
+                        {
+                            pendingTerminalCarriageReturn = true;
+                            continue;
+                        }
+
                         throw new InvalidDataException(
                             $"Browser hint pipe message exceeded the maximum of {maximumCharacters} characters.");
                     }
+
+                    result.Append(character);
                 }
             }
         }
@@ -2155,13 +2187,19 @@ internal static class BrowserHintStore
     private const int MaxTitlesPerWindow = 16;
     private const int MaxTitleChars = 256;
     private const int MaxSourceInstanceIdChars = 128;
+    private const int MaxOrderedSourceStates = 64;
+    private static readonly TimeSpan HintStaleAfter = TimeSpan.FromSeconds(12);
     private static readonly object LockObject = new();
-    private static readonly Dictionary<string, BrowserHintSet> HintsByProcess = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly Dictionary<string, long> HighestSequenceBySource = new(StringComparer.Ordinal);
+    private static readonly Dictionary<BrowserHintSourceKey, BrowserHintSourceState> SourceStates = new();
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
     private static readonly Dictionary<string, string> LastLoggedHintSignatures = new(StringComparer.OrdinalIgnoreCase);
 
     public static bool ApplyJson(string json)
+    {
+        return ApplyJson(json, DateTimeOffset.UtcNow);
+    }
+
+    internal static bool ApplyJson(string json, DateTimeOffset now)
     {
         try
         {
@@ -2171,8 +2209,8 @@ internal static class BrowserHintStore
                 return false;
             }
 
-            var processName = BrowserToProcessName(update.Browser);
-            if (processName is null)
+            var family = BrowserToFamily(update.Browser);
+            if (family is null)
             {
                 return false;
             }
@@ -2218,32 +2256,36 @@ internal static class BrowserHintStore
                         .ToList()))
                 .ToList();
 
-            int? preferredWindowId;
+            BrowserHintSet hintSet;
             lock (LockObject)
             {
-                var now = DateTimeOffset.UtcNow;
+                PruneStaleSourcesLocked(now);
+                var sourceKey = new BrowserHintSourceKey(family.Value, sourceInstanceId);
+                SourceStates.TryGetValue(sourceKey, out var previous);
                 if (sourceInstanceId is not null &&
-                    HighestSequenceBySource.TryGetValue(sourceInstanceId, out var highestSequence) &&
-                    update.Sequence <= highestSequence)
+                    previous is not null &&
+                    update.Sequence!.Value <= previous.Sequence!.Value)
                 {
                     return false;
                 }
 
-                HintsByProcess.TryGetValue(processName, out var previous);
-                preferredWindowId = DeterminePreferredWindowId(previous, windows);
-                HintsByProcess[processName] = new BrowserHintSet(
-                    processName,
+                var preferredWindowId = DeterminePreferredWindowId(previous, windows);
+                SourceStates[sourceKey] = new BrowserHintSourceState(
+                    family.Value,
+                    sourceInstanceId,
+                    update.Sequence,
                     now,
                     windows,
                     preferredWindowId);
                 if (sourceInstanceId is not null)
                 {
-                    HighestSequenceBySource[sourceInstanceId] = update.Sequence!.Value;
+                    EnforceOrderedSourceCapLocked(sourceKey);
                 }
+
+                hintSet = BuildHintSetLocked(family.Value);
             }
 
-            var changed = LogHintIfChanged(processName, windows, preferredWindowId);
-            return changed;
+            return LogHintIfChanged(hintSet);
         }
         catch (Exception exception)
         {
@@ -2257,23 +2299,36 @@ internal static class BrowserHintStore
 
     public static Dictionary<string, BrowserHintSet> GetSnapshot()
     {
-        var cutoff = DateTimeOffset.UtcNow.AddSeconds(-12);
+        return GetSnapshot(DateTimeOffset.UtcNow);
+    }
+
+    internal static Dictionary<string, BrowserHintSet> GetSnapshot(DateTimeOffset now)
+    {
         lock (LockObject)
         {
-            foreach (var stale in HintsByProcess.Where(entry => entry.Value.UpdatedUtc < cutoff).Select(entry => entry.Key).ToList())
-            {
-                HintsByProcess.Remove(stale);
-            }
+            PruneStaleSourcesLocked(now);
 
-            return HintsByProcess.ToDictionary(entry => entry.Key, entry => entry.Value, StringComparer.OrdinalIgnoreCase);
+            return SourceStates.Values
+                .Select(state => state.Family)
+                .Distinct()
+                .ToDictionary(
+                    BrowserFamilyProcessName,
+                    BuildHintSetLocked,
+                    StringComparer.OrdinalIgnoreCase);
         }
     }
 
     public static bool WindowMatchesHints(Dictionary<string, BrowserHintSet> hints, WindowInfo window)
     {
-        if (!hints.TryGetValue(window.ProcessName, out var hintSet))
+        var family = BrowserFamilyForProcessName(window.ProcessName);
+        if (family is null)
         {
-            return !IsBrowserProcessName(window.ProcessName);
+            return true;
+        }
+
+        if (!hints.TryGetValue(BrowserFamilyProcessName(family.Value), out var hintSet))
+        {
+            return false;
         }
 
         if (hintSet.Windows.Count == 0)
@@ -2296,24 +2351,25 @@ internal static class BrowserHintStore
         return hintMonitor.BoundsKey.Equals(window.Monitor.BoundsKey, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string? BrowserToProcessName(string? browser)
+    private static BrowserFamily? BrowserToFamily(string? browser)
     {
         return browser?.ToLowerInvariant() switch
         {
-            "chrome" => "chrome.exe",
-            "edge" => "msedge.exe",
-            "firefox" => "firefox.exe",
+            "chrome" => BrowserFamily.Chromium,
+            "edge" => BrowserFamily.Edge,
+            "firefox" => BrowserFamily.Firefox,
             _ => null
         };
     }
 
     public static bool IsBrowserProcessName(string processName)
     {
-        return processName.Equals("chrome.exe", StringComparison.OrdinalIgnoreCase) ||
-               processName.Equals("msedge.exe", StringComparison.OrdinalIgnoreCase) ||
-               processName.Equals("firefox.exe", StringComparison.OrdinalIgnoreCase) ||
-               processName.Equals("brave.exe", StringComparison.OrdinalIgnoreCase) ||
-               processName.Equals("vivaldi.exe", StringComparison.OrdinalIgnoreCase);
+        return BrowserFamilyForProcessName(processName) is not null;
+    }
+
+    internal static bool ProcessBelongsToFamily(BrowserFamily family, string processName)
+    {
+        return BrowserFamilyForProcessName(processName) == family;
     }
 
     internal static bool IsAdvisoryProcessMatch(
@@ -2321,12 +2377,101 @@ internal static class BrowserHintStore
         string actualProcessName,
         bool ownsRelevantAudioSession)
     {
-        return ownsRelevantAudioSession &&
-               actualProcessName.Equals(expectedProcessName, StringComparison.OrdinalIgnoreCase);
+        var family = BrowserFamilyForProcessName(expectedProcessName);
+        return family is not null &&
+               ownsRelevantAudioSession &&
+               ProcessBelongsToFamily(family.Value, actualProcessName);
+    }
+
+    private static BrowserFamily? BrowserFamilyForProcessName(string processName)
+    {
+        if (processName.Equals("chrome.exe", StringComparison.OrdinalIgnoreCase) ||
+            processName.Equals("chromium.exe", StringComparison.OrdinalIgnoreCase) ||
+            processName.Equals("brave.exe", StringComparison.OrdinalIgnoreCase) ||
+            processName.Equals("vivaldi.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            return BrowserFamily.Chromium;
+        }
+
+        if (processName.Equals("msedge.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            return BrowserFamily.Edge;
+        }
+
+        return processName.Equals("firefox.exe", StringComparison.OrdinalIgnoreCase)
+            ? BrowserFamily.Firefox
+            : null;
+    }
+
+    private static string BrowserFamilyProcessName(BrowserFamily family)
+    {
+        return family switch
+        {
+            BrowserFamily.Chromium => "chrome.exe",
+            BrowserFamily.Edge => "msedge.exe",
+            BrowserFamily.Firefox => "firefox.exe",
+            _ => throw new ArgumentOutOfRangeException(nameof(family))
+        };
+    }
+
+    private static void PruneStaleSourcesLocked(DateTimeOffset now)
+    {
+        var cutoff = now - HintStaleAfter;
+        foreach (var staleKey in SourceStates
+                     .Where(entry => entry.Value.UpdatedUtc < cutoff)
+                     .Select(entry => entry.Key)
+                     .ToList())
+        {
+            SourceStates.Remove(staleKey);
+        }
+    }
+
+    private static void EnforceOrderedSourceCapLocked(BrowserHintSourceKey activeKey)
+    {
+        while (SourceStates.Count(entry => entry.Key.SourceInstanceId is not null) > MaxOrderedSourceStates)
+        {
+            var oldestKey = SourceStates
+                .Where(entry => entry.Key.SourceInstanceId is not null && entry.Key != activeKey)
+                .OrderBy(entry => entry.Value.UpdatedUtc)
+                .ThenBy(entry => entry.Key.Family)
+                .ThenBy(entry => entry.Key.SourceInstanceId, StringComparer.Ordinal)
+                .Select(entry => (BrowserHintSourceKey?)entry.Key)
+                .FirstOrDefault();
+            if (oldestKey is null)
+            {
+                break;
+            }
+
+            SourceStates.Remove(oldestKey.Value);
+        }
+    }
+
+    private static BrowserHintSet BuildHintSetLocked(BrowserFamily family)
+    {
+        var sources = SourceStates.Values
+            .Where(state => state.Family == family)
+            .OrderBy(state => state.SourceInstanceId is null ? 0 : 1)
+            .ThenBy(state => state.SourceInstanceId, StringComparer.Ordinal)
+            .Select(state => new BrowserHintSourceSnapshot(
+                state.SourceInstanceId,
+                state.UpdatedUtc,
+                state.Windows,
+                state.PreferredWindowId))
+            .ToList();
+        var windows = sources.SelectMany(source => source.Windows).ToList();
+        var updatedUtc = sources.Max(source => source.UpdatedUtc);
+        var preferredWindowId = sources.Count == 1 ? sources[0].PreferredWindowId : null;
+        return new BrowserHintSet(
+            BrowserFamilyProcessName(family),
+            family,
+            updatedUtc,
+            windows,
+            preferredWindowId,
+            sources);
     }
 
     private static int? DeterminePreferredWindowId(
-        BrowserHintSet? previous,
+        BrowserHintSourceState? previous,
         List<BrowserHintWindow> windows)
     {
         // When a playing tab is moved to another browser window, Firefox and
@@ -2362,38 +2507,35 @@ internal static class BrowserHintStore
             : null;
     }
 
-    private static bool LogHintIfChanged(
-        string processName,
-        List<BrowserHintWindow> windows,
-        int? preferredWindowId)
+    private static bool LogHintIfChanged(BrowserHintSet hintSet)
     {
         var monitors = WindowInspector.GetMonitors();
-        var signatureParts = windows
-            .Select(hintWindow =>
+        var signatureParts = hintSet.Sources
+            .SelectMany((source, sourceIndex) => source.Windows.Select(hintWindow =>
             {
                 var monitor = WindowInspector.PickMonitor(hintWindow.Bounds, monitors);
-                return $"id={hintWindow.WindowId};{ShortBounds(hintWindow.Bounds)}>{monitor.BoundsKey};processIds={CompactProcessIdList(hintWindow.ProcessIds)};tabs={hintWindow.Titles.Count};active={hintWindow.WindowTitles.Count};{CreateTitleDiagnostic(hintWindow.Titles.Concat(hintWindow.WindowTitles))}";
-            });
-        var signature = $"{processName}|preferred={preferredWindowId?.ToString() ?? "none"}|{string.Join("|", signatureParts)}";
+                return $"source={sourceIndex};preferred={source.PreferredWindowId?.ToString() ?? "none"};id={hintWindow.WindowId};{ShortBounds(hintWindow.Bounds)}>{monitor.BoundsKey};processIds={CompactProcessIdList(hintWindow.ProcessIds)};tabs={hintWindow.Titles.Count};active={hintWindow.WindowTitles.Count};{CreateTitleDiagnostic(hintWindow.Titles.Concat(hintWindow.WindowTitles))}";
+            }));
+        var signature = $"{hintSet.ProcessName}|sources={hintSet.Sources.Count}|{string.Join("|", signatureParts)}";
         lock (LockObject)
         {
-            if (LastLoggedHintSignatures.TryGetValue(processName, out var previousSignature) &&
+            if (LastLoggedHintSignatures.TryGetValue(hintSet.ProcessName, out var previousSignature) &&
                 string.Equals(previousSignature, signature, StringComparison.OrdinalIgnoreCase))
             {
                 return false;
             }
 
-            LastLoggedHintSignatures[processName] = signature;
+            LastLoggedHintSignatures[hintSet.ProcessName] = signature;
         }
 
-        var summary = string.Join("; ", windows.Select((hintWindow, index) =>
+        var summary = string.Join("; ", hintSet.Windows.Select((hintWindow, index) =>
         {
             var monitor = WindowInspector.PickMonitor(hintWindow.Bounds, monitors);
             var titleDiagnostic = CreateTitleDiagnostic(hintWindow.Titles.Concat(hintWindow.WindowTitles));
             return $"w{index + 1}@{ShortMonitor(monitor)} bounds={ShortBounds(hintWindow.Bounds)} processIds={CompactProcessIdList(hintWindow.ProcessIds)} tabs={hintWindow.Titles.Count} {titleDiagnostic}";
         }));
         Log.Write(
-            $"Browser hint: {processName} windows={windows.Count} preferred={preferredWindowId?.ToString() ?? "none"}" +
+            $"Browser hint: {hintSet.ProcessName} sources={hintSet.Sources.Count} windows={hintSet.Windows.Count}" +
             $"{(summary.Length == 0 ? "" : " " + summary)}");
         return true;
     }
@@ -2543,11 +2685,38 @@ internal sealed class BrowserHintWindowUpdate
     public List<string>? WindowTitles { get; set; }
 }
 
-internal sealed record BrowserHintSet(
-    string ProcessName,
+internal enum BrowserFamily
+{
+    Chromium,
+    Edge,
+    Firefox
+}
+
+internal readonly record struct BrowserHintSourceKey(
+    BrowserFamily Family,
+    string? SourceInstanceId);
+
+internal sealed record BrowserHintSourceState(
+    BrowserFamily Family,
+    string? SourceInstanceId,
+    long? Sequence,
     DateTimeOffset UpdatedUtc,
     List<BrowserHintWindow> Windows,
     int? PreferredWindowId);
+
+internal sealed record BrowserHintSourceSnapshot(
+    string? SourceInstanceId,
+    DateTimeOffset UpdatedUtc,
+    List<BrowserHintWindow> Windows,
+    int? PreferredWindowId);
+
+internal sealed record BrowserHintSet(
+    string ProcessName,
+    BrowserFamily Family,
+    DateTimeOffset UpdatedUtc,
+    List<BrowserHintWindow> Windows,
+    int? PreferredWindowId,
+    List<BrowserHintSourceSnapshot> Sources);
 
 internal sealed record BrowserHintWindow(
     int WindowId,
@@ -2562,17 +2731,26 @@ internal static class BrowserBridgeSecurity
     private const int TokenByteCount = 32;
     private const string TokenMutexName = @"Local\MonitorAudioRouterBrowserBridgeToken";
     private static readonly object LockObject = new();
-    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+    };
     private static string? _token;
 
     public static string CreateEnvelope(string payloadJson)
     {
+        return SerializeEnvelope(payloadJson, GetToken());
+    }
+
+    internal static string SerializeEnvelope(string payloadJson, string token)
+    {
         return JsonSerializer.Serialize(new BrowserBridgeEnvelope
         {
             Type = EnvelopeType,
-            Token = GetToken(),
+            Token = token,
             Payload = payloadJson
-        });
+        }, JsonOptions);
     }
 
     public static string? TryUnwrap(string envelopeJson)
@@ -2627,7 +2805,7 @@ internal static class BrowserBridgeSecurity
                 if (File.Exists(Paths.BrowserBridgeTokenFile))
                 {
                     var existing = File.ReadAllText(Paths.BrowserBridgeTokenFile).Trim();
-                    if (existing.Length >= 32)
+                    if (existing.Length is >= 32 and <= BrowserBridgeProtocol.MaximumTokenCharacters)
                     {
                         _token = existing;
                         return _token;
@@ -2704,7 +2882,7 @@ internal static class NativeMessagingHost
         }
 
         var messageLength = BitConverter.ToInt32(messageLengthBytes, 0);
-        if (messageLength <= 0 || messageLength > 1024 * 1024)
+        if (messageLength <= 0 || messageLength > BrowserBridgeProtocol.MaximumBrowserMessageBytes)
         {
             return null;
         }
@@ -2735,10 +2913,17 @@ internal static class NativeMessagingHost
     {
         try
         {
+            var envelope = BrowserBridgeSecurity.CreateEnvelope(json);
+            if (envelope.Length > BrowserBridgeProtocol.MaximumPipeMessageCharacters)
+            {
+                return false;
+            }
+
             using var pipe = new NamedPipeClientStream(".", BrowserHintServer.PipeName, PipeDirection.Out);
             pipe.Connect(2000);
             using var writer = new StreamWriter(pipe, new UTF8Encoding(false), 1024, leaveOpen: true) { AutoFlush = true };
-            writer.WriteLine(BrowserBridgeSecurity.CreateEnvelope(json));
+            writer.Write(envelope);
+            writer.Write('\n');
             return true;
         }
         catch (Exception exception)
@@ -3771,89 +3956,94 @@ internal sealed class RoutingEngine : IDisposable
         var monitors = WindowInspector.GetMonitors();
         foreach (var hintSet in hints.Values)
         {
-            var usableExplicitProcesses = hintSet.Windows
-                .SelectMany(window => window.ProcessIds)
-                .Distinct()
-                .Select(processId => new
-                {
-                    OwnsRelevantAudioSession = audioSessionProcessIds.Contains(processId),
-                    Process = GetProcessInfo(processId)
-                })
-                .Where(candidate =>
-                    candidate.Process is not null &&
-                    BrowserHintStore.IsAdvisoryProcessMatch(
-                        hintSet.ProcessName,
-                        candidate.Process.Value.ProcessName,
-                        candidate.OwnsRelevantAudioSession) &&
-                    IsAllowedProcessName(candidate.Process.Value.ProcessName))
-                .Select(candidate => candidate.Process!.Value)
-                .ToDictionary(process => process.ProcessId);
-            var routeWindows = hintSet.Windows;
-            if (hintSet.PreferredWindowId is int preferredWindowId &&
-                hintSet.Windows.Count > 1 &&
-                usableExplicitProcesses.Count == 0)
+            foreach (var source in hintSet.Sources)
             {
-                var preferredWindows = hintSet.Windows
-                    .Where(window => window.WindowId == preferredWindowId)
-                    .ToList();
-                if (preferredWindows.Count == 1)
-                {
-                    routeWindows = preferredWindows;
-                }
-            }
-
-            var inferredProcess = routeWindows.Count == 1
-                ? audioSessionProcessIds
-                    .Select(GetProcessInfo)
-                    .Where(process =>
-                        process is not null &&
-                        process.Value.ProcessName.Equals(hintSet.ProcessName, StringComparison.OrdinalIgnoreCase) &&
-                        IsAllowedProcessName(process.Value.ProcessName))
-                    .Select(process => process!.Value)
-                    .DistinctBy(process => process.ProcessId)
-                    .ToList()
-                : new List<(int ProcessId, string ProcessName, DateTimeOffset? StartUtc, string? ExecutablePath)>();
-
-            foreach (var hintWindow in routeWindows)
-            {
-                var extensionMonitor = WindowInspector.PickMonitor(hintWindow.Bounds, monitors);
-                var matchingWindow = ResolveNativeBrowserWindow(hintSet, hintWindow, windows);
-                var monitor = matchingWindow?.Monitor ?? extensionMonitor;
-                if (matchingWindow is not null &&
-                    !monitor.BoundsKey.Equals(extensionMonitor.BoundsKey, StringComparison.OrdinalIgnoreCase))
-                {
-                    Log.WriteThrottled(
-                        $"corrected-browser-monitor-{hintSet.ProcessName}-{monitor.BoundsKey}",
-                        $"Corrected stale {hintSet.ProcessName} extension bounds from {extensionMonitor.DeviceName} to native titled window {monitor.DeviceName}.",
-                        TimeSpan.FromMinutes(5));
-                }
-
-                var endpoint = FindEndpointForMonitor(monitor, endpoints);
-                var matchedExplicitProcessIds = 0;
-                foreach (var processId in hintWindow.ProcessIds.Distinct())
-                {
-                    if (!usableExplicitProcesses.TryGetValue(processId, out var process))
+                var usableExplicitProcesses = source.Windows
+                    .SelectMany(window => window.ProcessIds)
+                    .Distinct()
+                    .Select(processId => new
                     {
-                        continue;
+                        OwnsRelevantAudioSession = audioSessionProcessIds.Contains(processId),
+                        Process = GetProcessInfo(processId)
+                    })
+                    .Where(candidate =>
+                        candidate.Process is not null &&
+                        BrowserHintStore.IsAdvisoryProcessMatch(
+                            hintSet.ProcessName,
+                            candidate.Process.Value.ProcessName,
+                            candidate.OwnsRelevantAudioSession) &&
+                        IsAllowedProcessName(candidate.Process.Value.ProcessName))
+                    .Select(candidate => candidate.Process!.Value)
+                    .ToDictionary(process => process.ProcessId);
+                var routeWindows = source.Windows;
+                if (source.PreferredWindowId is int preferredWindowId &&
+                    source.Windows.Count > 1 &&
+                    usableExplicitProcesses.Count == 0)
+                {
+                    var preferredWindows = source.Windows
+                        .Where(window => window.WindowId == preferredWindowId)
+                        .ToList();
+                    if (preferredWindows.Count == 1)
+                    {
+                        routeWindows = preferredWindows;
+                    }
+                }
+
+                var inferredProcess = routeWindows.Count == 1
+                    ? audioSessionProcessIds
+                        .Select(GetProcessInfo)
+                        .Where(process =>
+                            process is not null &&
+                            BrowserHintStore.ProcessBelongsToFamily(
+                                hintSet.Family,
+                                process.Value.ProcessName) &&
+                            IsAllowedProcessName(process.Value.ProcessName))
+                        .Select(process => process!.Value)
+                        .DistinctBy(process => process.ProcessId)
+                        .ToList()
+                    : new List<(int ProcessId, string ProcessName, DateTimeOffset? StartUtc, string? ExecutablePath)>();
+
+                foreach (var hintWindow in routeWindows)
+                {
+                    var extensionMonitor = WindowInspector.PickMonitor(hintWindow.Bounds, monitors);
+                    var matchingWindow = ResolveNativeBrowserWindow(hintSet, source, hintWindow, windows);
+                    var monitor = matchingWindow?.Monitor ?? extensionMonitor;
+                    if (matchingWindow is not null &&
+                        !monitor.BoundsKey.Equals(extensionMonitor.BoundsKey, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Log.WriteThrottled(
+                            $"corrected-browser-monitor-{hintSet.ProcessName}-{monitor.BoundsKey}",
+                            $"Corrected stale {hintSet.ProcessName} extension bounds from {extensionMonitor.DeviceName} to native titled window {monitor.DeviceName}.",
+                            TimeSpan.FromMinutes(5));
                     }
 
-                    matchedExplicitProcessIds++;
-                    AddRouteTarget(targets, ambiguousProcessIds, new ProcessRouteTarget(processId, process.ProcessName, process.StartUtc, monitor, endpoint));
-                    authoritativeHintProcessIds.Add(processId);
-                }
+                    var endpoint = FindEndpointForMonitor(monitor, endpoints);
+                    var matchedExplicitProcessIds = 0;
+                    foreach (var processId in hintWindow.ProcessIds.Distinct())
+                    {
+                        if (!usableExplicitProcesses.TryGetValue(processId, out var process))
+                        {
+                            continue;
+                        }
 
-                if (matchedExplicitProcessIds == 0 && inferredProcess.Count == 1)
-                {
-                    var process = inferredProcess[0];
-                    Log.WriteThrottled(
-                        $"inferred-browser-route-{process.ProcessId}-{monitor.BoundsKey}",
-                        $"Matched PID {process.ProcessId} ({process.ProcessName}) to the sole audible browser window on {monitor.DeviceName}.",
-                        TimeSpan.FromMinutes(5));
-                    AddRouteTarget(
-                        targets,
-                        ambiguousProcessIds,
-                        new ProcessRouteTarget(process.ProcessId, process.ProcessName, process.StartUtc, monitor, endpoint));
-                    authoritativeHintProcessIds.Add(process.ProcessId);
+                        matchedExplicitProcessIds++;
+                        AddRouteTarget(targets, ambiguousProcessIds, new ProcessRouteTarget(processId, process.ProcessName, process.StartUtc, monitor, endpoint));
+                        authoritativeHintProcessIds.Add(processId);
+                    }
+
+                    if (matchedExplicitProcessIds == 0 && inferredProcess.Count == 1)
+                    {
+                        var process = inferredProcess[0];
+                        Log.WriteThrottled(
+                            $"inferred-browser-route-{process.ProcessId}-{monitor.BoundsKey}",
+                            $"Matched PID {process.ProcessId} ({process.ProcessName}) to the sole audible browser window on {monitor.DeviceName}.",
+                            TimeSpan.FromMinutes(5));
+                        AddRouteTarget(
+                            targets,
+                            ambiguousProcessIds,
+                            new ProcessRouteTarget(process.ProcessId, process.ProcessName, process.StartUtc, monitor, endpoint));
+                        authoritativeHintProcessIds.Add(process.ProcessId);
+                    }
                 }
             }
         }
@@ -3861,12 +4051,13 @@ internal sealed class RoutingEngine : IDisposable
 
     private WindowInfo? ResolveNativeBrowserWindow(
         BrowserHintSet hintSet,
+        BrowserHintSourceSnapshot source,
         BrowserHintWindow hintWindow,
         List<WindowInfo> windows)
     {
         var candidates = windows
             .Where(window =>
-                window.ProcessName.Equals(hintSet.ProcessName, StringComparison.OrdinalIgnoreCase) &&
+                BrowserHintStore.ProcessBelongsToFamily(hintSet.Family, window.ProcessName) &&
                 BrowserHintStore.WindowMatchesHint(hintWindow, window))
             .ToList();
         if (candidates.Count == 0)
@@ -3874,7 +4065,7 @@ internal sealed class RoutingEngine : IDisposable
             return null;
         }
 
-        var cacheKey = $"{hintSet.ProcessName}:{hintWindow.WindowId}";
+        var cacheKey = $"{hintSet.ProcessName}:{source.SourceInstanceId ?? "legacy"}:{hintWindow.WindowId}";
         if (hintWindow.WindowId > 0 &&
             _browserWindowHandles.TryGetValue(cacheKey, out var cachedHandle))
         {
@@ -4132,6 +4323,7 @@ internal sealed class RouterSettings
     public List<string> AllowProcessNames { get; set; } = new()
     {
         "chrome.exe",
+        "chromium.exe",
         "msedge.exe",
         "firefox.exe",
         "brave.exe",
