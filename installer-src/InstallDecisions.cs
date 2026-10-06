@@ -183,14 +183,7 @@ internal enum InstallerMutationKind
 internal sealed class InstallerStateTransaction : IDisposable
 {
     private readonly List<Action> rollbackActions = [];
-    private readonly Action<InstallerMutationKind, int>? afterMutation;
     private bool completed;
-    private int mutationCount;
-
-    internal InstallerStateTransaction(Action<InstallerMutationKind, int>? afterMutation = null)
-    {
-        this.afterMutation = afterMutation;
-    }
 
     internal void Apply(InstallerMutationKind kind, Action mutation, Action rollback)
     {
@@ -199,8 +192,6 @@ internal sealed class InstallerStateTransaction : IDisposable
         try
         {
             mutation();
-            mutationCount++;
-            afterMutation?.Invoke(kind, mutationCount);
         }
         catch (Exception mutationException)
         {
@@ -212,7 +203,7 @@ internal sealed class InstallerStateTransaction : IDisposable
             catch (Exception rollbackException)
             {
                 throw new AggregateException(
-                    "An installer mutation failed and its prior state could not be restored.",
+                    $"An installer {kind} mutation failed and its prior state could not be restored.",
                     mutationException,
                     rollbackException);
             }
@@ -259,27 +250,6 @@ internal sealed class InstallerStateTransaction : IDisposable
     public void Dispose()
     {
         RollBack();
-    }
-}
-
-internal sealed record FileStateSnapshot(bool Exists, byte[]? Contents)
-{
-    internal static FileStateSnapshot Capture(string path) =>
-        File.Exists(path)
-            ? new FileStateSnapshot(true, File.ReadAllBytes(path))
-            : new FileStateSnapshot(false, null);
-
-    internal void Restore(string path)
-    {
-        if (!Exists)
-        {
-            File.Delete(path);
-            return;
-        }
-
-        Directory.CreateDirectory(Path.GetDirectoryName(path)
-            ?? throw new InvalidOperationException($"The file path has no parent directory: {path}"));
-        File.WriteAllBytes(path, Contents ?? []);
     }
 }
 

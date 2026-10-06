@@ -48,9 +48,6 @@ if (options.UpdateToLatestDuringInstall && TryLaunchNewerInstaller(options, prev
     return;
 }
 
-var replacementApplied = false;
-string? pendingBackupDir = null;
-InstallerStateTransaction? stateTransaction = null;
 try
 {
     var tempDir = Path.Combine(Path.GetTempPath(), AppId + "-" + Guid.NewGuid().ToString("N"));
@@ -71,37 +68,33 @@ try
         WriteInstallerLog($"Stopping existing app processes before installing to {installDir}.");
         StopExistingApp(installDir);
         WriteInstallerLog("Replacing application files transactionally.");
-        var backupCreated = ReplaceInstallation(stagedInstallDir, installDir, backupDir);
-        replacementApplied = true;
-        pendingBackupDir = backupCreated ? backupDir : null;
-        stateTransaction = new InstallerStateTransaction();
-        var registryOwnership = new RegistryOwnershipRecorder(previousInstallInfo?.RegistryValues);
-        WriteInstallerLog("Writing native messaging manifests.");
-        WriteNativeMessagingManifests(installDir, options);
-        WriteInstallerLog("Registering native messaging hosts.");
-        RegisterNativeMessagingHosts(installDir, registryOwnership, stateTransaction);
-        WriteInstallerLog("Registering browser extension deployment policies.");
-        var browserExtensionDeployment = RegisterBrowserExtensionPolicies(options, registryOwnership, stateTransaction);
-        WriteInstallerLog("Applying startup and shortcut settings.");
-        SetStartup(installDir, options.Autostart, registryOwnership, stateTransaction);
-        InstallStartMenuShortcut(installDir, stateTransaction);
-        WriteUserAutostartSetting(options.Autostart, stateTransaction);
-        RegisterUninstaller(installDir, registryOwnership, stateTransaction);
-        WriteInstallInfo(
+        var browserExtensionDeployment = InstallerOrchestration.Execute(
+            stagedInstallDir,
             installDir,
-            options,
-            registryOwnership.Values,
-            previousInstallInfo?.RequiresLegacyBrowserCleanup == true,
-            previousInstallInfo);
-        stateTransaction.Commit();
+            backupDir,
+            stateTransaction =>
+            {
+                var registryOwnership = new RegistryOwnershipRecorder(previousInstallInfo?.RegistryValues);
+                WriteInstallerLog("Writing native messaging manifests.");
+                WriteNativeMessagingManifests(installDir, options);
+                WriteInstallerLog("Registering native messaging hosts.");
+                RegisterNativeMessagingHosts(installDir, registryOwnership, stateTransaction);
+                WriteInstallerLog("Registering browser extension deployment policies.");
+                var deployment = RegisterBrowserExtensionPolicies(options, registryOwnership, stateTransaction);
+                WriteInstallerLog("Applying startup and shortcut settings.");
+                SetStartup(installDir, options.Autostart, registryOwnership, stateTransaction);
+                InstallStartMenuShortcut(installDir, stateTransaction);
+                WriteUserAutostartSetting(options.Autostart, stateTransaction);
+                RegisterUninstaller(installDir, registryOwnership, stateTransaction);
+                WriteInstallInfo(
+                    installDir,
+                    options,
+                    registryOwnership.Values,
+                    previousInstallInfo?.RequiresLegacyBrowserCleanup == true,
+                    previousInstallInfo);
+                return deployment;
+            });
         WriteInstallerLog("Install registry state written.");
-        if (pendingBackupDir is not null)
-        {
-            TryDeleteDirectory(pendingBackupDir);
-            pendingBackupDir = null;
-        }
-
-        replacementApplied = false;
 
         if (options.Launch)
         {
@@ -126,44 +119,13 @@ try
 }
 catch (Exception exception)
 {
-    var rollbackFailures = new List<Exception>();
-    if (stateTransaction is not null)
-    {
-        try
-        {
-            stateTransaction.RollBack();
-        }
-        catch (Exception rollbackException)
-        {
-            rollbackFailures.Add(rollbackException);
-        }
-    }
-
-    if (replacementApplied)
-    {
-        try
-        {
-            RollBackInstallation(installDir, pendingBackupDir);
-        }
-        catch (Exception rollbackException)
-        {
-            rollbackFailures.Add(rollbackException);
-        }
-    }
-
-    Exception reportedException = rollbackFailures.Count == 0
-        ? exception
-        : new AggregateException(
-            "Installation failed and one or more parts of the prior state could not be restored.",
-            new[] { exception }.Concat(rollbackFailures));
-
     Console.Error.WriteLine("Install failed:");
-    Console.Error.WriteLine(reportedException);
-    WriteInstallerLog($"Setup failed: {reportedException}");
+    Console.Error.WriteLine(exception);
+    WriteInstallerLog($"Setup failed: {exception}");
     if (!HasSwitch(args, "/quiet"))
     {
         MessageBox.Show(
-            "Monitor Audio Router could not be installed.\n\n" + reportedException.Message + "\n\nSee installer.log in the app data folder for details.",
+            "Monitor Audio Router could not be installed.\n\n" + exception.Message + "\n\nSee installer.log in the app data folder for details.",
             "Monitor Audio Router setup failed",
             MessageBoxButtons.OK,
             MessageBoxIcon.Error);
@@ -352,77 +314,6 @@ static void ValidateStagedInstallation(string stagedInstallDir)
         {
             throw new InvalidOperationException($"The staged payload contains a reparse point: {path}");
         }
-    }
-}
-
-static bool ReplaceInstallation(string stagedInstallDir, string installDir, string backupDir)
-{
-    var replacementRoot = Path.GetDirectoryName(installDir)
-        ?? throw new InvalidOperationException("The installation directory does not have a parent directory.");
-    RequireChildPath(replacementRoot, stagedInstallDir, "staged installation");
-    RequireChildPath(replacementRoot, installDir, "installation directory");
-    RequireChildPath(replacementRoot, backupDir, "backup directory");
-
-    var backupCreated = false;
-    var replacementStarted = false;
-    try
-    {
-        if (Directory.Exists(backupDir))
-        {
-            throw new InvalidOperationException($"The backup directory already exists: {backupDir}");
-        }
-
-        if (Directory.Exists(installDir))
-        {
-            Directory.Move(installDir, backupDir);
-            backupCreated = true;
-        }
-
-        replacementStarted = true;
-        Directory.Move(stagedInstallDir, installDir);
-    }
-    catch (Exception replacementException)
-    {
-        try
-        {
-            if (replacementStarted && Directory.Exists(installDir))
-            {
-                Directory.Delete(installDir, recursive: true);
-            }
-
-            if (backupCreated)
-            {
-                Directory.Move(backupDir, installDir);
-            }
-        }
-        catch (Exception rollbackException)
-        {
-            throw new AggregateException(
-                "Installation replacement and rollback both failed.",
-                replacementException,
-                rollbackException);
-        }
-
-        throw;
-    }
-
-    return backupCreated;
-}
-
-static void RollBackInstallation(string installDir, string? backupDir)
-{
-    var replacementRoot = Path.GetDirectoryName(installDir)
-        ?? throw new InvalidOperationException("The installation directory does not have a parent directory.");
-    RequireChildPath(replacementRoot, installDir, "installation directory");
-    if (Directory.Exists(installDir))
-    {
-        Directory.Delete(installDir, recursive: true);
-    }
-
-    if (backupDir is not null)
-    {
-        RequireChildPath(replacementRoot, backupDir, "backup directory");
-        Directory.Move(backupDir, installDir);
     }
 }
 
@@ -686,12 +577,6 @@ static void SetFirefoxExtensionPolicy(
     var keyExisted = RegistryKeyExists(Registry.LocalMachine, subKey);
     var currentValue = ReadRegistryValueAtPath(Registry.LocalMachine, subKey, valueName);
     EnsureStringRegistryValue(currentValue, "HKLM", subKey, valueName);
-    var settings = ParseExistingJsonObjectForMerge(currentValue.Value);
-    var priorExtensionPolicy = settings[extensionId];
-    var prior = new RegistryValueSnapshot(
-        priorExtensionPolicy is not null,
-        priorExtensionPolicy?.ToJsonString(new JsonSerializerOptions { WriteIndented = false }),
-        "Json");
     var extensionPolicy = new JsonObject
     {
         ["installation_mode"] = "force_installed",
@@ -704,12 +589,10 @@ static void SetFirefoxExtensionPolicy(
         extensionPolicy["private_browsing"] = true;
     }
 
-    settings[extensionId] = extensionPolicy;
-    var writtenExtensionPolicy = new RegistryValueSnapshot(
-        true,
-        extensionPolicy.ToJsonString(new JsonSerializerOptions { WriteIndented = false }),
-        "Json");
-    RegistryValueSnapshot? writtenValue = null;
+    var mutation = FirefoxExtensionSettingsMutation.Create(
+        currentValue.Value,
+        extensionId,
+        extensionPolicy);
     stateTransaction.Apply(
         InstallerMutationKind.Registry,
         () =>
@@ -718,35 +601,22 @@ static void SetFirefoxExtensionPolicy(
                 ?? throw new InvalidOperationException($"Registry key could not be created: HKLM\\{subKey}");
             key.SetValue(
                 valueName,
-                settings.ToJsonString(new JsonSerializerOptions { WriteIndented = false }),
+                mutation.WrittenValue,
                 RegistryValueKind.String);
-            writtenValue = ReadRegistryValue(key, valueName);
             registryOwnership.Record(
                 "HKLM",
                 subKey,
                 valueName,
-                prior,
-                writtenExtensionPolicy,
+                mutation.Prior,
+                mutation.Written,
                 extensionId);
         },
-        () => RestoreRegistryMutation(
+        () => RestoreFirefoxExtensionSettingsMutation(
             Registry.LocalMachine,
             subKey,
             valueName,
-            currentValue,
-            writtenValue,
+            mutation,
             keyExisted));
-}
-
-static JsonObject ParseExistingJsonObjectForMerge(string? json)
-{
-    if (string.IsNullOrWhiteSpace(json))
-    {
-        return new JsonObject();
-    }
-
-    return JsonNode.Parse(json) as JsonObject
-        ?? throw new InvalidOperationException("The existing Firefox ExtensionSettings value is not a JSON object.");
 }
 
 static JsonObject ParseJsonObject(string? json)
@@ -801,19 +671,18 @@ static void WriteUserAutostartSetting(bool enabled, InstallerStateTransaction st
 {
     var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
     var configPath = Path.Combine(localAppData, AppName, "config.json");
-    var priorState = FileStateSnapshot.Capture(configPath);
     try
     {
-        stateTransaction.Apply(
+        InstallerExternalFileMutation.Apply(
+            stateTransaction,
             InstallerMutationKind.UserConfiguration,
+            configPath,
             () =>
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(configPath)!);
                 var settings = ParseJsonObject(File.Exists(configPath) ? File.ReadAllText(configPath) : null);
                 settings["AutostartEnabled"] = enabled;
                 File.WriteAllText(configPath, settings.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-            },
-            () => priorState.Restore(configPath));
+            });
     }
     catch (AggregateException)
     {
@@ -860,14 +729,14 @@ static void InstallStartMenuShortcut(string installDir, InstallerStateTransactio
 {
     var programsDir = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
     var shortcutPath = Path.Combine(programsDir, $"{AppName}.lnk");
-    var priorState = FileStateSnapshot.Capture(shortcutPath);
     try
     {
-        stateTransaction.Apply(
+        InstallerExternalFileMutation.Apply(
+            stateTransaction,
             InstallerMutationKind.StartMenuShortcut,
+            shortcutPath,
             () =>
             {
-                Directory.CreateDirectory(programsDir);
                 var shellType = Type.GetTypeFromProgID("WScript.Shell");
                 if (shellType is null)
                 {
@@ -881,8 +750,7 @@ static void InstallStartMenuShortcut(string installDir, InstallerStateTransactio
                 shortcut.IconLocation = Path.Combine(installDir, "MonitorAudioRouter.ico") + ",0";
                 shortcut.Description = AppName;
                 shortcut.Save();
-            },
-            () => priorState.Restore(shortcutPath));
+            });
     }
     catch (AggregateException)
     {
@@ -1120,14 +988,67 @@ static void RestoreRegistryMutation(
     }
 
     RestoreRegistrySnapshot(hive, subKey, valueName, prior);
-    if (!keyExisted)
+    RemoveEmptyRegistryKeyCreatedByInstaller(hive, subKey, keyExisted);
+}
+
+static void RestoreFirefoxExtensionSettingsMutation(
+    RegistryKey hive,
+    string subKey,
+    string valueName,
+    FirefoxExtensionSettingsMutation mutation,
+    bool keyExisted)
+{
+    var current = ReadRegistryValueAtPath(hive, subKey, valueName);
+    if (!current.Exists ||
+        !string.Equals(current.Kind, RegistryValueKind.String.ToString(), StringComparison.Ordinal))
     {
-        using var key = hive.OpenSubKey(subKey);
-        if (key is not null && key.ValueCount == 0 && key.SubKeyCount == 0)
-        {
-            key.Dispose();
-            hive.DeleteSubKey(subKey, throwOnMissingSubKey: false);
-        }
+        return;
+    }
+
+    var rollback = mutation.DecideRollback(current.Value);
+    switch (rollback.Action)
+    {
+        case JsonPropertyRollbackAction.RetainCurrent:
+            return;
+        case JsonPropertyRollbackAction.SetValue:
+            using (var key = hive.CreateSubKey(subKey, writable: true)
+                ?? throw new InvalidOperationException($"Registry key could not be restored: {subKey}"))
+            {
+                key.SetValue(valueName, rollback.Value!, RegistryValueKind.String);
+            }
+            break;
+        case JsonPropertyRollbackAction.DeleteValue:
+            using (var key = hive.OpenSubKey(subKey, writable: true))
+            {
+                key?.DeleteValue(valueName, throwOnMissingValue: false);
+            }
+            break;
+        default:
+            throw new InvalidOperationException($"Unsupported Firefox rollback action: {rollback.Action}");
+    }
+
+    RemoveEmptyRegistryKeyCreatedByInstaller(hive, subKey, keyExisted);
+}
+
+static void RemoveEmptyRegistryKeyCreatedByInstaller(
+    RegistryKey hive,
+    string subKey,
+    bool keyExisted)
+{
+    if (keyExisted)
+    {
+        return;
+    }
+
+    var shouldDelete = false;
+    using (var key = hive.OpenSubKey(subKey))
+    {
+        shouldDelete = key is not null && key.ValueCount == 0 && key.SubKeyCount == 0;
+    }
+
+    if (shouldDelete)
+    {
+        hive.DeleteSubKey(subKey, throwOnMissingSubKey: false);
     }
 }
 

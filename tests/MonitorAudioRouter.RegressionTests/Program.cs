@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace MonitorAudioRouter.RegressionTests;
 
@@ -22,8 +23,17 @@ internal static class Program
         runner.Add("Unchanged new installer registry values are deleted", UnchangedNewInstallerRegistryValuesAreDeleted);
         runner.Add("Registry ownership across update keeps the original predecessor", RegistryOwnershipAcrossUpdateKeepsOriginalPredecessor);
         runner.Add(
-            "Post-replacement failure restores registry shortcut and configuration state",
-            PostReplacementFailureRestoresExternalState);
+            "Installer failure rolls back payload and preserves concurrent external file changes",
+            InstallerFailureRollsBackPayloadAndPreservesConcurrentExternalFiles);
+        runner.Add(
+            "Installer failure removes an unchanged new external file and owned parent",
+            InstallerFailureRemovesUnchangedNewExternalFileAndOwnedParent);
+        runner.Add(
+            "Firefox rollback restores its prior property and preserves concurrent properties",
+            FirefoxRollbackRestoresOwnedPropertyAndPreservesConcurrentProperties);
+        runner.Add(
+            "Firefox rollback removes its new property and preserves concurrent properties",
+            FirefoxRollbackRemovesOwnedPropertyAndPreservesConcurrentProperties);
         runner.Add(
             "Legacy browser ownership survives migration with deployment disabled",
             LegacyBrowserOwnershipSurvivesDisabledMigration);
@@ -292,69 +302,173 @@ internal static class Program
             JsonPropertyName: null);
     }
 
-    private static void PostReplacementFailureRestoresExternalState()
+    private static void InstallerFailureRollsBackPayloadAndPreservesConcurrentExternalFiles()
     {
         var temporaryDirectory = Path.Combine(
             Path.GetTempPath(),
             "MonitorAudioRouter.RegressionTests",
             Guid.NewGuid().ToString("N"));
-        var shortcutPath = Path.Combine(temporaryDirectory, "Monitor Audio Router.lnk");
-        var configurationPath = Path.Combine(temporaryDirectory, "config.json");
-        Directory.CreateDirectory(temporaryDirectory);
-        File.WriteAllText(shortcutPath, "prior-shortcut", Encoding.UTF8);
+        var replacementRoot = Path.Combine(temporaryDirectory, "replacement-root");
+        var installDirectory = Path.Combine(replacementRoot, "Monitor Audio Router");
+        var stagedDirectory = Path.Combine(replacementRoot, ".stage", "Monitor Audio Router");
+        var backupDirectory = Path.Combine(replacementRoot, ".backup");
+        var externalDirectory = Path.Combine(temporaryDirectory, "external");
+        var shortcutDirectory = Path.Combine(temporaryDirectory, "new-shortcuts");
+        var configurationPath = Path.Combine(externalDirectory, "config.json");
+        var shortcutPath = Path.Combine(shortcutDirectory, "Monitor Audio Router.lnk");
+        Directory.CreateDirectory(installDirectory);
+        Directory.CreateDirectory(stagedDirectory);
+        Directory.CreateDirectory(externalDirectory);
+        File.WriteAllText(Path.Combine(installDirectory, "payload.txt"), "prior-payload", Encoding.UTF8);
+        File.WriteAllText(Path.Combine(stagedDirectory, "payload.txt"), "replacement-payload", Encoding.UTF8);
         File.WriteAllText(configurationPath, "{\"AutostartEnabled\":false}", Encoding.UTF8);
-        var registryValue = "prior-registry";
-        var registryWriteObserved = false;
 
         try
         {
-            using var transaction = new global::MonitorAudioRouter.Setup.InstallerStateTransaction(
-                (kind, _) =>
-                {
-                    if (kind == global::MonitorAudioRouter.Setup.InstallerMutationKind.UserConfiguration)
+            var failure = RegressionAssert.Throws<InvalidOperationException>(() =>
+                global::MonitorAudioRouter.Setup.InstallerOrchestration.Execute(
+                    stagedDirectory,
+                    installDirectory,
+                    backupDirectory,
+                    transaction =>
                     {
-                        throw new InvalidOperationException("Injected post-replacement failure.");
-                    }
-                });
-            var shortcutSnapshot = global::MonitorAudioRouter.Setup.FileStateSnapshot.Capture(shortcutPath);
-            var configurationSnapshot = global::MonitorAudioRouter.Setup.FileStateSnapshot.Capture(configurationPath);
-
-            try
-            {
-                transaction.Apply(
-                    global::MonitorAudioRouter.Setup.InstallerMutationKind.Registry,
-                    () =>
-                    {
-                        registryValue = "installer-registry";
-                        registryWriteObserved = true;
+                        global::MonitorAudioRouter.Setup.InstallerExternalFileMutation.Apply(
+                            transaction,
+                            global::MonitorAudioRouter.Setup.InstallerMutationKind.UserConfiguration,
+                            configurationPath,
+                            () => File.WriteAllText(configurationPath, "{\"AutostartEnabled\":true}", Encoding.UTF8));
+                        global::MonitorAudioRouter.Setup.InstallerExternalFileMutation.Apply(
+                            transaction,
+                            global::MonitorAudioRouter.Setup.InstallerMutationKind.StartMenuShortcut,
+                            shortcutPath,
+                            () => File.WriteAllText(shortcutPath, "installer-shortcut", Encoding.UTF8));
+                        return true;
                     },
-                    () => registryValue = "prior-registry");
-                transaction.Apply(
-                    global::MonitorAudioRouter.Setup.InstallerMutationKind.StartMenuShortcut,
-                    () => File.WriteAllText(shortcutPath, "installer-shortcut", Encoding.UTF8),
-                    () => shortcutSnapshot.Restore(shortcutPath));
-                transaction.Apply(
-                    global::MonitorAudioRouter.Setup.InstallerMutationKind.UserConfiguration,
-                    () => File.WriteAllText(configurationPath, "{\"AutostartEnabled\":true}", Encoding.UTF8),
-                    () => configurationSnapshot.Restore(configurationPath));
-                transaction.Commit();
-                throw new RegressionAssertionException("The deterministic failure injection did not run.");
-            }
-            catch (InvalidOperationException exception)
-            {
-                RegressionAssert.Contains("Injected post-replacement failure", exception.Message, "The expected failure should escape the production transaction path.");
-                transaction.RollBack();
-            }
+                    beforeCommit: () =>
+                    {
+                        RegressionAssert.Equal("replacement-payload", File.ReadAllText(Path.Combine(installDirectory, "payload.txt"), Encoding.UTF8), "The replacement payload must be active before failure injection.");
+                        RegressionAssert.Equal("{\"AutostartEnabled\":true}", File.ReadAllText(configurationPath, Encoding.UTF8), "The production configuration write must complete before failure injection.");
+                        RegressionAssert.Equal("installer-shortcut", File.ReadAllText(shortcutPath, Encoding.UTF8), "The production shortcut write must complete before failure injection.");
+                        File.WriteAllText(configurationPath, "{\"AutostartEnabled\":false,\"UserEdit\":true}", Encoding.UTF8);
+                        File.WriteAllText(shortcutPath, "user-shortcut", Encoding.UTF8);
+                        throw new InvalidOperationException("Injected post-external-write failure.");
+                    }));
 
-            RegressionAssert.True(registryWriteObserved, "Failure injection must occur after a registry write.");
-            RegressionAssert.Equal("prior-registry", registryValue, "Registry state must return to its predecessor.");
-            RegressionAssert.Equal("prior-shortcut", File.ReadAllText(shortcutPath, Encoding.UTF8), "The prior shortcut must be restored byte for byte.");
-            RegressionAssert.Equal("{\"AutostartEnabled\":false}", File.ReadAllText(configurationPath, Encoding.UTF8), "The prior user configuration must be restored byte for byte.");
+            RegressionAssert.Contains("Injected post-external-write failure", failure.Message, "The production failure injection should escape after compensation.");
+            RegressionAssert.Equal("prior-payload", File.ReadAllText(Path.Combine(installDirectory, "payload.txt"), Encoding.UTF8), "The prior payload must be restored by production orchestration.");
+            RegressionAssert.Equal("{\"AutostartEnabled\":false,\"UserEdit\":true}", File.ReadAllText(configurationPath, Encoding.UTF8), "A concurrent edit to an existing configuration must survive rollback.");
+            RegressionAssert.Equal("user-shortcut", File.ReadAllText(shortcutPath, Encoding.UTF8), "A concurrent edit to a newly created shortcut must survive rollback.");
+            RegressionAssert.True(Directory.Exists(shortcutDirectory), "A parent containing a concurrent file edit must remain.");
+            RegressionAssert.True(!Directory.Exists(backupDirectory), "The payload backup must be consumed by rollback.");
         }
         finally
         {
             Directory.Delete(temporaryDirectory, recursive: true);
         }
+    }
+
+    private static void InstallerFailureRemovesUnchangedNewExternalFileAndOwnedParent()
+    {
+        var temporaryDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "MonitorAudioRouter.RegressionTests",
+            Guid.NewGuid().ToString("N"));
+        var replacementRoot = Path.Combine(temporaryDirectory, "replacement-root");
+        var installDirectory = Path.Combine(replacementRoot, "Monitor Audio Router");
+        var stagedDirectory = Path.Combine(replacementRoot, ".stage", "Monitor Audio Router");
+        var backupDirectory = Path.Combine(replacementRoot, ".backup");
+        var newParentDirectory = Path.Combine(temporaryDirectory, "installer-created-parent");
+        var newFilePath = Path.Combine(newParentDirectory, "config.json");
+        var preexistingParentDirectory = Path.Combine(temporaryDirectory, "preexisting-parent");
+        var existingFilePath = Path.Combine(preexistingParentDirectory, "config.json");
+        var preexistingEmptyParentDirectory = Path.Combine(temporaryDirectory, "preexisting-empty-parent");
+        var preexistingParentFilePath = Path.Combine(preexistingEmptyParentDirectory, "shortcut.lnk");
+        Directory.CreateDirectory(installDirectory);
+        Directory.CreateDirectory(stagedDirectory);
+        Directory.CreateDirectory(preexistingParentDirectory);
+        Directory.CreateDirectory(preexistingEmptyParentDirectory);
+        File.WriteAllText(Path.Combine(installDirectory, "payload.txt"), "prior-payload", Encoding.UTF8);
+        File.WriteAllText(Path.Combine(stagedDirectory, "payload.txt"), "replacement-payload", Encoding.UTF8);
+        File.WriteAllText(existingFilePath, "prior-configuration", Encoding.UTF8);
+
+        try
+        {
+            RegressionAssert.Throws<InvalidOperationException>(() =>
+                global::MonitorAudioRouter.Setup.InstallerOrchestration.Execute(
+                    stagedDirectory,
+                    installDirectory,
+                    backupDirectory,
+                    transaction =>
+                    {
+                        global::MonitorAudioRouter.Setup.InstallerExternalFileMutation.Apply(
+                            transaction,
+                            global::MonitorAudioRouter.Setup.InstallerMutationKind.UserConfiguration,
+                            newFilePath,
+                            () => File.WriteAllText(newFilePath, "installer-created", Encoding.UTF8));
+                        global::MonitorAudioRouter.Setup.InstallerExternalFileMutation.Apply(
+                            transaction,
+                            global::MonitorAudioRouter.Setup.InstallerMutationKind.StartMenuShortcut,
+                            preexistingParentFilePath,
+                            () => File.WriteAllText(preexistingParentFilePath, "installer-created", Encoding.UTF8));
+                        global::MonitorAudioRouter.Setup.InstallerExternalFileMutation.Apply(
+                            transaction,
+                            global::MonitorAudioRouter.Setup.InstallerMutationKind.UserConfiguration,
+                            existingFilePath,
+                            () => File.WriteAllText(existingFilePath, "installer-configuration", Encoding.UTF8));
+                        return true;
+                    },
+                    beforeCommit: () => throw new InvalidOperationException("Injected failure.")));
+
+            RegressionAssert.True(!File.Exists(newFilePath), "An unchanged file created by the installer must be removed.");
+            RegressionAssert.True(!Directory.Exists(newParentDirectory), "An empty parent created by the installer must be removed.");
+            RegressionAssert.True(!File.Exists(preexistingParentFilePath), "An unchanged file in a pre-existing parent must be removed.");
+            RegressionAssert.True(Directory.Exists(preexistingEmptyParentDirectory), "A pre-existing empty parent must not be removed.");
+            RegressionAssert.Equal("prior-configuration", File.ReadAllText(existingFilePath, Encoding.UTF8), "An unchanged installer write must restore the prior external file.");
+            RegressionAssert.Equal("prior-payload", File.ReadAllText(Path.Combine(installDirectory, "payload.txt"), Encoding.UTF8), "Payload rollback must still restore the old installation.");
+        }
+        finally
+        {
+            Directory.Delete(temporaryDirectory, recursive: true);
+        }
+    }
+
+    private static void FirefoxRollbackRestoresOwnedPropertyAndPreservesConcurrentProperties()
+    {
+        const string extensionId = "monitor-audio-router@example.test";
+        const string priorJson = "{\"monitor-audio-router@example.test\":{\"installation_mode\":\"allowed\"},\"unrelated@example.test\":{\"installation_mode\":\"allowed\"}}";
+        var replacementPolicy = JsonNode.Parse("{\"installation_mode\":\"force_installed\",\"install_url\":\"https://example.test/router.xpi\"}")!;
+        var mutation = global::MonitorAudioRouter.Setup.FirefoxExtensionSettingsMutation.Create(
+            priorJson,
+            extensionId,
+            replacementPolicy);
+        const string concurrentJson = "{\"monitor-audio-router@example.test\":{\"installation_mode\":\"force_installed\",\"install_url\":\"https://example.test/router.xpi\"},\"unrelated@example.test\":{\"installation_mode\":\"blocked\"},\"new@example.test\":{\"installation_mode\":\"allowed\"}}";
+
+        var rollback = mutation.DecideRollback(concurrentJson);
+        var restored = JsonNode.Parse(rollback.Value!)!.AsObject();
+
+        RegressionAssert.Equal(global::MonitorAudioRouter.Setup.JsonPropertyRollbackAction.SetValue, rollback.Action, "The shared value should be rewritten when only the owned property still matches.");
+        RegressionAssert.Equal("allowed", restored[extensionId]!["installation_mode"]!.GetValue<string>(), "Rollback must restore the prior Monitor Audio Router property.");
+        RegressionAssert.Equal("blocked", restored["unrelated@example.test"]!["installation_mode"]!.GetValue<string>(), "Rollback must preserve a concurrent unrelated property edit.");
+        RegressionAssert.True(restored.ContainsKey("new@example.test"), "Rollback must preserve a concurrently added property.");
+    }
+
+    private static void FirefoxRollbackRemovesOwnedPropertyAndPreservesConcurrentProperties()
+    {
+        const string extensionId = "monitor-audio-router@example.test";
+        const string priorJson = "{\"unrelated@example.test\":{\"installation_mode\":\"allowed\"}}";
+        var replacementPolicy = JsonNode.Parse("{\"installation_mode\":\"force_installed\",\"install_url\":\"https://example.test/router.xpi\"}")!;
+        var mutation = global::MonitorAudioRouter.Setup.FirefoxExtensionSettingsMutation.Create(
+            priorJson,
+            extensionId,
+            replacementPolicy);
+        const string concurrentJson = "{\"monitor-audio-router@example.test\":{\"installation_mode\":\"force_installed\",\"install_url\":\"https://example.test/router.xpi\"},\"unrelated@example.test\":{\"installation_mode\":\"blocked\"}}";
+
+        var rollback = mutation.DecideRollback(concurrentJson);
+        var restored = JsonNode.Parse(rollback.Value!)!.AsObject();
+
+        RegressionAssert.Equal(global::MonitorAudioRouter.Setup.JsonPropertyRollbackAction.SetValue, rollback.Action, "An unrelated property keeps the shared value present.");
+        RegressionAssert.True(!restored.ContainsKey(extensionId), "Rollback must remove only the installer-created Monitor Audio Router property.");
+        RegressionAssert.Equal("blocked", restored["unrelated@example.test"]!["installation_mode"]!.GetValue<string>(), "Rollback must retain the concurrent unrelated property edit.");
     }
 
     private static void LegacyBrowserOwnershipSurvivesDisabledMigration()
